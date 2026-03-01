@@ -51,6 +51,18 @@ async function startServer() {
     }
   });
 
+  // Proxy for external AI APIs
+  app.post("/api/ai-proxy", async (req, res) => {
+    try {
+      const { url, data, headers } = req.body;
+      const response = await axios.post(url, data, { headers });
+      res.json(response.data);
+    } catch (error: any) {
+      console.error('AI Proxy Error:', error.response?.data || error.message);
+      res.status(error.response?.status || 500).json(error.response?.data || { message: error.message });
+    }
+  });
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

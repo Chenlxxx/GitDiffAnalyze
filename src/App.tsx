@@ -15,10 +15,13 @@ import {
   ExternalLink,
   ChevronRight,
   History,
-  Code2
+  Code2,
+  Settings,
+  Cpu
 } from 'lucide-react';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
-import { GeminiService, ChangeLogAnalysis, DiffAnalysis } from './services/geminiService';
+import { getAIProvider } from './services/aiProvider';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis } from './types';
 import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -33,6 +36,15 @@ export default function App() {
   const [toVersion, setToVersion] = useState('0.22.0');
   const [projectBackground, setProjectBackground] = useState('我现在的项目是coze平台再这个平台中可以搭建agent，这个项目用到了maxgraph作为三方件');
   
+  // AI Config
+  const [aiConfig, setAiConfig] = useState<AIConfig>({
+    provider: 'gemini',
+    apiKey: '',
+    baseUrl: '',
+    model: 'gemini-3-flash-preview'
+  });
+  const [showSettings, setShowSettings] = useState(false);
+
   const [loading, setLoading] = useState(false);
   const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -72,13 +84,14 @@ export default function App() {
         }
       }
 
-      // 2. Analyze Change Log with Gemini
-      const analysis = await GeminiService.analyzeChangeLog(release.body, projectBackground);
+      // 2. Analyze Change Log with Selected AI
+      const provider = getAIProvider(aiConfig);
+      const analysis = await provider.analyzeChangeLog(release.body, projectBackground);
       setChangeLogAnalysis(analysis);
       
     } catch (err: any) {
       console.error(err);
-      setError(err.message || 'An error occurred during analysis');
+      setError(err.message || '分析过程中发生错误');
     } finally {
       setLoading(false);
     }
@@ -95,7 +108,8 @@ export default function App() {
       const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber);
       const diff = await GitHubService.getDiff(pr.diff_url);
       
-      const analysis = await GeminiService.analyzeDiff(diff, pr.title, projectBackground);
+      const provider = getAIProvider(aiConfig);
+      const analysis = await provider.analyzeDiff(diff, pr.title, projectBackground);
       setDiffAnalyses(prev => ({ ...prev, [prNumber]: analysis }));
     } catch (err: any) {
       console.error(err);
@@ -124,15 +138,81 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
+            <button 
+              onClick={() => setShowSettings(!showSettings)}
+              className={cn(
+                "p-2 rounded-xl transition-all",
+                showSettings ? "bg-black text-white" : "bg-black/5 text-black/40 hover:bg-black/10"
+              )}
+            >
+              <Settings size={20} />
+            </button>
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 rounded-full text-xs font-medium border border-emerald-100">
               <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-              Gemini 3.1 Pro 已就绪
+              {aiConfig.provider === 'gemini' ? 'Gemini 3.1 Pro' : aiConfig.model} 已就绪
             </div>
           </div>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-12">
+        {/* Settings Panel */}
+        {showSettings && (
+          <div className="mb-12 bg-white rounded-3xl p-8 shadow-sm border border-black/5 animate-in fade-in slide-in-from-top-4">
+            <div className="flex items-center gap-2 mb-6">
+              <Cpu size={20} className="text-emerald-500" />
+              <h2 className="text-xl font-bold">AI 模型配置</h2>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              <div className="space-y-2">
+                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">AI 提供商</label>
+                <select 
+                  value={aiConfig.provider}
+                  onChange={(e) => setAiConfig({...aiConfig, provider: e.target.value as any})}
+                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                >
+                  <option value="gemini">Google Gemini</option>
+                  <option value="openai-compatible">OpenAI 兼容 (豆包/Qwen/DeepSeek)</option>
+                </select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">API Key</label>
+                <input 
+                  type="password" 
+                  value={aiConfig.apiKey}
+                  onChange={(e) => setAiConfig({...aiConfig, apiKey: e.target.value})}
+                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                  placeholder={aiConfig.provider === 'gemini' ? '可选 (默认使用系统 Key)' : '请输入 API Key'}
+                />
+              </div>
+              {aiConfig.provider === 'openai-compatible' && (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">Base URL</label>
+                    <input 
+                      type="text" 
+                      value={aiConfig.baseUrl}
+                      onChange={(e) => setAiConfig({...aiConfig, baseUrl: e.target.value})}
+                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                      placeholder="https://api.openai.com/v1"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">模型名称</label>
+                    <input 
+                      type="text" 
+                      value={aiConfig.model}
+                      onChange={(e) => setAiConfig({...aiConfig, model: e.target.value})}
+                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                      placeholder="gpt-4o / qwen-max"
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
           
           {/* Left Column: Configuration */}
