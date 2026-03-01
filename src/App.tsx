@@ -41,7 +41,8 @@ export default function App() {
     provider: 'gemini',
     apiKey: '',
     baseUrl: '',
-    model: 'gemini-3-flash-preview'
+    model: 'gemini-3-flash-preview',
+    useProxy: true
   });
   const [showSettings, setShowSettings] = useState(false);
 
@@ -184,6 +185,18 @@ export default function App() {
                   className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
                   placeholder={aiConfig.provider === 'gemini' ? '可选 (默认使用系统 Key)' : '请输入 API Key'}
                 />
+              </div>
+              <div className="space-y-2 flex flex-col justify-end pb-1">
+                <label className="flex items-center gap-2 cursor-pointer group">
+                  <input 
+                    type="checkbox" 
+                    checked={aiConfig.useProxy}
+                    onChange={(e) => setAiConfig({...aiConfig, useProxy: e.target.checked})}
+                    className="w-5 h-5 rounded-lg border-black/10 text-emerald-500 focus:ring-emerald-500/20 transition-all"
+                  />
+                  <span className="text-sm font-bold text-black/60 group-hover:text-black transition-colors">使用代理模式</span>
+                </label>
+                <p className="text-[10px] text-black/30 mt-1">在静态托管环境（如 Cloudflare Pages）下建议关闭此项。</p>
               </div>
               {aiConfig.provider === 'openai-compatible' && (
                 <>

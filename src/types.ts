@@ -5,6 +5,7 @@ export interface AIConfig {
   apiKey: string;
   baseUrl?: string;
   model: string;
+  useProxy: boolean;
 }
 
 export interface ChangeLogAnalysis {

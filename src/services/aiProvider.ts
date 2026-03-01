@@ -157,9 +157,15 @@ export class OpenAICompatibleProvider implements AIProvider {
       'Content-Type': 'application/json'
     };
 
-    // Use the proxy to avoid CORS
-    const response = await axios.post('/api/ai-proxy', { url, data, headers });
-    return response.data.choices[0].message.content;
+    if (this.config.useProxy) {
+      // Use the proxy to avoid CORS (Works in full-stack environments like AI Studio)
+      const response = await axios.post('/api/ai-proxy', { url, data, headers });
+      return response.data.choices[0].message.content;
+    } else {
+      // Direct call (Works in static hosting if the AI provider allows CORS)
+      const response = await axios.post(url, data, { headers });
+      return response.data.choices[0].message.content;
+    }
   }
 
   async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
