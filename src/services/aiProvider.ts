@@ -33,6 +33,25 @@ function parseJSON(text: string): any {
   }
 }
 
+async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 3, initialDelay: number = 2000): Promise<T> {
+  let retries = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const isRateLimit = err.message?.includes("429") || err.status === 429 || err.message?.includes("RESOURCE_EXHAUSTED");
+      if (isRateLimit && retries < maxRetries) {
+        const delay = initialDelay * Math.pow(2, retries);
+        console.warn(`AI Rate limit hit, retrying in ${delay}ms... (Attempt ${retries + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retries++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export class GeminiProvider implements AIProvider {
   private ai: GoogleGenAI;
 
@@ -42,7 +61,7 @@ export class GeminiProvider implements AIProvider {
 
   async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
     try {
-      const response = await this.ai.models.generateContent({
+      const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
           分析以下 GitHub 发布变更日志，并识别对具有此背景的项目产生影响的所有条目：
@@ -56,8 +75,10 @@ export class GeminiProvider implements AIProvider {
         1. 提供该版本的简明摘要（中文）。
         2. **必须识别并罗列变更日志中的每一个条目，严禁遗漏任何一项**。包括所有分类（如 Documentation, Refactor, Fix, Feature 等）下的每一个 PR 或提交。
         3. 对于每一个条目，根据提供的背景评估影响等级（高、中、低）。
-        4. 如果影响等级为“低”，请用一句话解释为什么该项对当前项目背景风险较低。
-        5. 如果影响等级为“高”或“中”，请详细说明它如何影响项目。
+        4. 如果影响等级为“高”或“中”，必须提供：
+           - \`compatibilityAnalysis\`: 结合项目背景，详细说明该变更可能带来的兼容性风险或破坏性影响。
+           - \`codeExample\`: 提供简要的 "before" 和 "after" 代码示例，展示项目代码可能需要如何调整。
+        5. 如果影响等级为“低”，请在 \`reason\` 中简要解释原因。
         6. 必须提取每个条目对应的 Pull Request 编号（例如 #123 或 PR #123）。
         
         请务必使用中文回答，确保输出的 items 数组长度与变更日志中的条目总数一致。
@@ -76,7 +97,15 @@ export class GeminiProvider implements AIProvider {
                   title: { type: Type.STRING },
                   prNumber: { type: Type.INTEGER },
                   reason: { type: Type.STRING },
-                  impactLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] }
+                  impactLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                  compatibilityAnalysis: { type: Type.STRING },
+                  codeExample: {
+                    type: Type.OBJECT,
+                    properties: {
+                      before: { type: Type.STRING },
+                      after: { type: Type.STRING }
+                    }
+                  }
                 },
                 required: ["title", "reason", "impactLevel"]
               }
@@ -86,10 +115,13 @@ export class GeminiProvider implements AIProvider {
           required: ["items", "summary"]
         }
       }
-    });
+    }));
     return parseJSON(response.text || '{}');
   } catch (err: any) {
     console.error("Gemini analyzeChangeLog error:", err);
+    if (err.message?.includes("429") || err.message?.includes("RESOURCE_EXHAUSTED")) {
+      throw new Error("Gemini API 配额已耗尽。请稍后再试，或在设置中更换 API Key。");
+    }
     if (err.message?.includes("Rpc failed") || err.message?.includes("xhr error")) {
       throw new Error("Gemini API 暂时不可用或变更日志过大，请稍后再试。");
     }
@@ -99,7 +131,7 @@ export class GeminiProvider implements AIProvider {
 
   async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
     try {
-      const response = await this.ai.models.generateContent({
+      const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
           分析以下代码差异以识别兼容性风险和破坏性变更。
@@ -141,10 +173,13 @@ export class GeminiProvider implements AIProvider {
           required: ["riskLevel", "breakingChanges", "compatibilityNotes", "recommendations", "codeExample"]
         }
       }
-    });
+    }));
     return parseJSON(response.text || '{}');
   } catch (err: any) {
     console.error("Gemini analyzeDiff error:", err);
+    if (err.message?.includes("429") || err.message?.includes("RESOURCE_EXHAUSTED")) {
+      throw new Error("Gemini API 配额已耗尽。请稍后再试，或在设置中更换 API Key。");
+    }
     if (err.message?.includes("Rpc failed") || err.message?.includes("xhr error")) {
       throw new Error("Gemini API 暂时不可用或差异内容过大导致请求失败，请稍后再试。");
     }
@@ -197,12 +232,20 @@ export class OpenAICompatibleProvider implements AIProvider {
       1. 提供该版本的简明摘要（中文）。
       2. 识别变更日志中的每一个条目。
       3. 评估影响等级（High, Medium, Low）。
-      4. 提取 PR 编号。
+      4. 对于 High/Medium 风险项，提供 \`compatibilityAnalysis\` 和 \`codeExample\` (before/after)。
+      5. 提取 PR 编号。
       
       请以 JSON 格式返回，结构如下：
       {
         "items": [
-          { "title": "...", "prNumber": 123, "reason": "...", "impactLevel": "High/Medium/Low" }
+          { 
+            "title": "...", 
+            "prNumber": 123, 
+            "reason": "...", 
+            "impactLevel": "High/Medium/Low",
+            "compatibilityAnalysis": "...",
+            "codeExample": { "before": "...", "after": "..." }
+          }
         ],
         "summary": "..."
       }

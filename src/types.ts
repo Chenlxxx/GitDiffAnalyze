@@ -6,6 +6,7 @@ export interface AIConfig {
   baseUrl?: string;
   model: string;
   useProxy: boolean;
+  githubToken?: string;
 }
 
 export interface ChangeLogAnalysis {
@@ -14,6 +15,11 @@ export interface ChangeLogAnalysis {
     prNumber?: number;
     reason: string;
     impactLevel: 'High' | 'Medium' | 'Low';
+    compatibilityAnalysis?: string;
+    codeExample?: {
+      before: string;
+      after: string;
+    };
   }[];
   summary: string;
 }

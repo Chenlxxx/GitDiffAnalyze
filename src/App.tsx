@@ -42,7 +42,8 @@ export default function App() {
     apiKey: '',
     baseUrl: '',
     model: 'gemini-3-flash-preview',
-    useProxy: true
+    useProxy: true,
+    githubToken: ''
   });
   const [showSettings, setShowSettings] = useState(false);
 
@@ -65,29 +66,145 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-      // 1. Fetch Release Info
-      let release: GitHubRelease;
-      try {
-        release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, toVersion.startsWith('v') ? toVersion : `v${toVersion}`);
-      } catch (err: any) {
-        // Fallback to searching without 'v' prefix
+      // Helper to find actual tag name from version string
+      const findActualTag = async (version: string) => {
         try {
-          release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, toVersion);
-        } catch (innerErr: any) {
-          const status = innerErr.response?.status;
-          if (status === 404) {
-            throw new Error(`Release version "${toVersion}" not found in this repository.`);
-          } else if (status === 403) {
-            throw new Error('GitHub API rate limit exceeded. Please try again later or configure a GitHub token.');
+          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+          // Try exact match, then v-prefix, then common prefixes like rel/
+          const match = tags.find(t => 
+            t.name === version || 
+            t.name === `v${version}` || 
+            t.name === `rel/v${version}` || 
+            t.name === `rel/${version}` ||
+            t.name.endsWith(`/${version}`) ||
+            t.name.endsWith(`/v${version}`)
+          );
+          return match?.name || version;
+        } catch (e) {
+          return version;
+        }
+      };
+
+      const actualToTag = await findActualTag(toVersion);
+      const actualFromTag = await findActualTag(fromVersion);
+
+      // Helper to extract relevant section from a cumulative changelog
+      const extractVersionSection = (content: string, toV: string, fromV: string) => {
+        const cleanTo = toV.replace(/^v/, '').replace(/^rel\//, '');
+        const cleanFrom = fromV.replace(/^v/, '').replace(/^rel\//, '');
+        
+        const getVersionPos = (ver: string) => {
+          const escapedVer = ver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const patterns = [
+            new RegExp(`(?:Release|Version|##|#|Tag)\\s*v?${escapedVer}`, 'i'),
+            new RegExp(`^v?${escapedVer}\\s*$`, 'im'),
+            new RegExp(`^v?${escapedVer}\\s+[-=]+$`, 'im'),
+            new RegExp(`\\[${escapedVer}\\]`, 'i'),
+          ];
+          
+          for (const p of patterns) {
+            const match = content.match(p);
+            if (match) return match.index;
+          }
+          return -1;
+        };
+
+        const toPos = getVersionPos(cleanTo);
+        if (toPos === -1) return content;
+
+        // Try to find where the next version (or the fromVersion) starts
+        let endPos = -1;
+        const fromPos = getVersionPos(cleanFrom);
+        
+        if (fromPos !== -1 && fromPos > toPos) {
+          endPos = fromPos;
+        } else {
+          // If fromVersion not found, look for ANY other version header after toPos
+          const nextVersionMatch = content.substring(toPos + 10).match(/(?:Release|Version|##|#)\s*v?\d+\.\d+/i);
+          if (nextVersionMatch && nextVersionMatch.index) {
+            endPos = toPos + 10 + nextVersionMatch.index;
+          }
+        }
+
+        if (endPos !== -1) {
+          return content.substring(toPos, endPos);
+        }
+        
+        return content.substring(toPos, toPos + 15000); // Default chunk
+      };
+
+      // 1. Fetch Release Info or Fallback to Files/Commits
+      let releaseBody = '';
+      let releaseUrl = '';
+      
+      try {
+        // Try GitHub Release first
+        const release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag, aiConfig.githubToken);
+        releaseBody = release.body;
+        releaseUrl = release.html_url;
+      } catch (err: any) {
+        // Fallback 1: Try to find a changelog file in the repo (e.g., RELEASE_NOTES.txt)
+        try {
+          const files = ['RELEASE_NOTES.txt', 'CHANGELOG.md', 'CHANGES.txt', 'RELEASENOTES.md', 'CHANGELOG.txt'];
+          let fileContent = '';
+          let foundFile = '';
+          for (const file of files) {
+            try {
+              fileContent = await GitHubService.getFileContent(repoInfo.owner, repoInfo.repo, file, actualToTag, aiConfig.githubToken);
+              if (fileContent) {
+                foundFile = file;
+                console.log(`Found changelog in file: ${file}`);
+                break;
+              }
+            } catch (e) {}
+          }
+          
+          if (fileContent) {
+            releaseBody = extractVersionSection(fileContent, toVersion, fromVersion);
+            releaseUrl = `https://github.com/${repoInfo.owner}/${repoInfo.repo}/blob/${actualToTag}/${foundFile}`;
           } else {
-            throw new Error(`Failed to fetch release info: ${innerErr.message}`);
+            throw new Error('No changelog file found');
+          }
+        } catch (fileErr) {
+          // Fallback 2: Try to compare tags if release and files are not found
+          try {
+            const comparison = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken);
+            releaseUrl = comparison.html_url;
+            // Create a synthetic changelog from commit messages
+            releaseBody = "## Synthetic Changelog (Generated from Commits)\n\n" + 
+              comparison.commits.map((c: any) => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0, 7)})`).join('\n');
+            
+            console.log("Using synthetic changelog from commits");
+          } catch (compareErr: any) {
+            // Log available tags to help user debug
+            try {
+              const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+              console.log("Available tags in this repository:", tags.map(t => t.name));
+            } catch (tagErr) {
+              console.error("Failed to fetch tags for debugging:", tagErr);
+            }
+
+            const status = err.response?.status || compareErr.response?.status;
+            if (status === 404) {
+              throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。请确保这两个版本在 GitHub 上存在（作为 Release 或 Tag）。当前尝试匹配的 Tag 为: ${actualToTag}`);
+            } else if (status === 403 || status === 429) {
+              throw new Error('GitHub API 速率限制已达到。请在设置中配置 GitHub Token 以提高限制。');
+            } else {
+              const errorMsg = compareErr.response?.data?.message || err.response?.data?.message || err.message || "未知错误";
+              throw new Error(`获取发布信息失败: ${errorMsg}`);
+            }
           }
         }
       }
 
       // 2. Analyze Change Log with Selected AI
       const provider = getAIProvider(aiConfig);
-      const analysis = await provider.analyzeChangeLog(release.body, projectBackground);
+      const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground);
+      
+      // Sort items by risk level: High > Medium > Low
+      const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
+      analysis.items.sort((a, b) => riskOrder[a.impactLevel] - riskOrder[b.impactLevel]);
+      
       setChangeLogAnalysis(analysis);
       
     } catch (err: any) {
@@ -106,7 +223,7 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) return;
 
-      const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber);
+      const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber, aiConfig.githubToken);
       const diff = await GitHubService.getDiff(pr.diff_url);
       
       const provider = getAIProvider(aiConfig);
@@ -238,6 +355,16 @@ export default function App() {
                   </div>
                 </>
               )}
+              <div className="space-y-2">
+                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub Token (可选)</label>
+                <input 
+                  type="password" 
+                  value={aiConfig.githubToken}
+                  onChange={(e) => setAiConfig({...aiConfig, githubToken: e.target.value})}
+                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                  placeholder="提高 GitHub API 速率限制"
+                />
+              </div>
             </div>
           </div>
         )}
@@ -428,6 +555,34 @@ export default function App() {
                                 </div>
                                 <h3 className="font-bold text-lg">{item.title}</h3>
                                 <p className="text-sm text-black/60 leading-relaxed">{item.reason}</p>
+                                
+                                {/* AI-based compatibility analysis from changelog (fallback when no diff is available) */}
+                                {!diffAnalyses[item.prNumber || -1] && (item.impactLevel === 'High' || item.impactLevel === 'Medium') && item.compatibilityAnalysis && (
+                                  <div className="mt-4 p-4 bg-amber-50/30 rounded-xl border border-amber-100/50 space-y-3">
+                                    <div className="flex items-center gap-2 text-amber-700 font-bold text-xs uppercase tracking-wider">
+                                      <AlertTriangle size={14} />
+                                      AI 兼容性预判 (基于变更日志)
+                                    </div>
+                                    <p className="text-sm text-amber-900/80 leading-relaxed">{item.compatibilityAnalysis}</p>
+                                    
+                                    {item.codeExample && (
+                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+                                        <div className="space-y-1">
+                                          <div className="text-[9px] font-bold text-amber-600/50 uppercase tracking-widest">Before</div>
+                                          <pre className="p-3 bg-white/50 border border-amber-100/30 rounded-lg text-[11px] font-mono text-amber-900/70 overflow-x-auto">
+                                            <code>{item.codeExample.before}</code>
+                                          </pre>
+                                        </div>
+                                        <div className="space-y-1">
+                                          <div className="text-[9px] font-bold text-amber-600/50 uppercase tracking-widest">After</div>
+                                          <pre className="p-3 bg-white/50 border border-amber-100/30 rounded-lg text-[11px] font-mono text-amber-900/70 overflow-x-auto">
+                                            <code>{item.codeExample.after}</code>
+                                          </pre>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                               
                               {item.prNumber && (item.impactLevel === 'High' || item.impactLevel === 'Medium') && (

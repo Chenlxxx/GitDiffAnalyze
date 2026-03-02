@@ -18,17 +18,23 @@ async function startServer() {
       
       console.log(`Proxying request to: ${url}`);
       
-      const response = await axios.get(url, {
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'GitDiff-Analyzer-App'
-        }
-      });
+      const githubToken = req.headers['x-github-token'];
+      const headers: any = {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'GitDiff-Analyzer-App'
+      };
+      
+      if (githubToken) {
+        headers['Authorization'] = `token ${githubToken}`;
+      }
+      
+      const response = await axios.get(url, { headers });
       
       res.json(response.data);
     } catch (error: any) {
-      console.error('GitHub Proxy Error:', error.response?.data || error.message);
-      res.status(error.response?.status || 500).json(error.response?.data || { message: error.message });
+      const errorData = error.response?.data;
+      console.error('GitHub Proxy Error:', JSON.stringify(errorData || error.message));
+      res.status(error.response?.status || 500).json(errorData || { message: error.message });
     }
   });
 
