@@ -124,6 +124,22 @@ export default function App() {
     }
   };
 
+  const handleBatchDeepScan = async () => {
+    if (!changeLogAnalysis) return;
+    
+    const targetItems = changeLogAnalysis.items.filter(item => 
+      (item.impactLevel === 'High' || item.impactLevel === 'Medium') && 
+      item.prNumber && 
+      !diffAnalyses[item.prNumber] &&
+      !analyzingPrs.has(item.prNumber)
+    );
+
+    if (targetItems.length === 0) return;
+
+    // Trigger all scans in parallel
+    await Promise.all(targetItems.map(item => analyzePR(item.prNumber!, item.title)));
+  };
+
   return (
     <div className="min-h-screen bg-[#F5F5F5] text-[#1A1A1A] font-sans selection:bg-emerald-100">
       {/* Header */}
@@ -352,10 +368,26 @@ export default function App() {
                 {/* All Changes Section */}
                 <section className="space-y-4">
                   <div className="flex items-center justify-between px-2">
-                    <h2 className="text-xl font-bold flex items-center gap-2">
-                      <History size={20} className="text-amber-500" />
-                      变更详情与风险评估
-                    </h2>
+                    <div className="flex items-center gap-4">
+                      <h2 className="text-xl font-bold flex items-center gap-2">
+                        <History size={20} className="text-amber-500" />
+                        变更详情与风险评估
+                      </h2>
+                      {changeLogAnalysis.items.some(item => (item.impactLevel === 'High' || item.impactLevel === 'Medium') && item.prNumber && !diffAnalyses[item.prNumber]) && (
+                        <button 
+                          onClick={handleBatchDeepScan}
+                          disabled={analyzingPrs.size > 0}
+                          className="flex items-center gap-2 px-4 py-1.5 bg-black text-white rounded-full text-xs font-bold hover:bg-black/80 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-sm hover:shadow-md active:scale-95"
+                        >
+                          {analyzingPrs.size > 0 ? (
+                            <Loader2 className="animate-spin" size={14} />
+                          ) : (
+                            <Cpu size={14} />
+                          )}
+                          一键深度扫描 (中/高风险)
+                        </button>
+                      )}
+                    </div>
                     <span className="text-xs font-medium text-black/40 bg-black/5 px-2 py-1 rounded-lg">
                       共 {changeLogAnalysis.items.length} 项变更
                     </span>

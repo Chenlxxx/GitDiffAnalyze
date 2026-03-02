@@ -41,10 +41,11 @@ export class GeminiProvider implements AIProvider {
   }
 
   async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
-    const response = await this.ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `
-        分析以下 GitHub 发布变更日志，并识别对具有此背景的项目产生影响的所有条目：
+    try {
+      const response = await this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          分析以下 GitHub 发布变更日志，并识别对具有此背景的项目产生影响的所有条目：
         
         项目背景：${projectBackground}
         
@@ -87,19 +88,27 @@ export class GeminiProvider implements AIProvider {
       }
     });
     return parseJSON(response.text || '{}');
+  } catch (err: any) {
+    console.error("Gemini analyzeChangeLog error:", err);
+    if (err.message?.includes("Rpc failed") || err.message?.includes("xhr error")) {
+      throw new Error("Gemini API 暂时不可用或变更日志过大，请稍后再试。");
+    }
+    throw err;
   }
+}
 
   async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
-    const response = await this.ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `
-        分析以下代码差异以识别兼容性风险和破坏性变更。
-        
-        PR 标题：${prTitle}
-        项目背景：${projectBackground}
-        
-        差异内容：
-        ${diff.slice(0, 30000)}
+    try {
+      const response = await this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          分析以下代码差异以识别兼容性风险和破坏性变更。
+          
+          PR 标题：${prTitle}
+          项目背景：${projectBackground}
+          
+          差异内容：
+          ${diff.slice(0, 20000)}
         
         任务：
         1. 识别任何破坏性变更（API 更改、删除的方法、更改的签名）。
@@ -134,7 +143,14 @@ export class GeminiProvider implements AIProvider {
       }
     });
     return parseJSON(response.text || '{}');
+  } catch (err: any) {
+    console.error("Gemini analyzeDiff error:", err);
+    if (err.message?.includes("Rpc failed") || err.message?.includes("xhr error")) {
+      throw new Error("Gemini API 暂时不可用或差异内容过大导致请求失败，请稍后再试。");
+    }
+    throw err;
   }
+}
 }
 
 export class OpenAICompatibleProvider implements AIProvider {
