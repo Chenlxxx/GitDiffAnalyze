@@ -38,10 +38,10 @@ export default function App() {
   
   // AI Config
   const [aiConfig, setAiConfig] = useState<AIConfig>({
-    provider: 'gemini',
-    apiKey: '',
-    baseUrl: '',
-    model: 'gemini-3-flash-preview',
+    provider: 'openai-compatible',
+    apiKey: 'AAAAAAAAAA',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'qwen-plus',
     useProxy: true,
     githubToken: ''
   });
