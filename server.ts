@@ -61,6 +61,22 @@ async function startServer() {
   app.post("/api/ai-proxy", async (req, res) => {
     try {
       const { url, data, headers } = req.body;
+      
+      // Inject default API keys if missing or empty
+      const authHeader = headers['Authorization'] || headers['authorization'];
+      const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
+      
+      if (isAuthEmpty) {
+        if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
+          headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
+        } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
+          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+        } else if (process.env.OPENAI_API_KEY) {
+          // Fallback to OPENAI_API_KEY for other compatible providers if configured
+          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+        }
+      }
+
       const response = await axios.post(url, data, { headers });
       res.json(response.data);
     } catch (error: any) {

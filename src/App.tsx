@@ -39,7 +39,7 @@ export default function App() {
   // AI Config
   const [aiConfig, setAiConfig] = useState<AIConfig>({
     provider: 'openai-compatible',
-    apiKey: 'AAAAAAAAAA',
+    apiKey: '',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     model: 'qwen-plus',
     useProxy: true,

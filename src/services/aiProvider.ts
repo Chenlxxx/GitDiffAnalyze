@@ -284,7 +284,7 @@ export class OpenAICompatibleProvider implements AIProvider {
 
 export function getAIProvider(config: AIConfig): AIProvider {
   if (config.provider === 'gemini') {
-    return new GeminiProvider(config.apiKey || process.env.GEMINI_API_KEY || '');
+    return new GeminiProvider(config.apiKey || '');
   }
   return new OpenAICompatibleProvider(config);
 }
