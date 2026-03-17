@@ -19,8 +19,9 @@ async function startServer() {
       console.log(`Proxying request to: ${url}`);
       
       const githubToken = req.headers['x-github-token'];
+      const customAccept = req.headers['accept'];
       const headers: any = {
-        'Accept': 'application/vnd.github.v3+json',
+        'Accept': customAccept || 'application/vnd.github.v3+json',
         'User-Agent': 'GitDiff-Analyzer-App'
       };
       
@@ -69,19 +70,34 @@ async function startServer() {
       if (isAuthEmpty) {
         if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
           headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
+          console.log('Injected QWEN_API_KEY from environment');
         } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
           headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+          console.log('Injected OPENAI_API_KEY from environment');
         } else if (process.env.OPENAI_API_KEY) {
-          // Fallback to OPENAI_API_KEY for other compatible providers if configured
           headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+          console.log('Injected fallback OPENAI_API_KEY from environment');
+        } else {
+          console.warn(`AI Proxy: No API key provided by client and no default key found in environment for ${url}`);
         }
       }
 
       const response = await axios.post(url, data, { headers });
       res.json(response.data);
     } catch (error: any) {
-      console.error('AI Proxy Error:', error.response?.data || error.message);
-      res.status(error.response?.status || 500).json(error.response?.data || { message: error.message });
+      const status = error.response?.status;
+      const errorData = error.response?.data;
+      
+      console.error(`AI Proxy Error (${status}):`, JSON.stringify(errorData || error.message));
+      
+      if (status === 401) {
+        return res.status(401).json({
+          message: '身份验证失败 (401)。请检查您的 API Key 是否正确，或者是否已在服务端配置了默认 Key。',
+          details: errorData
+        });
+      }
+      
+      res.status(status || 500).json(errorData || { message: error.message });
     }
   });
 

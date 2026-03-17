@@ -47,6 +47,16 @@ export class GitHubService {
     return response.data;
   }
 
+  static async getCompareDiff(owner: string, repo: string, base: string, head: string, token?: string): Promise<string> {
+    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
+      headers: {
+        ...(token ? { 'X-GitHub-Token': token } : {}),
+        'Accept': 'application/vnd.github.v3.diff'
+      }
+    });
+    return response.data;
+  }
+
   static async getFileContent(owner: string, repo: string, path: string, ref: string, token?: string): Promise<string> {
     const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/contents/${path}?ref=${ref}`, {
       headers: token ? { 'X-GitHub-Token': token } : {}

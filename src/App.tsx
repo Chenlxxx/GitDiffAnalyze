@@ -13,6 +13,7 @@ import {
   Info, 
   Loader2, 
   ExternalLink,
+  GitCommit,
   ChevronRight,
   History,
   Code2,
@@ -21,7 +22,7 @@ import {
 } from 'lucide-react';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis } from './types';
 import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -31,10 +32,10 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
-  const [repoUrl, setRepoUrl] = useState('https://github.com/maxGraph/maxGraph');
-  const [fromVersion, setFromVersion] = useState('0.21.0');
-  const [toVersion, setToVersion] = useState('0.22.0');
-  const [projectBackground, setProjectBackground] = useState('我现在的项目是coze平台再这个平台中可以搭建agent，这个项目用到了maxgraph作为三方件');
+  const [repoUrl, setRepoUrl] = useState('https://github.com/apache/httpcomponents-client');
+  const [fromVersion, setFromVersion] = useState('v5.4.4');
+  const [toVersion, setToVersion] = useState('v5.5');
+  const [projectBackground, setProjectBackground] = useState('平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
   
   // AI Config
   const [aiConfig, setAiConfig] = useState<AIConfig>({
@@ -48,17 +49,25 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
 
   const [loading, setLoading] = useState(false);
-  const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs'>('idle');
+  const [analysisMode, setAnalysisMode] = useState<'changelog' | 'full-diff'>('changelog');
+  const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs' | 'analyzing-full-diff'>('idle');
   const [error, setError] = useState<string | null>(null);
   
   const [changeLogAnalysis, setChangeLogAnalysis] = useState<ChangeLogAnalysis | null>(null);
+  const [fullDiffAnalysis, setFullDiffAnalysis] = useState<FullDiffAnalysis | null>(null);
+  const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
 
   const handleAnalyze = async () => {
+    if (analysisMode === 'full-diff') {
+      return handleFullDiffAnalyze();
+    }
+
     setLoading(true);
     setError(null);
     setChangeLogAnalysis(null);
+    setFullDiffAnalysis(null);
     setDiffAnalyses({});
     setStep('analyzing-changelog');
 
@@ -87,6 +96,7 @@ export default function App() {
 
       const actualToTag = await findActualTag(toVersion);
       const actualFromTag = await findActualTag(fromVersion);
+      setResolvedTags({ from: actualFromTag, to: actualToTag });
 
       // Helper to extract relevant section from a cumulative changelog
       const extractVersionSection = (content: string, toV: string, fromV: string) => {
@@ -210,6 +220,70 @@ export default function App() {
     } catch (err: any) {
       console.error(err);
       setError(err.message || '分析过程中发生错误');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFullDiffAnalyze = async () => {
+    setLoading(true);
+    setError(null);
+    setChangeLogAnalysis(null);
+    setFullDiffAnalysis(null);
+    setDiffAnalyses({});
+    setStep('analyzing-full-diff');
+
+    try {
+      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
+      if (!repoInfo) throw new Error('Invalid GitHub URL');
+
+      const findActualTag = async (version: string) => {
+        try {
+          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+          const match = tags.find(t => 
+            t.name === version || 
+            t.name === `v${version}` || 
+            t.name === `rel/v${version}` || 
+            t.name === `rel/${version}` ||
+            t.name.endsWith(`/${version}`) ||
+            t.name.endsWith(`/v${version}`)
+          );
+          return match?.name || version;
+        } catch (e) {
+          return version;
+        }
+      };
+
+      const actualToTag = await findActualTag(toVersion);
+      const actualFromTag = await findActualTag(fromVersion);
+      setResolvedTags({ from: actualFromTag, to: actualToTag });
+
+      // 1. Fetch Commits and Full Diff
+      setStep('analyzing-full-diff');
+      const [commitData, diff] = await Promise.all([
+        GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken),
+        GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken)
+      ]);
+      
+      if (!diff || diff.length < 10) {
+        throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
+      }
+
+      // 2. Analyze Full Diff with Selected AI
+      const provider = getAIProvider(aiConfig);
+      const analysis = await provider.analyzeFullDiff(diff, projectBackground, commitData.commits);
+      
+      // Sort items within each category by risk level: High > Medium > Low
+      const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
+      analysis.categories.forEach(cat => {
+        cat.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
+      });
+      
+      setFullDiffAnalysis(analysis);
+      
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || '深度分析过程中发生错误');
     } finally {
       setLoading(false);
     }
@@ -381,6 +455,35 @@ export default function App() {
               
               <div className="space-y-6">
                 <div className="space-y-2">
+                  <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">分析模式</label>
+                  <div className="flex p-1 bg-[#F9F9F9] border border-black/5 rounded-xl">
+                    <button 
+                      onClick={() => setAnalysisMode('changelog')}
+                      className={cn(
+                        "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                        analysisMode === 'changelog' ? "bg-white shadow-sm text-black" : "text-black/40 hover:text-black/60"
+                      )}
+                    >
+                      变更日志模式
+                    </button>
+                    <button 
+                      onClick={() => setAnalysisMode('full-diff')}
+                      className={cn(
+                        "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                        analysisMode === 'full-diff' ? "bg-white shadow-sm text-black" : "text-black/40 hover:text-black/60"
+                      )}
+                    >
+                      全量 Diff 模式
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-black/30 px-1">
+                    {analysisMode === 'changelog' 
+                      ? "基于 Release Notes 或 Commit 记录进行初步评估。" 
+                      : "直接获取两个版本间的完整代码差异进行深度扫描。"}
+                  </p>
+                </div>
+
+                <div className="space-y-2">
                   <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub 仓库地址</label>
                   <div className="relative">
                     <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-black/20" size={18} />
@@ -455,7 +558,7 @@ export default function App() {
 
           {/* Right Column: Results */}
           <div className="lg:col-span-8 space-y-8">
-            {!changeLogAnalysis && !loading && (
+            {!changeLogAnalysis && !fullDiffAnalysis && !loading && (
               <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-center space-y-4 bg-white/50 border border-dashed border-black/10 rounded-3xl">
                 <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center text-black/20">
                   <History size={32} />
@@ -467,10 +570,160 @@ export default function App() {
               </div>
             )}
 
-            {loading && step === 'analyzing-changelog' && (
+            {loading && (step === 'analyzing-changelog' || step === 'analyzing-full-diff') && (
               <div className="space-y-6 animate-pulse">
                 <div className="h-48 bg-white rounded-3xl border border-black/5" />
                 <div className="h-64 bg-white rounded-3xl border border-black/5" />
+              </div>
+            )}
+
+            {fullDiffAnalysis && (
+              <div className="space-y-8">
+                {/* Full Diff Summary Section */}
+                <section className="bg-white rounded-3xl p-8 shadow-sm border border-black/5">
+                  <div className="flex items-center justify-between mb-6">
+                    <h2 className="text-xl font-bold flex items-center gap-2">
+                      <Info size={20} className="text-blue-500" />
+                      全量 Diff 深度分析摘要
+                    </h2>
+                    <div className="flex items-center gap-2">
+                      <span className={cn(
+                        "px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border",
+                        fullDiffAnalysis.overallRisk === 'High' ? "bg-red-50 text-red-700 border-red-100" :
+                        fullDiffAnalysis.overallRisk === 'Medium' ? "bg-amber-50 text-amber-700 border-amber-100" :
+                        "bg-emerald-50 text-emerald-700 border-emerald-100"
+                      )}>
+                        整体风险: {fullDiffAnalysis.overallRisk === 'High' ? '高' : fullDiffAnalysis.overallRisk === 'Medium' ? '中' : '低'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="prose prose-sm max-w-none text-black/70">
+                    <Markdown>{fullDiffAnalysis.summary}</Markdown>
+                  </div>
+                </section>
+
+                {/* Recommendations Section */}
+                <section className="bg-white rounded-3xl p-8 shadow-sm border border-black/5">
+                  <h3 className="text-lg font-bold mb-4 flex items-center gap-2">
+                    <CheckCircle2 size={18} className="text-emerald-500" />
+                    核心建议
+                  </h3>
+                  <ul className="space-y-3">
+                    {fullDiffAnalysis.recommendations.map((rec, i) => (
+                      <li key={i} className="text-sm text-black/70 flex gap-3">
+                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 mt-2 shrink-0" />
+                        {rec}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+
+                {/* Detailed Categories Section */}
+                <section className="space-y-6">
+                  <div className="flex items-center justify-between px-2">
+                    <h2 className="text-xl font-bold">变更分类详情</h2>
+                    <a 
+                      href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"
+                    >
+                      查看 GitHub 原始对比
+                      <ExternalLink size={12} />
+                    </a>
+                  </div>
+                  {fullDiffAnalysis.categories.map((cat, idx) => (
+                    <div key={idx} className="space-y-4">
+                      <h3 className="text-sm font-bold text-black/40 uppercase tracking-widest px-2">{cat.name}</h3>
+                      <div className="grid gap-4">
+                        {cat.items.map((item, i) => (
+                          <div key={i} className="bg-white rounded-2xl border border-black/5 shadow-sm transition-all hover:shadow-md overflow-hidden">
+                            <div className="p-6">
+                              <div className="flex items-start justify-between gap-4 mb-3">
+                                <h4 className="font-bold text-lg">{item.title}</h4>
+                                <span className={cn(
+                                  "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
+                                  item.riskLevel === 'High' ? "bg-red-50 text-red-600 border border-red-100" :
+                                  item.riskLevel === 'Medium' ? "bg-amber-50 text-amber-600 border border-amber-100" :
+                                  "bg-emerald-50 text-emerald-700 border border-emerald-100"
+                                )}>
+                                  {item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低'} 风险
+                                </span>
+                              </div>
+                              <p className="text-sm text-black/60 mb-4 leading-relaxed">{item.description}</p>
+                              
+                              {/* Commit Links */}
+                              {item.commitLinks && item.commitLinks.length > 0 && (
+                                <div className="mb-4 flex flex-wrap gap-2">
+                                  {item.commitLinks.map((link, lIdx) => (
+                                    <a 
+                                      key={lIdx}
+                                      href={link.url}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 border border-black/5 rounded text-[10px] font-mono text-black/60 transition-colors"
+                                    >
+                                      <GitCommit size={10} />
+                                      {link.sha.substring(0, 7)}
+                                    </a>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* Source Snippet for Credibility */}
+                              {item.sourceSnippet && (
+                                <div className="mb-4 space-y-2">
+                                  <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest flex items-center gap-1.5">
+                                    <Code2 size={12} />
+                                    原始代码片段 (Diff 原文)
+                                  </div>
+                                  <pre className="p-4 bg-gray-50 border border-black/5 rounded-xl text-[11px] font-mono text-black/70 overflow-x-auto whitespace-pre-wrap break-all">
+                                    <code>{item.sourceSnippet}</code>
+                                  </pre>
+                                </div>
+                              )}
+
+                              {/* Compatibility Analysis & Code Examples */}
+                              {(item.riskLevel === 'High' || item.riskLevel === 'Medium') && (
+                                <div className="space-y-4 mt-4 pt-4 border-t border-black/5">
+                                  {item.compatibilityAnalysis && (
+                                    <div className="p-4 bg-amber-50/30 rounded-xl border border-amber-100/50">
+                                      <div className="text-[10px] font-bold text-amber-700 uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                                        <AlertTriangle size={12} />
+                                        兼容性影响分析
+                                      </div>
+                                      <p className="text-sm text-amber-900/80 leading-relaxed">{item.compatibilityAnalysis}</p>
+                                    </div>
+                                  )}
+
+                                  {item.codeExample && (
+                                    <div className="space-y-3">
+                                      <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest">迁移指导代码示例</div>
+                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div className="space-y-1">
+                                          <div className="text-[9px] font-bold text-red-600/50 uppercase tracking-widest">修改前 (Before)</div>
+                                          <pre className="p-3 bg-red-50/20 border border-red-100/30 rounded-lg text-[11px] font-mono text-red-900/80 overflow-x-auto whitespace-pre-wrap break-all">
+                                            <code>{item.codeExample.before}</code>
+                                          </pre>
+                                        </div>
+                                        <div className="space-y-1">
+                                          <div className="text-[9px] font-bold text-emerald-600/50 uppercase tracking-widest">修改后 (After)</div>
+                                          <pre className="p-3 bg-emerald-50/20 border border-emerald-100/30 rounded-lg text-[11px] font-mono text-emerald-900/80 overflow-x-auto whitespace-pre-wrap break-all">
+                                            <code>{item.codeExample.after}</code>
+                                          </pre>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </section>
               </div>
             )}
 
