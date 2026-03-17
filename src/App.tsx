@@ -360,7 +360,7 @@ export default function App() {
       const headerRow = worksheet.addRow(['', ...headers]);
       headerRow.height = 35;
       
-      const thinBorder = {
+      const thinBorder: any = {
         top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
         left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
         bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } },

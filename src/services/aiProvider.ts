@@ -6,56 +6,81 @@ function parseJSON(text: string): any {
   if (!text) return {};
   let cleanText = text.trim();
   
-  // Helper to try parsing
+  // Helper to try parsing and fixing common issues
   const tryParse = (str: string) => {
     try {
       return JSON.parse(str);
-    } catch (e) {
-      // Try to fix common JSON issues:
+    } catch (e: any) {
+      let fixed = str;
+      
       // 1. Remove trailing commas before closing braces/brackets
-      let fixed = str.replace(/,\s*([\]}])/g, '$1');
+      fixed = fixed.replace(/,\s*([\]}])/g, '$1');
+      
       // 2. Handle unescaped newlines in strings
-      // This is tricky, but we can try to find newlines that are NOT preceded by a backslash
-      // and are inside double quotes. A simpler approach is to just escape all newlines 
-      // that are not already escaped, but that might break actual escaped newlines.
-      // Let's try to replace literal newlines with \n if they are between quotes.
-      // However, a safer way is to just replace them globally if we're desperate.
+      fixed = fixed.replace(/"([^"]*?)\n([^"]*?)"/g, (match, p1, p2) => {
+        return `"${p1}\\n${p2}"`;
+      });
+
       try {
         return JSON.parse(fixed);
-      } catch (e2) {
-        // If still failing, try to replace literal newlines with \n
-        // This is a bit aggressive but often works for AI-generated JSON
-        try {
-          const veryFixed = fixed.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-          // But wait, this will break the JSON structure itself if not careful.
-          // Let's not do this globally yet.
-          return null;
-        } catch (e3) {
-          return null;
+      } catch (e2: any) {
+        // 3. Handle truncated JSON
+        if (e2.message?.includes("Unexpected end of JSON input") || e2.message?.includes("Unterminated string")) {
+          let truncated = fixed;
+          
+          const lastQuote = truncated.lastIndexOf('"');
+          const lastOpenBrace = truncated.lastIndexOf('{');
+          const lastOpenBracket = truncated.lastIndexOf('[');
+          
+          if (lastQuote > lastOpenBrace && lastQuote > lastOpenBracket) {
+            const quotesAfterLastBrace = truncated.substring(Math.max(lastOpenBrace, lastOpenBracket)).split('"').length - 1;
+            if (quotesAfterLastBrace % 2 !== 0) {
+              truncated += '"';
+            }
+          }
+
+          const stack: string[] = [];
+          for (let i = 0; i < truncated.length; i++) {
+            if (truncated[i] === '{') stack.push('}');
+            else if (truncated[i] === '[') stack.push(']');
+            else if (truncated[i] === '}') stack.pop();
+            else if (truncated[i] === ']') stack.pop();
+          }
+
+          while (stack.length > 0) {
+            truncated += stack.pop();
+          }
+
+          try {
+            return JSON.parse(truncated);
+          } catch (e3) {
+            return null;
+          }
         }
+        return null;
       }
     }
   };
 
-  // 1. Try direct parse
   let result = tryParse(cleanText);
   if (result) return result;
 
-  // 2. Try to extract JSON from markdown code blocks
   const jsonMatch = cleanText.match(/```json\s*([\s\S]*?)\s*```/i) || cleanText.match(/```\s*([\s\S]*?)\s*```/i);
   if (jsonMatch && jsonMatch[1]) {
     result = tryParse(jsonMatch[1].trim());
     if (result) return result;
-    console.error("Failed to parse extracted JSON");
   }
   
-  // 3. Try to find the first '{' and last '}'
   const firstBrace = cleanText.indexOf('{');
   const lastBrace = cleanText.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     result = tryParse(cleanText.substring(firstBrace, lastBrace + 1));
     if (result) return result;
-    console.error("Failed to parse braced JSON");
+  }
+
+  if (cleanText.startsWith('{')) {
+    result = tryParse(cleanText);
+    if (result) return result;
   }
   
   throw new Error("无法解析 AI 返回的 JSON 数据。这通常是因为返回内容过长导致截断，或者内容中包含特殊字符。请尝试缩小分析范围或稍后再试。");
@@ -221,9 +246,70 @@ export class GeminiProvider implements AIProvider {
   }
 }
 
+  private async clusterCommitsInBatches(commits: any[]): Promise<string> {
+    if (!commits || commits.length === 0) return '';
+    
+    if (commits.length <= 20) {
+      return commits.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n');
+    }
+
+    console.log(`Clustering ${commits.length} commits in batches...`);
+
+    const batchSize = 40;
+    const clusters: string[] = [];
+    
+    for (let i = 0; i < commits.length; i += batchSize) {
+      const batch = commits.slice(i, i + batchSize);
+      const batchText = batch.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n');
+      
+      const response = await withRetry(() => this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          请对以下代码提交（Commits）进行聚类分析。
+          
+          提交列表：
+          ${batchText}
+          
+          任务：
+          1. 识别具有相同目的或涉及相同模块的提交，并将它们聚类。
+          2. 对于每个聚类，提供一个简洁的描述（中文），并列出包含的 SHA。
+          3. 识别潜在的高风险变更（如 API 变更、核心逻辑修改）。
+          4. 过滤掉琐碎的变更（如文档、注释、测试、版本号更新）。
+          
+          请以结构化的文本形式返回，例如：
+          - [模块名/功能名] 描述 (关联 SHA: sha1, sha2...) [风险等级: 高/中/低]
+        `,
+      }));
+      
+      clusters.push(response.text || '');
+    }
+    
+    if (clusters.length > 1) {
+       const finalResponse = await withRetry(() => this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          请对以下多批次的提交聚类结果进行最终的整合与精简。
+          
+          聚类结果：
+          ${clusters.join('\n\n')}
+          
+          任务：
+          1. 合并重复或高度相关的聚类。
+          2. 确保所有重要的变更点都被保留。
+          3. 保持描述简洁且专业。
+          
+          请以结构化的文本形式返回。
+        `,
+      }));
+      return finalResponse.text || clusters.join('\n\n');
+    }
+    
+    return clusters[0];
+  }
+
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
     try {
-      const commitSummary = commits ? commits.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+      const enrichedCommitSummary = await this.clusterCommitsInBatches(commits || []);
       const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}, Changes: +${f.additions}/-${f.deletions}`).join('\n') : '';
       
       const response = await withRetry(() => this.ai.models.generateContent({
@@ -233,39 +319,32 @@ export class GeminiProvider implements AIProvider {
           
           **分析输入：**
           1. **代码差异 (Diff)**：最真实的代码变更。
-          2. **Commit 记录**：变更的具体意图。
+          2. **结构化 Commit 聚类分析**：这是对所有 ${commits?.length || 0} 个 Commit 的预分析结果，包含了每个变更的意图和初步风险评估。
           3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
           
-          **核心原则：**
-          1. **全量分析，严禁遗漏**：你必须查看提供的【所有】Commit 记录（除非是纯格式化、注释、测试代码、版本号更新）。每一个非琐碎的 Commit 都必须在分析结果中有所体现，或者归纳到相关的变更点中。
-          2. **代码驱动 + 日志参考**：主要依靠代码 Diff 和 Commit 进行分析，但**必须参考**发布日志中的说明。如果发布日志中提到某个变更是 Breaking Change 或高危变更，即使代码层面看起来变动不大，也应重点分析并提高风险等级。
-          3. **语义变更优先**：重点关注“语义变更”（行为变化、逻辑调整、兼容性影响），而非仅关注“API 变更”。
-          4. **可溯源性**：在分析结果中，如果某个变更能明确关联到某个 Commit，请务必记录其 SHA。
-          5. **业务影响评估**：如果某个修改会影响到业务功能，或者会导致运行期错误，必须显著提高风险等级。
-          
-          **风险评估原则：**
-          - 评估对象是【兼容性风险】：升级后，旧代码 / 旧配置 / 旧默认行为是否可能发生变化或失效。
-          - 风险评估以“技术兼容性变化”为核心。
-          - 允许结合“该变更对业务能力面的影响范围与关键程度”进行有限度风险调整。
-          - 不允许因为业务重要而忽略兼容性事实，也不允许脱离变更内容主观放大。
+          **核心指令（最高优先级）：**
+          1. **100% 覆盖率**：你必须确保分析结果覆盖了提供的【所有】非琐碎 Commit。严禁为了节省篇幅而忽略任何一个可能影响行为的修改。
+          2. **琐碎变更定义**：仅允许忽略“纯版本号更新”、“纯文档/注释修改”、“纯测试代码增加”。除此之外的所有逻辑变更、配置调整、依赖升级都必须分析。
+          3. **深度聚类**：将具有相同目标的多个 Commit 聚类为一个“变更点”，但在描述中必须列出所有关联的 SHA。
+          4. **风险放大原则**：如果代码 Diff 显示了逻辑变动，但 Commit Message 描述模糊，应按“中/高风险”处理并要求排查。
           
           项目背景：${projectBackground}
           
           变更文件列表：
           ${fileSummary}
           
-          相关 Commits 列表（共 ${commits?.length || 0} 个）：
-          ${commitSummary}
+          结构化 Commit 聚类与风险初筛：
+          ${enrichedCommitSummary}
           
           发布日志 (Release Notes)：
           ${releaseNotes || '未提供'}
           
           差异内容（Diff）：
-          ${diff.slice(0, 40000)}
+          ${diff.slice(0, 45000)}
           
           任务：
           1. 提供变更的整体摘要。
-          2. 识别关键变更条目，并评估风险等级。**如果变更条目过多（超过 15 个），请优先分析风险等级较高的条目，并对相似的条目进行合并，以确保输出的 JSON 完整且不被截断。**
+          2. 识别关键变更条目，并评估风险等级。
           3. **深度分析与兼容性指导**：对于“高”和“中”风险项，提供深度分析和代码示例。
           4. **生成 Excel 结构化数据**：为了方便导出，请同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
           
@@ -279,17 +358,13 @@ export class GeminiProvider implements AIProvider {
           - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
           - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。内容要详细，分点请使用回车换行。
           - **code_fix**: 代码整改指导。必须提供**详细的、能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。代码示例应包含必要的上下文。
-          - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
+          - **related_commits**: 关联的 Commit SHA（必须列出所有相关的 SHA，用逗号分隔）
           
-          **特别注意：**
-          - 对于分点描述（如 1.xxx 2.xxx），请务必在每个点之间添加换行符（\\n），确保在表格和 Excel 中清晰易读。
-          - 代码整改指导必须包含具体的代码块示例。
-          - 必须确保所有非琐碎的 Commit 都被分析到。
-
           请务必使用中文回答。
         `,
         config: {
           responseMimeType: "application/json",
+          maxOutputTokens: 16384,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -372,13 +447,14 @@ export class OpenAICompatibleProvider implements AIProvider {
     this.config = config;
   }
 
-  private async callAI(prompt: string, jsonMode: boolean = true): Promise<string> {
+  private async callAI(prompt: string, jsonMode: boolean = true, maxTokens: number = 4096): Promise<string> {
     const url = `${this.config.baseUrl || 'https://api.openai.com/v1'}/chat/completions`;
     const data = {
       model: this.config.model,
       messages: [{ role: 'user', content: prompt }],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
-      temperature: 0.1
+      temperature: 0.1,
+      max_tokens: maxTokens
     };
     const headers = {
       'Authorization': `Bearer ${this.config.apiKey}`,
@@ -387,7 +463,6 @@ export class OpenAICompatibleProvider implements AIProvider {
 
     try {
       if (this.config.useProxy) {
-        // Use the proxy to avoid CORS (Works in full-stack environments like AI Studio)
         const response = await axios.post('/api/ai-proxy', { url, data, headers });
         if (!response.data?.choices?.[0]?.message?.content) {
           console.error("Invalid AI response structure:", response.data);
@@ -395,7 +470,6 @@ export class OpenAICompatibleProvider implements AIProvider {
         }
         return response.data.choices[0].message.content;
       } else {
-        // Direct call (Works in static hosting if the AI provider allows CORS)
         const response = await axios.post(url, data, { headers });
         if (!response.data?.choices?.[0]?.message?.content) {
           console.error("Invalid AI response structure:", response.data);
@@ -473,8 +547,64 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
 
+  private async clusterCommitsInBatches(commits: any[]): Promise<string> {
+    if (!commits || commits.length === 0) return '';
+    
+    if (commits.length <= 20) {
+      return commits.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n');
+    }
+
+    console.log(`Clustering ${commits.length} commits in batches (OpenAI)...`);
+
+    const batchSize = 40;
+    const clusters: string[] = [];
+    
+    for (let i = 0; i < commits.length; i += batchSize) {
+      const batch = commits.slice(i, i + batchSize);
+      const batchText = batch.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n');
+      
+      const prompt = `
+        请对以下代码提交（Commits）进行聚类分析。
+        
+        提交列表：
+        ${batchText}
+        
+        任务：
+        1. 识别具有相同目的或涉及相同模块的提交，并将它们聚类。
+        2. 对于每个聚类，提供一个简洁的描述（中文），并列出包含的 SHA。
+        3. 识别潜在的高风险变更（如 API 变更、核心逻辑修改）。
+        4. 过滤掉琐碎的变更（如文档、注释、测试、版本号更新）。
+        
+        请以结构化的文本形式返回，例如：
+        - [模块名/功能名] 描述 (关联 SHA: sha1, sha2...) [风险等级: 高/中/低]
+      `;
+      
+      const response = await this.callAI(prompt, false);
+      clusters.push(response);
+    }
+    
+    if (clusters.length > 1) {
+      const finalPrompt = `
+        请对以下多批次的提交聚类结果进行最终的整合与精简。
+        
+        聚类结果：
+        ${clusters.join('\n\n')}
+        
+        任务：
+        1. 合并重复或高度相关的聚类。
+        2. 确保所有重要的变更点都被保留。
+        3. 保持描述简洁且专业。
+        
+        请以结构化的文本形式返回。
+      `;
+      return await this.callAI(finalPrompt, false);
+    }
+    
+    return clusters[0];
+  }
+
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
-    const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+    const enrichedCommitSummary = await this.clusterCommitsInBatches(commits || []);
     const fileSummary = files ? files.slice(0, 50).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
     
     const prompt = `
@@ -482,34 +612,28 @@ export class OpenAICompatibleProvider implements AIProvider {
       
       **分析输入：**
       1. **代码差异 (Diff)**：最真实的代码变更。
-      2. **Commit 记录**：变更的具体意图。
+      2. **结构化 Commit 聚类分析**：这是对所有 ${commits?.length || 0} 个 Commit 的预分析结果，包含了每个变更的意图和初步风险评估。
       3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
       
-      **核心原则：**
-      1. **代码驱动 + 日志参考**：主要依靠代码 Diff 和 Commit 进行分析，但**必须参考**发布日志中的说明。如果发布日志中提到某个变更是 Breaking Change 或高危变更，即使代码层面看起来变动不大，也应重点分析并提高风险等级。
-      2. **语义变更优先**：重点关注“语义变更”（行为变化、逻辑调整、兼容性影响），而非仅关注“API 变更”。
-      3. **可溯源性**：在分析结果中，如果某个变更能明确关联到某个 Commit，请务必记录其 SHA。
-      4. **业务影响评估**：如果某个修改会影响到业务功能，或者会导致运行期错误，必须显著提高风险等级。
-      
-      **风险评估原则：**
-      - 评估对象是【兼容性风险】：升级后，旧代码 / 旧配置 / 旧默认行为是否可能发生变化或失效。
-      - 风险评估以“技术兼容性变化”为核心。
-      - 允许结合“该变更对业务能力面的影响范围与关键程度”进行有限度风险调整。
-      - 不允许因为业务重要而忽略兼容性事实，也不允许脱离变更内容主观放大。
+      **核心指令（最高优先级）：**
+      1. **100% 覆盖率**：你必须确保分析结果覆盖了提供的【所有】非琐碎 Commit。严禁为了节省篇幅而忽略任何一个可能影响行为的修改。
+      2. **琐碎变更定义**：仅允许忽略“纯版本号更新”、“纯文档/注释修改”、“纯测试代码增加”。除此之外的所有逻辑变更、配置调整、依赖升级都必须分析。
+      3. **深度聚类**：将具有相同目标的多个 Commit 聚类为一个“变更点”，但在描述中必须列出所有关联的 SHA。
+      4. **风险放大原则**：如果代码 Diff 显示了逻辑变动，但 Commit Message 描述模糊，应按“中/高风险”处理并要求排查。
       
       项目背景：${projectBackground}
       
       变更文件列表：
       ${fileSummary}
       
-      相关 Commits 列表：
-      ${commitSummary}
+      结构化 Commit 聚类与风险初筛：
+      ${enrichedCommitSummary}
       
       发布日志 (Release Notes)：
       ${releaseNotes || '未提供'}
       
-      差异内容（前 25000 字符）：
-      ${diff.slice(0, 25000)}
+      差异内容（前 40000 字符）：
+      ${diff.slice(0, 40000)}
       
       任务：
       1. 提供变更的整体摘要。
@@ -527,7 +651,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
       - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
       - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
-      - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
+      - **related_commits**: 关联的 Commit SHA（必须列出所有相关的 SHA，用逗号分隔）
 
       请以 JSON 格式返回，结构如下：
       {
@@ -568,7 +692,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       
       请务必使用中文回答。
     `;
-    const result = await this.callAI(prompt);
+    const result = await this.callAI(prompt, true, 8192);
     return parseJSON(result);
   }
 }
