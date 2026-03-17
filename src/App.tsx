@@ -18,8 +18,10 @@ import {
   History,
   Code2,
   Settings,
-  Cpu
+  Cpu,
+  Download
 } from 'lucide-react';
+import * as ExcelJS from 'exceljs';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis } from './types';
@@ -43,12 +45,12 @@ export default function App() {
     apiKey: '',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     model: 'qwen-plus',
-    useProxy: true,
-    githubToken: ''
+    useProxy: true
   });
   const [showSettings, setShowSettings] = useState(false);
 
   const [loading, setLoading] = useState(false);
+  const [excelLoading, setExcelLoading] = useState(false);
   const [analysisMode, setAnalysisMode] = useState<'changelog' | 'full-diff'>('changelog');
   const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs' | 'analyzing-full-diff'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -75,10 +77,13 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
+      const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
+      const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
+
       // Helper to find actual tag name from version string
       const findActualTag = async (version: string) => {
         try {
-          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
           // Try exact match, then v-prefix, then common prefixes like rel/
           const match = tags.find(t => 
             t.name === version || 
@@ -86,7 +91,9 @@ export default function App() {
             t.name === `rel/v${version}` || 
             t.name === `rel/${version}` ||
             t.name.endsWith(`/${version}`) ||
-            t.name.endsWith(`/v${version}`)
+            t.name.endsWith(`/v${version}`) ||
+            version.endsWith(`/${t.name}`) ||
+            version.endsWith(`/v${t.name}`)
           );
           return match?.name || version;
         } catch (e) {
@@ -94,8 +101,8 @@ export default function App() {
         }
       };
 
-      const actualToTag = await findActualTag(toVersion);
-      const actualFromTag = await findActualTag(fromVersion);
+      const actualToTag = await findActualTag(cleanToVersion);
+      const actualFromTag = await findActualTag(cleanFromVersion);
       setResolvedTags({ from: actualFromTag, to: actualToTag });
 
       // Helper to extract relevant section from a cumulative changelog
@@ -149,9 +156,13 @@ export default function App() {
       
       try {
         // Try GitHub Release first
-        const release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag, aiConfig.githubToken);
-        releaseBody = release.body;
-        releaseUrl = release.html_url;
+        const release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+        if (release) {
+          releaseBody = release.body;
+          releaseUrl = release.html_url;
+        } else {
+          throw new Error('Release not found');
+        }
       } catch (err: any) {
         // Fallback 1: Try to find a changelog file in the repo (e.g., RELEASE_NOTES.txt)
         try {
@@ -160,7 +171,7 @@ export default function App() {
           let foundFile = '';
           for (const file of files) {
             try {
-              fileContent = await GitHubService.getFileContent(repoInfo.owner, repoInfo.repo, file, actualToTag, aiConfig.githubToken);
+              fileContent = await GitHubService.getFileContent(repoInfo.owner, repoInfo.repo, file, actualToTag);
               if (fileContent) {
                 foundFile = file;
                 console.log(`Found changelog in file: ${file}`);
@@ -178,7 +189,7 @@ export default function App() {
         } catch (fileErr) {
           // Fallback 2: Try to compare tags if release and files are not found
           try {
-            const comparison = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken);
+            const comparison = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
             releaseUrl = comparison.html_url;
             // Create a synthetic changelog from commit messages
             releaseBody = "## Synthetic Changelog (Generated from Commits)\n\n" + 
@@ -188,19 +199,22 @@ export default function App() {
           } catch (compareErr: any) {
             // Log available tags to help user debug
             try {
-              const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+              const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
               console.log("Available tags in this repository:", tags.map(t => t.name));
             } catch (tagErr) {
               console.error("Failed to fetch tags for debugging:", tagErr);
             }
 
             const status = err.response?.status || compareErr.response?.status;
-            if (status === 404) {
+            const errorData = compareErr.response?.data || err.response?.data;
+            
+            if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
+              const suggestion = errorData.suggestion || '请在设置中配置 GitHub Token 以提高限制。';
+              throw new Error(`GitHub API 速率限制已达到。${suggestion}`);
+            } else if (status === 404) {
               throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。请确保这两个版本在 GitHub 上存在（作为 Release 或 Tag）。当前尝试匹配的 Tag 为: ${actualToTag}`);
-            } else if (status === 403 || status === 429) {
-              throw new Error('GitHub API 速率限制已达到。请在设置中配置 GitHub Token 以提高限制。');
             } else {
-              const errorMsg = compareErr.response?.data?.message || err.response?.data?.message || err.message || "未知错误";
+              const errorMsg = errorData?.message || err.message || "未知错误";
               throw new Error(`获取发布信息失败: ${errorMsg}`);
             }
           }
@@ -237,16 +251,21 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
+      const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
+      const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
+
       const findActualTag = async (version: string) => {
         try {
-          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo, aiConfig.githubToken);
+          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
           const match = tags.find(t => 
             t.name === version || 
             t.name === `v${version}` || 
             t.name === `rel/v${version}` || 
             t.name === `rel/${version}` ||
             t.name.endsWith(`/${version}`) ||
-            t.name.endsWith(`/v${version}`)
+            t.name.endsWith(`/v${version}`) ||
+            version.endsWith(`/${t.name}`) ||
+            version.endsWith(`/v${t.name}`)
           );
           return match?.name || version;
         } catch (e) {
@@ -254,30 +273,46 @@ export default function App() {
         }
       };
 
-      const actualToTag = await findActualTag(toVersion);
-      const actualFromTag = await findActualTag(fromVersion);
+      const actualToTag = await findActualTag(cleanToVersion);
+      const actualFromTag = await findActualTag(cleanFromVersion);
       setResolvedTags({ from: actualFromTag, to: actualToTag });
 
-      // 1. Fetch Commits and Full Diff
+      // 1. Fetch Commits, Full Diff and Release Notes
       setStep('analyzing-full-diff');
-      const [commitData, diff] = await Promise.all([
-        GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken),
-        GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, aiConfig.githubToken)
+      
+      const [commitData, diff, releaseData] = await Promise.all([
+        GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
+        GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
+        (async () => {
+          try {
+            return await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+          } catch (e) {
+            return null;
+          }
+        })()
       ]);
       
       if (!diff || diff.length < 10) {
         throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
       }
 
+      const releaseNotes = releaseData?.body || '';
+
       // 2. Analyze Full Diff with Selected AI
       const provider = getAIProvider(aiConfig);
-      const analysis = await provider.analyzeFullDiff(diff, projectBackground, commitData.commits);
+      const analysis = await provider.analyzeFullDiff(
+        diff, 
+        projectBackground, 
+        fromVersion, 
+        toVersion, 
+        releaseNotes, 
+        commitData.commits, 
+        commitData.files
+      );
       
-      // Sort items within each category by risk level: High > Medium > Low
+      // Sort items by risk level: High > Medium > Low
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
-      analysis.categories.forEach(cat => {
-        cat.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
-      });
+      analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
       
       setFullDiffAnalysis(analysis);
       
@@ -289,6 +324,138 @@ export default function App() {
     }
   };
 
+  const handleDownloadExcel = async () => {
+    if (!fullDiffAnalysis?.excelRows || fullDiffAnalysis.excelRows.length === 0) {
+      setError('请先进行“全量 Diff 深度分析”，分析完成后即可直接下载 Excel 报告。');
+      return;
+    }
+
+    setExcelLoading(true);
+    setError(null);
+    try {
+      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
+      const repoName = repoInfo ? repoInfo.repo : '项目';
+      const reportTitle = `${repoName} ${fromVersion} → ${toVersion} 升级变更分析报告`;
+
+      // Generate Excel using ExcelJS
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('Analysis Report');
+
+      // 1. Add Title Row
+      const titleRow = worksheet.addRow([reportTitle]);
+      titleRow.height = 35;
+      titleRow.font = { size: 16, bold: true };
+      titleRow.alignment = { vertical: 'middle', horizontal: 'center' };
+      worksheet.mergeCells(`A1:J1`);
+
+      // 2. Define headers (Row 2)
+      const headers = [
+        '版本号', '变更点（英文）', '变更点中文描述', '功能作用说明', 
+        '排查建议', '风险等级', '测试建议', '代码排查指导', 
+        '代码整改指导', '关联 Commit'
+      ];
+      const headerRow = worksheet.addRow(headers);
+      headerRow.height = 25;
+      headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+      headerRow.eachCell((cell) => {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: { argb: 'FF4F81BD' } // Professional blue
+        };
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        };
+      });
+
+      // Set column widths
+      worksheet.getColumn(1).width = 15; // 版本号
+      worksheet.getColumn(2).width = 30; // 变更点（英文）
+      worksheet.getColumn(3).width = 35; // 变更点中文描述
+      worksheet.getColumn(4).width = 50; // 功能作用说明
+      worksheet.getColumn(5).width = 50; // 排查建议
+      worksheet.getColumn(6).width = 12; // 风险等级
+      worksheet.getColumn(7).width = 50; // 测试建议
+      worksheet.getColumn(8).width = 60; // 代码排查指导
+      worksheet.getColumn(9).width = 60; // 代码整改指导
+      worksheet.getColumn(10).width = 40; // 关联 Commit
+
+      // 3. Add Data Rows
+      fullDiffAnalysis.excelRows.forEach(data => {
+        const row = worksheet.addRow([
+          data.version,
+          data.changepoint,
+          data.chinese,
+          data.function,
+          data.suggestion,
+          data.risk,
+          data.test_suggestion,
+          data.code_discovery,
+          data.code_fix,
+          data.related_commits || ''
+        ]);
+
+        // Style cells
+        row.eachCell((cell, colNumber) => {
+          cell.alignment = { wrapText: true, vertical: 'top' };
+          cell.border = {
+            top: { style: 'thin' },
+            left: { style: 'thin' },
+            bottom: { style: 'thin' },
+            right: { style: 'thin' }
+          };
+
+          // Risk Level Coloring (Column 6)
+          if (colNumber === 6) {
+            cell.alignment = { vertical: 'top', horizontal: 'center' };
+            if (cell.value === '高') {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFFFC7CE' } // Light red
+              };
+              cell.font = { color: { argb: 'FF9C0006' }, bold: true }; // Dark red text
+            } else if (cell.value === '中') {
+              cell.fill = {
+                type: 'pattern',
+                pattern: 'solid',
+                fgColor: { argb: 'FFFFEB9C' } // Light orange/yellow
+              };
+              cell.font = { color: { argb: 'FF9C6500' }, bold: true }; // Dark orange text
+            }
+          }
+        });
+      });
+
+      // 4. Enable Auto Filter on header row
+      worksheet.autoFilter = { from: 'A2', to: 'J2' };
+
+      // 5. Freeze panes (freeze top 2 rows)
+      worksheet.views = [
+        { state: 'frozen', xSplit: 0, ySplit: 2 }
+      ];
+
+      // Write to buffer and download
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `Analysis_Report_${fromVersion}_to_${toVersion}.xlsx`;
+      anchor.click();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error('Excel generation error:', err);
+      setError('生成 Excel 报告失败: ' + err.message);
+    } finally {
+      setExcelLoading(false);
+    }
+  };
+
   const analyzePR = async (prNumber: number, title: string) => {
     if (analyzingPrs.has(prNumber)) return;
     
@@ -297,7 +464,7 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) return;
 
-      const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber, aiConfig.githubToken);
+      const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber);
       const diff = await GitHubService.getDiff(pr.diff_url);
       
       const provider = getAIProvider(aiConfig);
@@ -429,16 +596,6 @@ export default function App() {
                   </div>
                 </>
               )}
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub Token (可选)</label>
-                <input 
-                  type="password" 
-                  value={aiConfig.githubToken}
-                  onChange={(e) => setAiConfig({...aiConfig, githubToken: e.target.value})}
-                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  placeholder="提高 GitHub API 速率限制"
-                />
-              </div>
             </div>
           </div>
         )}
@@ -586,15 +743,25 @@ export default function App() {
                       <Info size={20} className="text-blue-500" />
                       全量 Diff 深度分析摘要
                     </h2>
-                    <div className="flex items-center gap-2">
-                      <span className={cn(
-                        "px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border",
-                        fullDiffAnalysis.overallRisk === 'High' ? "bg-red-50 text-red-700 border-red-100" :
-                        fullDiffAnalysis.overallRisk === 'Medium' ? "bg-amber-50 text-amber-700 border-amber-100" :
-                        "bg-emerald-50 text-emerald-700 border-emerald-100"
-                      )}>
-                        整体风险: {fullDiffAnalysis.overallRisk === 'High' ? '高' : fullDiffAnalysis.overallRisk === 'Medium' ? '中' : '低'}
-                      </span>
+                    <div className="flex items-center gap-4">
+                      <button
+                        onClick={handleDownloadExcel}
+                        disabled={excelLoading}
+                        className="flex items-center gap-2 px-4 py-2 bg-emerald-50 text-emerald-700 border border-emerald-100 rounded-xl text-xs font-bold hover:bg-emerald-100 transition-all disabled:opacity-50"
+                      >
+                        {excelLoading ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
+                        下载 Excel 报告
+                      </button>
+                      <div className="flex items-center gap-2">
+                        <span className={cn(
+                          "px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border",
+                          fullDiffAnalysis.overallRisk === 'High' ? "bg-red-50 text-red-700 border-red-100" :
+                          fullDiffAnalysis.overallRisk === 'Medium' ? "bg-amber-50 text-amber-700 border-amber-100" :
+                          "bg-emerald-50 text-emerald-700 border-emerald-100"
+                        )}>
+                          整体风险: {fullDiffAnalysis.overallRisk === 'High' ? '高' : fullDiffAnalysis.overallRisk === 'Medium' ? '中' : '低'}
+                        </span>
+                      </div>
                     </div>
                   </div>
                   <div className="prose prose-sm max-w-none text-black/70">
@@ -618,111 +785,176 @@ export default function App() {
                   </ul>
                 </section>
 
-                {/* Detailed Categories Section */}
+                {/* Detailed Items Section */}
                 <section className="space-y-6">
                   <div className="flex items-center justify-between px-2">
-                    <h2 className="text-xl font-bold">变更分类详情</h2>
-                    <a 
-                      href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"
-                    >
-                      查看 GitHub 原始对比
-                      <ExternalLink size={12} />
-                    </a>
+                    <h2 className="text-xl font-bold">变更详情 (按风险等级排序)</h2>
+                    <div className="flex items-center gap-4">
+                      <a 
+                        href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"
+                      >
+                        查看 GitHub 原始对比
+                        <ExternalLink size={12} />
+                      </a>
+                    </div>
                   </div>
-                  {fullDiffAnalysis.categories.map((cat, idx) => (
-                    <div key={idx} className="space-y-4">
-                      <h3 className="text-sm font-bold text-black/40 uppercase tracking-widest px-2">{cat.name}</h3>
-                      <div className="grid gap-4">
-                        {cat.items.map((item, i) => (
-                          <div key={i} className="bg-white rounded-2xl border border-black/5 shadow-sm transition-all hover:shadow-md overflow-hidden">
-                            <div className="p-6">
-                              <div className="flex items-start justify-between gap-4 mb-3">
-                                <h4 className="font-bold text-lg">{item.title}</h4>
+
+                  {/* Table View of Excel Data */}
+                  <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="bg-gray-50 border-b border-black/5">
+                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40 w-32">变更点</th>
+                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40">详细描述与功能说明</th>
+                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40 w-24 text-center">风险</th>
+                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40">排查与整改指导</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-black/5">
+                          {fullDiffAnalysis.excelRows.map((row, idx) => (
+                            <tr key={idx} className="hover:bg-gray-50/50 transition-colors">
+                              <td className="px-4 py-4 align-top">
+                                <div className="font-bold text-sm text-black">{row.changepoint}</div>
+                                <div className="text-xs text-black/40 mt-1">{row.chinese}</div>
+                              </td>
+                              <td className="px-4 py-4 align-top">
+                                <div className="text-sm text-black/70 leading-relaxed whitespace-pre-wrap">
+                                  <Markdown>{row.function}</Markdown>
+                                </div>
+                              </td>
+                              <td className="px-4 py-4 align-top text-center">
                                 <span className={cn(
                                   "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
-                                  item.riskLevel === 'High' ? "bg-red-50 text-red-600 border border-red-100" :
-                                  item.riskLevel === 'Medium' ? "bg-amber-50 text-amber-600 border border-amber-100" :
+                                  row.risk === '高' ? "bg-red-50 text-red-600 border border-red-100" :
+                                  row.risk === '中' ? "bg-amber-50 text-amber-600 border border-amber-100" :
                                   "bg-emerald-50 text-emerald-700 border border-emerald-100"
                                 )}>
-                                  {item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低'} 风险
+                                  {row.risk}
                                 </span>
-                              </div>
-                              <p className="text-sm text-black/60 mb-4 leading-relaxed">{item.description}</p>
-                              
-                              {/* Commit Links */}
-                              {item.commitLinks && item.commitLinks.length > 0 && (
-                                <div className="mb-4 flex flex-wrap gap-2">
-                                  {item.commitLinks.map((link, lIdx) => (
-                                    <a 
-                                      key={lIdx}
-                                      href={link.url}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 border border-black/5 rounded text-[10px] font-mono text-black/60 transition-colors"
-                                    >
-                                      <GitCommit size={10} />
-                                      {link.sha.substring(0, 7)}
-                                    </a>
-                                  ))}
-                                </div>
-                              )}
-
-                              {/* Source Snippet for Credibility */}
-                              {item.sourceSnippet && (
-                                <div className="mb-4 space-y-2">
-                                  <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest flex items-center gap-1.5">
-                                    <Code2 size={12} />
-                                    原始代码片段 (Diff 原文)
+                              </td>
+                              <td className="px-4 py-4 align-top">
+                                <div className="space-y-4">
+                                  <div>
+                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">排查建议</div>
+                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap">
+                                      <Markdown>{row.suggestion}</Markdown>
+                                    </div>
                                   </div>
-                                  <pre className="p-4 bg-gray-50 border border-black/5 rounded-xl text-[11px] font-mono text-black/70 overflow-x-auto whitespace-pre-wrap break-all">
-                                    <code>{item.sourceSnippet}</code>
-                                  </pre>
+                                  <div>
+                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">代码排查指导</div>
+                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap bg-gray-50 p-2 rounded-lg border border-black/5">
+                                      <Markdown>{row.code_discovery}</Markdown>
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">代码整改指导</div>
+                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap bg-emerald-50/30 p-2 rounded-lg border border-emerald-100/30">
+                                      <Markdown>{row.code_fix}</Markdown>
+                                    </div>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4">
+                    {fullDiffAnalysis.items.map((item, i) => (
+                      <div key={i} className="bg-white rounded-2xl border border-black/5 shadow-sm transition-all hover:shadow-md overflow-hidden">
+                        <div className="p-6">
+                          <div className="flex items-start justify-between gap-4 mb-3">
+                            <h4 className="font-bold text-lg">{item.title}</h4>
+                            <span className={cn(
+                              "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
+                              item.riskLevel === 'High' ? "bg-red-50 text-red-600 border border-red-100" :
+                              item.riskLevel === 'Medium' ? "bg-amber-50 text-amber-600 border border-amber-100" :
+                              "bg-emerald-50 text-emerald-700 border border-emerald-100"
+                            )}>
+                              {item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低'} 风险
+                            </span>
+                          </div>
+                          <div className="text-sm text-black/60 mb-4 leading-relaxed whitespace-pre-wrap">
+                            <Markdown>{item.description}</Markdown>
+                          </div>
+                          
+                          {/* Commit Links */}
+                          {item.commitLinks && item.commitLinks.length > 0 && (
+                            <div className="mb-4 flex flex-wrap gap-2">
+                              {item.commitLinks.map((link, lIdx) => (
+                                <a 
+                                  key={lIdx}
+                                  href={link.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 border border-black/5 rounded text-[10px] font-mono text-black/60 transition-colors"
+                                >
+                                  <GitCommit size={10} />
+                                  {link.sha.substring(0, 7)}
+                                </a>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Source Snippet for Credibility */}
+                          {item.sourceSnippet && (
+                            <div className="mb-4 space-y-2">
+                              <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest flex items-center gap-1.5">
+                                <Code2 size={12} />
+                                原始代码片段 (Diff 原文)
+                              </div>
+                              <pre className="p-4 bg-gray-50 border border-black/5 rounded-xl text-[11px] font-mono text-black/70 overflow-x-auto whitespace-pre-wrap break-all">
+                                <code>{item.sourceSnippet}</code>
+                              </pre>
+                            </div>
+                          )}
+
+                          {/* Compatibility Analysis & Code Examples */}
+                          {(item.riskLevel === 'High' || item.riskLevel === 'Medium') && (
+                            <div className="space-y-4 mt-4 pt-4 border-t border-black/5">
+                              {item.compatibilityAnalysis && (
+                                <div className="p-4 bg-amber-50/30 rounded-xl border border-amber-100/50">
+                                  <div className="text-[10px] font-bold text-amber-700 uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                                    <AlertTriangle size={12} />
+                                    兼容性影响分析
+                                  </div>
+                                  <div className="text-sm text-amber-900/80 leading-relaxed whitespace-pre-wrap">
+                                    <Markdown>{item.compatibilityAnalysis}</Markdown>
+                                  </div>
                                 </div>
                               )}
 
-                              {/* Compatibility Analysis & Code Examples */}
-                              {(item.riskLevel === 'High' || item.riskLevel === 'Medium') && (
-                                <div className="space-y-4 mt-4 pt-4 border-t border-black/5">
-                                  {item.compatibilityAnalysis && (
-                                    <div className="p-4 bg-amber-50/30 rounded-xl border border-amber-100/50">
-                                      <div className="text-[10px] font-bold text-amber-700 uppercase tracking-wider mb-1 flex items-center gap-1.5">
-                                        <AlertTriangle size={12} />
-                                        兼容性影响分析
-                                      </div>
-                                      <p className="text-sm text-amber-900/80 leading-relaxed">{item.compatibilityAnalysis}</p>
+                              {item.codeExample && (
+                                <div className="space-y-3">
+                                  <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest">迁移指导代码示例</div>
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div className="space-y-1">
+                                      <div className="text-[9px] font-bold text-red-600/50 uppercase tracking-widest">修改前 (Before)</div>
+                                      <pre className="p-3 bg-red-50/20 border border-red-100/30 rounded-lg text-[11px] font-mono text-red-900/80 overflow-x-auto whitespace-pre-wrap break-all">
+                                        <code>{item.codeExample.before}</code>
+                                      </pre>
                                     </div>
-                                  )}
-
-                                  {item.codeExample && (
-                                    <div className="space-y-3">
-                                      <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest">迁移指导代码示例</div>
-                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                        <div className="space-y-1">
-                                          <div className="text-[9px] font-bold text-red-600/50 uppercase tracking-widest">修改前 (Before)</div>
-                                          <pre className="p-3 bg-red-50/20 border border-red-100/30 rounded-lg text-[11px] font-mono text-red-900/80 overflow-x-auto whitespace-pre-wrap break-all">
-                                            <code>{item.codeExample.before}</code>
-                                          </pre>
-                                        </div>
-                                        <div className="space-y-1">
-                                          <div className="text-[9px] font-bold text-emerald-600/50 uppercase tracking-widest">修改后 (After)</div>
-                                          <pre className="p-3 bg-emerald-50/20 border border-emerald-100/30 rounded-lg text-[11px] font-mono text-emerald-900/80 overflow-x-auto whitespace-pre-wrap break-all">
-                                            <code>{item.codeExample.after}</code>
-                                          </pre>
-                                        </div>
-                                      </div>
+                                    <div className="space-y-1">
+                                      <div className="text-[9px] font-bold text-emerald-600/50 uppercase tracking-widest">修改后 (After)</div>
+                                      <pre className="p-3 bg-emerald-50/20 border border-emerald-100/30 rounded-lg text-[11px] font-mono text-emerald-900/80 overflow-x-auto whitespace-pre-wrap break-all">
+                                        <code>{item.codeExample.after}</code>
+                                      </pre>
                                     </div>
-                                  )}
+                                  </div>
                                 </div>
                               )}
                             </div>
-                          </div>
-                        ))}
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </section>
               </div>
             )}

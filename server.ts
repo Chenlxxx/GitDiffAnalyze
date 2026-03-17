@@ -11,31 +11,53 @@ async function startServer() {
 
   // GitHub API Proxy
   app.get("/api/github/*", async (req, res) => {
+    let url = "";
     try {
       const githubPath = req.params[0];
       const query = new URLSearchParams(req.query as any).toString();
-      const url = `https://api.github.com/${githubPath}${query ? `?${query}` : ""}`;
+      url = `https://api.github.com/${githubPath}${query ? `?${query}` : ""}`;
       
       console.log(`Proxying request to: ${url}`);
       
-      const githubToken = req.headers['x-github-token'];
       const customAccept = req.headers['accept'];
       const headers: any = {
         'Accept': customAccept || 'application/vnd.github.v3+json',
-        'User-Agent': 'GitDiff-Analyzer-App'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       };
-      
-      if (githubToken) {
-        headers['Authorization'] = `token ${githubToken}`;
+
+      if (process.env.GITHUB_TOKEN) {
+        headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
       
-      const response = await axios.get(url, { headers });
+      const response = await axios.get(url, { 
+        headers,
+        responseType: customAccept?.includes('diff') ? 'text' : 'json'
+      });
       
-      res.json(response.data);
+      if (customAccept?.includes('diff')) {
+        res.setHeader('Content-Type', 'text/plain');
+        res.send(response.data);
+      } else {
+        res.json(response.data);
+      }
     } catch (error: any) {
+      const status = error.response?.status;
       const errorData = error.response?.data;
-      console.error('GitHub Proxy Error:', JSON.stringify(errorData || error.message));
-      res.status(error.response?.status || 500).json(errorData || { message: error.message });
+      
+      if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
+        return res.status(403).json({
+          message: 'GitHub API 速率限制已达到。',
+          details: errorData,
+          suggestion: 'GitHub 限制了未授权的 API 请求。请稍后再试，或在平台环境变量中配置 GITHUB_TOKEN。'
+        });
+      }
+
+      if (status === 404) {
+        console.warn(`GitHub Proxy 404 (Not Found): ${url}`);
+      } else {
+        console.error('GitHub Proxy Error:', status, error.message);
+      }
+      res.status(status || 500).json(errorData || { message: error.message });
     }
   });
 
@@ -47,14 +69,25 @@ async function startServer() {
         return res.status(400).json({ message: 'Missing url parameter' });
       }
 
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent': 'GitDiff-Analyzer-App'
-        }
+      const headers: any = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+      };
+
+      if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
+        headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
+      }
+
+      const response = await axios.get(url, { 
+        headers,
+        responseType: 'text' 
       });
+      res.setHeader('Content-Type', 'text/plain');
       res.send(response.data);
     } catch (error: any) {
-      res.status(error.response?.status || 500).send(error.message);
+      const status = error.response?.status;
+      console.error(`GitHub Raw Proxy Error (${status}):`, error.message);
+      res.status(status || 500).send(error.message);
     }
   });
 

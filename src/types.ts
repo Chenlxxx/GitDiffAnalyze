@@ -6,7 +6,6 @@ export interface AIConfig {
   baseUrl?: string;
   model: string;
   useProxy: boolean;
-  githubToken?: string;
 }
 
 export interface ChangeLogAnalysis {
@@ -37,30 +36,45 @@ export interface DiffAnalysis {
 
 export interface FullDiffAnalysis {
   summary: string;
-  categories: {
-    name: string;
-    items: {
-      title: string;
-      description: string;
-      riskLevel: 'High' | 'Medium' | 'Low';
-      compatibilityAnalysis?: string;
-      sourceSnippet?: string;
-      commitLinks?: {
-        sha: string;
-        url: string;
-      }[];
-      codeExample?: {
-        before: string;
-        after: string;
-      };
+  items: {
+    title: string;
+    description: string;
+    riskLevel: 'High' | 'Medium' | 'Low';
+    compatibilityAnalysis?: string;
+    sourceSnippet?: string;
+    commitLinks?: {
+      sha: string;
+      url: string;
     }[];
+    codeExample?: {
+      before: string;
+      after: string;
+    };
   }[];
   overallRisk: 'High' | 'Medium' | 'Low';
   recommendations: string[];
+  excelRows?: ExcelAnalysisRow[];
+}
+
+export interface ExcelAnalysisRow {
+  version: string;
+  changepoint: string;
+  chinese: string;
+  function: string;
+  suggestion: string;
+  risk: '高' | '中' | '低';
+  test_suggestion: string;
+  code_discovery: string;
+  code_fix: string;
+  related_commits?: string;
+}
+
+export interface ExcelAnalysis {
+  rows: ExcelAnalysisRow[];
 }
 
 export interface AIProvider {
   analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis>;
   analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis>;
-  analyzeFullDiff(diff: string, projectBackground: string, commits?: any[]): Promise<FullDiffAnalysis>;
+  analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis>;
 }

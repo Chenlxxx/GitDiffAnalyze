@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
-import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig } from "../types";
+import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis } from "../types";
 
 function parseJSON(text: string): any {
   if (!text) return {};
@@ -77,7 +77,7 @@ export class GeminiProvider implements AIProvider {
         3. 对于每一个条目，根据提供的背景评估影响等级（高、中、低）。
         4. 如果影响等级为“高”或“中”，必须提供：
            - \`compatibilityAnalysis\`: 结合项目背景，详细说明该变更可能带来的兼容性风险或破坏性影响。
-           - \`codeExample\`: 提供简要的 "before" 和 "after" 代码示例，展示项目代码可能需要如何调整。
+           - \`codeExample\`: 提供详细的 "before" 和 "after" 代码示例，展示项目代码可能需要如何调整。
         5. 如果影响等级为“低”，请在 \`reason\` 中简要解释原因。
         6. 必须提取每个条目对应的 Pull Request 编号（例如 #123 或 PR #123）。
         
@@ -85,7 +85,7 @@ export class GeminiProvider implements AIProvider {
       `,
       config: {
         responseMimeType: "application/json",
-        maxOutputTokens: 8192,
+        maxOutputTokens: 16384,
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -193,34 +193,71 @@ export class GeminiProvider implements AIProvider {
   }
 }
 
-  async analyzeFullDiff(diff: string, projectBackground: string, commits?: any[]): Promise<FullDiffAnalysis> {
+  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
     try {
-      const commitSummary = commits ? commits.slice(0, 50).map(c => `- ${c.sha.substring(0, 7)}: ${c.commit.message}`).join('\n') : '';
+      const commitSummary = commits ? commits.map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+      const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}, Changes: +${f.additions}/-${f.deletions}`).join('\n') : '';
       
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
-          你是一个资深架构师和安全专家。请分析以下两个版本之间的完整代码差异（Diff），并识别潜在的兼容性风险、破坏性变更和架构影响。
+          你是一个极其严谨的资深架构师和安全专家。请分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
+          
+          **分析输入：**
+          1. **代码差异 (Diff)**：最真实的代码变更。
+          2. **Commit 记录**：变更的具体意图。
+          3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
+          
+          **核心原则：**
+          1. **全量分析，严禁遗漏**：你必须查看提供的【所有】Commit 记录（除非是纯格式化、注释、测试代码、版本号更新）。每一个非琐碎的 Commit 都必须在分析结果中有所体现，或者归纳到相关的变更点中。
+          2. **代码驱动 + 日志参考**：主要依靠代码 Diff 和 Commit 进行分析，但**必须参考**发布日志中的说明。如果发布日志中提到某个变更是 Breaking Change 或高危变更，即使代码层面看起来变动不大，也应重点分析并提高风险等级。
+          3. **语义变更优先**：重点关注“语义变更”（行为变化、逻辑调整、兼容性影响），而非仅关注“API 变更”。
+          4. **可溯源性**：在分析结果中，如果某个变更能明确关联到某个 Commit，请务必记录其 SHA。
+          5. **业务影响评估**：如果某个修改会影响到业务功能，或者会导致运行期错误，必须显著提高风险等级。
+          
+          **风险评估原则：**
+          - 评估对象是【兼容性风险】：升级后，旧代码 / 旧配置 / 旧默认行为是否可能发生变化或失效。
+          - 风险评估以“技术兼容性变化”为核心。
+          - 允许结合“该变更对业务能力面的影响范围与关键程度”进行有限度风险调整。
+          - 不允许因为业务重要而忽略兼容性事实，也不允许脱离变更内容主观放大。
           
           项目背景：${projectBackground}
           
-          相关 Commits 摘要：
+          变更文件列表：
+          ${fileSummary}
+          
+          相关 Commits 列表（共 ${commits?.length || 0} 个）：
           ${commitSummary}
           
-          差异内容（前 30000 字符）：
-          ${diff.slice(0, 30000)}
+          发布日志 (Release Notes)：
+          ${releaseNotes || '未提供'}
+          
+          差异内容（Diff）：
+          ${diff.slice(0, 40000)}
           
           任务：
           1. 提供变更的整体摘要。
-          2. 将变更分类（如：API 变更、依赖更新、核心逻辑修改、安全修复等）。
-          3. 识别每个分类下的关键条目，并评估风险等级。
-          4. **可信度要求**：对于每一个识别出的条目，必须从提供的 Diff 中摘取**足够长且完整**的原文代码片段（sourceSnippet），通常建议 10-20 行，确保包含上下文。
-          5. **关联 Commit**：如果某个条目能对应到上述 Commits 中的某一个或多个，请在 \`commitLinks\` 中列出对应的 SHA。
-          6. **深度分析与兼容性指导**：对于“高”和“中”风险项，必须提供：
-             - \`compatibilityAnalysis\`: **深度分析**该变更对当前项目背景的具体影响，不要只给一两句话。
-             - \`codeExample\`: 提供详细的 "before" 和 "after" 代码示例。**注意**："after" 代码应展示如何修改用户代码以适配新版本，同时尽可能保持逻辑一致性或提供平滑迁移方案。
-          7. 给出整体风险评估和建议。
+          2. 识别关键变更条目，并评估风险等级。
+          3. **深度分析与兼容性指导**：对于“高”和“中”风险项，提供深度分析和代码示例。
+          4. **生成 Excel 结构化数据**：为了方便导出，请同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
           
+          **Excel 字段深度要求：**
+          - **version**: ${toVersion}
+          - **changepoint**: 变更点（英文）
+          - **chinese**: 变更点中文描述
+          - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+          - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。如果包含分点，请使用回车换行符（\\n）分隔，不要粘连。
+          - **risk**: 高/中/低
+          - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+          - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。内容要详细，分点请使用回车换行。
+          - **code_fix**: 代码整改指导。必须提供**详细的、能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。代码示例应包含必要的上下文。
+          - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
+          
+          **特别注意：**
+          - 对于分点描述（如 1.xxx 2.xxx），请务必在每个点之间添加换行符（\\n），确保在表格和 Excel 中清晰易读。
+          - 代码整改指导必须包含具体的代码块示例。
+          - 必须确保所有非琐碎的 Commit 都被分析到。
+
           请务必使用中文回答。
         `,
         config: {
@@ -231,49 +268,58 @@ export class GeminiProvider implements AIProvider {
               summary: { type: Type.STRING },
               overallRisk: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
               recommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
-              categories: {
+              items: {
                 type: Type.ARRAY,
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    name: { type: Type.STRING },
-                    items: {
+                    title: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    riskLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                    compatibilityAnalysis: { type: Type.STRING },
+                    sourceSnippet: { type: Type.STRING },
+                    commitLinks: {
                       type: Type.ARRAY,
                       items: {
                         type: Type.OBJECT,
                         properties: {
-                          title: { type: Type.STRING },
-                          description: { type: Type.STRING },
-                          riskLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
-                          compatibilityAnalysis: { type: Type.STRING },
-                          sourceSnippet: { type: Type.STRING, description: "从 Diff 中摘取的原始代码片段，应包含足够的上下文" },
-                          commitLinks: {
-                            type: Type.ARRAY,
-                            items: {
-                              type: Type.OBJECT,
-                              properties: {
-                                sha: { type: Type.STRING },
-                                url: { type: Type.STRING }
-                              }
-                            }
-                          },
-                          codeExample: {
-                            type: Type.OBJECT,
-                            properties: {
-                              before: { type: Type.STRING },
-                              after: { type: Type.STRING }
-                            }
-                          }
-                        },
-                        required: ["title", "description", "riskLevel"]
+                          sha: { type: Type.STRING },
+                          url: { type: Type.STRING }
+                        }
+                      }
+                    },
+                    codeExample: {
+                      type: Type.OBJECT,
+                      properties: {
+                        before: { type: Type.STRING },
+                        after: { type: Type.STRING }
                       }
                     }
                   },
-                  required: ["name", "items"]
+                  required: ["title", "description", "riskLevel"]
+                }
+              },
+              excelRows: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    version: { type: Type.STRING },
+                    changepoint: { type: Type.STRING },
+                    chinese: { type: Type.STRING },
+                    function: { type: Type.STRING },
+                    suggestion: { type: Type.STRING },
+                    risk: { type: Type.STRING, enum: ["高", "中", "低"] },
+                    test_suggestion: { type: Type.STRING },
+                    code_discovery: { type: Type.STRING },
+                    code_fix: { type: Type.STRING },
+                    related_commits: { type: Type.STRING }
+                  },
+                  required: ["version", "changepoint", "chinese", "function", "suggestion", "risk", "test_suggestion", "code_discovery", "code_fix"]
                 }
               }
             },
-            required: ["summary", "overallRisk", "recommendations", "categories"]
+            required: ["summary", "overallRisk", "recommendations", "items", "excelRows"]
           }
         }
       }));
@@ -391,52 +437,95 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
 
-  async analyzeFullDiff(diff: string, projectBackground: string, commits?: any[]): Promise<FullDiffAnalysis> {
-    const commitSummary = commits ? commits.slice(0, 50).map(c => `- ${c.sha.substring(0, 7)}: ${c.commit.message}`).join('\n') : '';
+  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
+    const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+    const fileSummary = files ? files.slice(0, 50).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
     
     const prompt = `
-      你是一个资深架构师和安全专家。请分析以下两个版本之间的完整代码差异（Diff），并识别潜在的兼容性风险、破坏性变更和架构影响。
+      你是一个极其严谨的资深架构师和安全专家。请分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
+      
+      **分析输入：**
+      1. **代码差异 (Diff)**：最真实的代码变更。
+      2. **Commit 记录**：变更的具体意图。
+      3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
+      
+      **核心原则：**
+      1. **代码驱动 + 日志参考**：主要依靠代码 Diff 和 Commit 进行分析，但**必须参考**发布日志中的说明。如果发布日志中提到某个变更是 Breaking Change 或高危变更，即使代码层面看起来变动不大，也应重点分析并提高风险等级。
+      2. **语义变更优先**：重点关注“语义变更”（行为变化、逻辑调整、兼容性影响），而非仅关注“API 变更”。
+      3. **可溯源性**：在分析结果中，如果某个变更能明确关联到某个 Commit，请务必记录其 SHA。
+      4. **业务影响评估**：如果某个修改会影响到业务功能，或者会导致运行期错误，必须显著提高风险等级。
+      
+      **风险评估原则：**
+      - 评估对象是【兼容性风险】：升级后，旧代码 / 旧配置 / 旧默认行为是否可能发生变化或失效。
+      - 风险评估以“技术兼容性变化”为核心。
+      - 允许结合“该变更对业务能力面的影响范围与关键程度”进行有限度风险调整。
+      - 不允许因为业务重要而忽略兼容性事实，也不允许脱离变更内容主观放大。
       
       项目背景：${projectBackground}
       
-      相关 Commits 摘要：
+      变更文件列表：
+      ${fileSummary}
+      
+      相关 Commits 列表：
       ${commitSummary}
       
-      差异内容（前 20000 字符）：
-      ${diff.slice(0, 20000)}
+      发布日志 (Release Notes)：
+      ${releaseNotes || '未提供'}
+      
+      差异内容（前 25000 字符）：
+      ${diff.slice(0, 25000)}
       
       任务：
       1. 提供变更的整体摘要。
-      2. 将变更分类。
-      3. 识别关键条目，评估风险等级。
-      4. **可信度要求**：摘取 10-20 行原始代码片段 (sourceSnippet)。
-      5. **关联 Commit**：在 \`commitLinks\` 中列出 SHA 和 URL。
-      6. **深度分析**：对中高风险项进行深度分析并提供迁移代码示例。
+      2. 识别关键变更条目，评估风险等级。
+      3. **深度分析**：对中高风险项进行深度分析并提供迁移代码示例。
+      4. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
       
+      **Excel 字段深度要求：**
+      - **version**: ${toVersion}
+      - **changepoint**: 变更点（英文）
+      - **chinese**: 变更点中文描述
+      - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+      - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。
+      - **risk**: 高/中/低
+      - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+      - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
+      - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
+      - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
+
       请以 JSON 格式返回，结构如下：
       {
         "summary": "整体摘要",
         "overallRisk": "High/Medium/Low",
         "recommendations": ["建议1", "建议2"],
-        "categories": [
+        "items": [
           {
-            "name": "分类名称",
-            "items": [
-              {
-                "title": "变更标题",
-                "description": "变更描述",
-                "riskLevel": "High/Medium/Low",
-                "sourceSnippet": "从 Diff 中摘取的原始代码片段 (10-20行)",
-                "commitLinks": [
-                  { "sha": "commit_sha", "url": "commit_url" }
-                ],
-                "compatibilityAnalysis": "对项目背景的深度兼容性影响分析",
-                "codeExample": {
-                  "before": "修改前的项目代码示例",
-                  "after": "修改后的项目代码示例 (展示如何适配新版本并保持功能兼容)"
-                }
-              }
-            ]
+            "title": "变更标题",
+            "description": "变更描述",
+            "riskLevel": "High/Medium/Low",
+            "sourceSnippet": "从 Diff 中摘取的原始代码片段",
+            "commitLinks": [
+              { "sha": "commit_sha", "url": "commit_url" }
+            ],
+            "compatibilityAnalysis": "深度兼容性影响分析",
+            "codeExample": {
+              "before": "修改前的项目代码示例",
+              "after": "修改后的项目代码示例"
+            }
+          }
+        ],
+        "excelRows": [
+          {
+            "version": "版本号",
+            "changepoint": "变更点（英文）",
+            "chinese": "变更点中文描述",
+            "function": "功能作用说明",
+            "suggestion": "排查建议",
+            "risk": "高/中/低",
+            "test_suggestion": "测试建议",
+            "code_discovery": "代码排查指导",
+            "code_fix": "代码整改指导",
+            "related_commits": "commit1, commit2"
           }
         ]
       }
