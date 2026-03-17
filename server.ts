@@ -13,7 +13,7 @@ async function startServer() {
   app.get("/api/github/*", async (req, res) => {
     let url = "";
     try {
-      const githubPath = req.params[0];
+      const githubPath = req.params[0] || "";
       const query = new URLSearchParams(req.query as any).toString();
       url = `https://api.github.com/${githubPath}${query ? `?${query}` : ""}`;
       
@@ -23,28 +23,24 @@ async function startServer() {
       const headers: any = {
         'Accept': customAccept || 'application/vnd.github.v3+json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
       };
 
+      // Use token from environment if available (helps avoid 403 without user config)
       if (process.env.GITHUB_TOKEN) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
       
-      const response = await axios.get(url, { 
-        headers,
-        responseType: customAccept?.includes('diff') ? 'text' : 'json'
-      });
+      const response = await axios.get(url, { headers });
       
-      if (customAccept?.includes('diff')) {
-        res.setHeader('Content-Type', 'text/plain');
-        res.send(response.data);
-      } else {
-        res.json(response.data);
-      }
+      res.json(response.data);
     } catch (error: any) {
       const status = error.response?.status;
       const errorData = error.response?.data;
       
       if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
+        console.warn(`GitHub API Rate Limit Exceeded for ${url || req.originalUrl}`);
         return res.status(403).json({
           message: 'GitHub API 速率限制已达到。',
           details: errorData,
@@ -53,10 +49,11 @@ async function startServer() {
       }
 
       if (status === 404) {
-        console.warn(`GitHub Proxy 404 (Not Found): ${url}`);
+        console.warn(`GitHub Resource Not Found (404): ${url || req.originalUrl}`);
       } else {
-        console.error('GitHub Proxy Error:', status, error.message);
+        console.error('GitHub Proxy Error:', JSON.stringify(errorData || error.message));
       }
+      
       res.status(status || 500).json(errorData || { message: error.message });
     }
   });
@@ -71,18 +68,26 @@ async function startServer() {
 
       const headers: any = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1'
       };
 
+      // Use token from environment if available
       if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
 
-      const response = await axios.get(url, { 
-        headers,
-        responseType: 'text' 
-      });
-      res.setHeader('Content-Type', 'text/plain');
+      const response = await axios.get(url, { headers });
       res.send(response.data);
     } catch (error: any) {
       const status = error.response?.status;

@@ -25,7 +25,6 @@ import * as ExcelJS from 'exceljs';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis } from './types';
-import Markdown from 'react-markdown';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -212,7 +211,7 @@ export default function App() {
               const suggestion = errorData.suggestion || '请在设置中配置 GitHub Token 以提高限制。';
               throw new Error(`GitHub API 速率限制已达到。${suggestion}`);
             } else if (status === 404) {
-              throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。请确保这两个版本在 GitHub 上存在（作为 Release 或 Tag）。当前尝试匹配的 Tag 为: ${actualToTag}`);
+              throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。这通常是因为：\n1. 版本号输入错误\n2. 该版本在 GitHub 上既不是 Release 也不是 Tag\n3. 仓库地址错误\n\n当前尝试匹配的 Tag 为: ${actualToTag}`);
             } else {
               const errorMsg = errorData?.message || err.message || "未知错误";
               throw new Error(`获取发布信息失败: ${errorMsg}`);
@@ -342,51 +341,61 @@ export default function App() {
       const worksheet = workbook.addWorksheet('Analysis Report');
 
       // 1. Add Title Row
-      const titleRow = worksheet.addRow([reportTitle]);
-      titleRow.height = 35;
-      titleRow.font = { size: 16, bold: true };
-      titleRow.alignment = { vertical: 'middle', horizontal: 'center' };
-      worksheet.mergeCells(`A1:J1`);
+      const titleRow = worksheet.addRow(['', reportTitle]); // Start from B
+      titleRow.height = 30;
+      const titleCell = titleRow.getCell(2);
+      titleCell.font = { size: 18, bold: true, color: { argb: 'FF000000' } };
+      titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
+      worksheet.mergeCells(`B1:K1`);
 
-      // 2. Define headers (Row 2)
+      // Add an empty row for spacing (like the Python example's row 3)
+      worksheet.addRow([]);
+
+      // 2. Define headers (Row 3)
       const headers = [
         '版本号', '变更点（英文）', '变更点中文描述', '功能作用说明', 
         '排查建议', '风险等级', '测试建议', '代码排查指导', 
         '代码整改指导', '关联 Commit'
       ];
-      const headerRow = worksheet.addRow(headers);
-      headerRow.height = 25;
-      headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-      headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
-      headerRow.eachCell((cell) => {
+      const headerRow = worksheet.addRow(['', ...headers]);
+      headerRow.height = 35;
+      
+      const thinBorder = {
+        top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+        right: { style: 'thin', color: { argb: 'FFCCCCCC' } }
+      };
+
+      headerRow.eachCell((cell, colNumber) => {
+        if (colNumber === 1) return; // Skip empty first column
+        cell.font = { size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
         cell.fill = {
           type: 'pattern',
           pattern: 'solid',
-          fgColor: { argb: 'FF4F81BD' } // Professional blue
+          fgColor: { argb: 'FF333333' }
         };
-        cell.border = {
-          top: { style: 'thin' },
-          left: { style: 'thin' },
-          bottom: { style: 'thin' },
-          right: { style: 'thin' }
-        };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        cell.border = thinBorder;
       });
 
-      // Set column widths
-      worksheet.getColumn(1).width = 15; // 版本号
-      worksheet.getColumn(2).width = 30; // 变更点（英文）
-      worksheet.getColumn(3).width = 35; // 变更点中文描述
-      worksheet.getColumn(4).width = 50; // 功能作用说明
-      worksheet.getColumn(5).width = 50; // 排查建议
-      worksheet.getColumn(6).width = 12; // 风险等级
-      worksheet.getColumn(7).width = 50; // 测试建议
-      worksheet.getColumn(8).width = 60; // 代码排查指导
-      worksheet.getColumn(9).width = 60; // 代码整改指导
-      worksheet.getColumn(10).width = 40; // 关联 Commit
+      // Set column widths (starting from B)
+      worksheet.getColumn(1).width = 2;   // Spacer column A
+      worksheet.getColumn(2).width = 10;  // 版本号
+      worksheet.getColumn(3).width = 50;  // 变更点（英文）
+      worksheet.getColumn(4).width = 30;  // 变更点中文描述
+      worksheet.getColumn(5).width = 50;  // 功能作用说明
+      worksheet.getColumn(6).width = 50;  // 排查建议
+      worksheet.getColumn(7).width = 10;  // 风险等级
+      worksheet.getColumn(8).width = 40;  // 测试建议
+      worksheet.getColumn(9).width = 60;  // 代码排查指导
+      worksheet.getColumn(10).width = 60; // 代码整改指导
+      worksheet.getColumn(11).width = 40; // 关联 Commit
 
       // 3. Add Data Rows
       fullDiffAnalysis.excelRows.forEach(data => {
         const row = worksheet.addRow([
+          '', // Spacer A
           data.version,
           data.changepoint,
           data.chinese,
@@ -398,45 +407,36 @@ export default function App() {
           data.code_fix,
           data.related_commits || ''
         ]);
+        row.height = 200;
 
-        // Style cells
+        // Style data cells
         row.eachCell((cell, colNumber) => {
-          cell.alignment = { wrapText: true, vertical: 'top' };
-          cell.border = {
-            top: { style: 'thin' },
-            left: { style: 'thin' },
-            bottom: { style: 'thin' },
-            right: { style: 'thin' }
-          };
-
-          // Risk Level Coloring (Column 6)
-          if (colNumber === 6) {
-            cell.alignment = { vertical: 'top', horizontal: 'center' };
-            if (cell.value === '高') {
-              cell.fill = {
-                type: 'pattern',
-                pattern: 'solid',
-                fgColor: { argb: 'FFFFC7CE' } // Light red
-              };
-              cell.font = { color: { argb: 'FF9C0006' }, bold: true }; // Dark red text
-            } else if (cell.value === '中') {
-              cell.fill = {
-                type: 'pattern',
-                pattern: 'solid',
-                fgColor: { argb: 'FFFFEB9C' } // Light orange/yellow
-              };
-              cell.font = { color: { argb: 'FF9C6500' }, bold: true }; // Dark orange text
+          if (colNumber === 1) return; // Skip empty first column
+          cell.font = { size: 10 };
+          cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
+          cell.border = thinBorder;
+          
+          // Color risk level (Column G / 7)
+          if (colNumber === 7) {
+            const value = cell.value?.toString() || '';
+            if (value.includes('高')) {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFCCCC' } };
+            } else if (value.includes('中')) {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFCC' } };
+            } else {
+              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFCCFFCC' } };
             }
+            cell.alignment = { vertical: 'middle', horizontal: 'center' };
           }
         });
       });
 
-      // 4. Enable Auto Filter on header row
-      worksheet.autoFilter = { from: 'A2', to: 'J2' };
+      // 4. Enable Auto Filter on header row (B3:K3)
+      worksheet.autoFilter = { from: 'B3', to: 'K3' };
 
-      // 5. Freeze panes (freeze top 2 rows)
+      // 5. Freeze panes (freeze top 3 rows)
       worksheet.views = [
-        { state: 'frozen', xSplit: 0, ySplit: 2 }
+        { state: 'frozen', xSplit: 0, ySplit: 3 }
       ];
 
       // Write to buffer and download
@@ -764,8 +764,8 @@ export default function App() {
                       </div>
                     </div>
                   </div>
-                  <div className="prose prose-sm max-w-none text-black/70">
-                    <Markdown>{fullDiffAnalysis.summary}</Markdown>
+                  <div className="prose prose-sm max-w-none text-black/70 whitespace-pre-wrap">
+                    {fullDiffAnalysis.summary}
                   </div>
                 </section>
 
@@ -789,80 +789,15 @@ export default function App() {
                 <section className="space-y-6">
                   <div className="flex items-center justify-between px-2">
                     <h2 className="text-xl font-bold">变更详情 (按风险等级排序)</h2>
-                    <div className="flex items-center gap-4">
-                      <a 
-                        href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"
-                      >
-                        查看 GitHub 原始对比
-                        <ExternalLink size={12} />
-                      </a>
-                    </div>
-                  </div>
-
-                  {/* Table View of Excel Data */}
-                  <div className="bg-white rounded-3xl border border-black/5 shadow-sm overflow-hidden">
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left border-collapse">
-                        <thead>
-                          <tr className="bg-gray-50 border-b border-black/5">
-                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40 w-32">变更点</th>
-                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40">详细描述与功能说明</th>
-                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40 w-24 text-center">风险</th>
-                            <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-black/40">排查与整改指导</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-black/5">
-                          {fullDiffAnalysis.excelRows.map((row, idx) => (
-                            <tr key={idx} className="hover:bg-gray-50/50 transition-colors">
-                              <td className="px-4 py-4 align-top">
-                                <div className="font-bold text-sm text-black">{row.changepoint}</div>
-                                <div className="text-xs text-black/40 mt-1">{row.chinese}</div>
-                              </td>
-                              <td className="px-4 py-4 align-top">
-                                <div className="text-sm text-black/70 leading-relaxed whitespace-pre-wrap">
-                                  <Markdown>{row.function}</Markdown>
-                                </div>
-                              </td>
-                              <td className="px-4 py-4 align-top text-center">
-                                <span className={cn(
-                                  "px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider",
-                                  row.risk === '高' ? "bg-red-50 text-red-600 border border-red-100" :
-                                  row.risk === '中' ? "bg-amber-50 text-amber-600 border border-amber-100" :
-                                  "bg-emerald-50 text-emerald-700 border border-emerald-100"
-                                )}>
-                                  {row.risk}
-                                </span>
-                              </td>
-                              <td className="px-4 py-4 align-top">
-                                <div className="space-y-4">
-                                  <div>
-                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">排查建议</div>
-                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap">
-                                      <Markdown>{row.suggestion}</Markdown>
-                                    </div>
-                                  </div>
-                                  <div>
-                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">代码排查指导</div>
-                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap bg-gray-50 p-2 rounded-lg border border-black/5">
-                                      <Markdown>{row.code_discovery}</Markdown>
-                                    </div>
-                                  </div>
-                                  <div>
-                                    <div className="text-[9px] font-bold text-black/30 uppercase tracking-widest mb-1">代码整改指导</div>
-                                    <div className="text-xs text-black/60 leading-relaxed whitespace-pre-wrap bg-emerald-50/30 p-2 rounded-lg border border-emerald-100/30">
-                                      <Markdown>{row.code_fix}</Markdown>
-                                    </div>
-                                  </div>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                    <a 
+                      href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"
+                    >
+                      查看 GitHub 原始对比
+                      <ExternalLink size={12} />
+                    </a>
                   </div>
 
                   <div className="grid gap-4">
@@ -880,9 +815,9 @@ export default function App() {
                               {item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低'} 风险
                             </span>
                           </div>
-                          <div className="text-sm text-black/60 mb-4 leading-relaxed whitespace-pre-wrap">
-                            <Markdown>{item.description}</Markdown>
-                          </div>
+                          <p className="text-sm text-black/60 mb-4 leading-relaxed whitespace-pre-wrap">
+                            {item.description}
+                          </p>
                           
                           {/* Commit Links */}
                           {item.commitLinks && item.commitLinks.length > 0 && (
@@ -924,9 +859,9 @@ export default function App() {
                                     <AlertTriangle size={12} />
                                     兼容性影响分析
                                   </div>
-                                  <div className="text-sm text-amber-900/80 leading-relaxed whitespace-pre-wrap">
-                                    <Markdown>{item.compatibilityAnalysis}</Markdown>
-                                  </div>
+                                  <p className="text-sm text-amber-900/80 leading-relaxed whitespace-pre-wrap">
+                                    {item.compatibilityAnalysis}
+                                  </p>
                                 </div>
                               )}
 
@@ -972,8 +907,8 @@ export default function App() {
                       {toVersion}
                     </span>
                   </div>
-                  <div className="prose prose-sm max-w-none text-black/70">
-                    <Markdown>{changeLogAnalysis.summary}</Markdown>
+                  <div className="prose prose-sm max-w-none text-black/70 whitespace-pre-wrap">
+                    {changeLogAnalysis.summary}
                   </div>
                 </section>
 

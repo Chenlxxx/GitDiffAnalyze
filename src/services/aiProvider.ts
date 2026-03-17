@@ -4,33 +4,61 @@ import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig
 
 function parseJSON(text: string): any {
   if (!text) return {};
-  const cleanText = text.trim();
-  try {
-    return JSON.parse(cleanText);
-  } catch (e) {
-    // Try to extract JSON from markdown code blocks
-    const jsonMatch = cleanText.match(/```json\s*([\s\S]*?)\s*```/i) || cleanText.match(/```\s*([\s\S]*?)\s*```/i);
-    if (jsonMatch && jsonMatch[1]) {
+  let cleanText = text.trim();
+  
+  // Helper to try parsing
+  const tryParse = (str: string) => {
+    try {
+      return JSON.parse(str);
+    } catch (e) {
+      // Try to fix common JSON issues:
+      // 1. Remove trailing commas before closing braces/brackets
+      let fixed = str.replace(/,\s*([\]}])/g, '$1');
+      // 2. Handle unescaped newlines in strings
+      // This is tricky, but we can try to find newlines that are NOT preceded by a backslash
+      // and are inside double quotes. A simpler approach is to just escape all newlines 
+      // that are not already escaped, but that might break actual escaped newlines.
+      // Let's try to replace literal newlines with \n if they are between quotes.
+      // However, a safer way is to just replace them globally if we're desperate.
       try {
-        return JSON.parse(jsonMatch[1].trim());
-      } catch (innerError) {
-        console.error("Failed to parse extracted JSON:", innerError);
+        return JSON.parse(fixed);
+      } catch (e2) {
+        // If still failing, try to replace literal newlines with \n
+        // This is a bit aggressive but often works for AI-generated JSON
+        try {
+          const veryFixed = fixed.replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+          // But wait, this will break the JSON structure itself if not careful.
+          // Let's not do this globally yet.
+          return null;
+        } catch (e3) {
+          return null;
+        }
       }
     }
-    
-    // Try to find the first '{' and last '}'
-    const firstBrace = cleanText.indexOf('{');
-    const lastBrace = cleanText.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-      try {
-        return JSON.parse(cleanText.substring(firstBrace, lastBrace + 1));
-      } catch (innerError) {
-        console.error("Failed to parse braced JSON:", innerError);
-      }
-    }
-    
-    throw new Error("无法解析 AI 返回的 JSON 数据。");
+  };
+
+  // 1. Try direct parse
+  let result = tryParse(cleanText);
+  if (result) return result;
+
+  // 2. Try to extract JSON from markdown code blocks
+  const jsonMatch = cleanText.match(/```json\s*([\s\S]*?)\s*```/i) || cleanText.match(/```\s*([\s\S]*?)\s*```/i);
+  if (jsonMatch && jsonMatch[1]) {
+    result = tryParse(jsonMatch[1].trim());
+    if (result) return result;
+    console.error("Failed to parse extracted JSON");
   }
+  
+  // 3. Try to find the first '{' and last '}'
+  const firstBrace = cleanText.indexOf('{');
+  const lastBrace = cleanText.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    result = tryParse(cleanText.substring(firstBrace, lastBrace + 1));
+    if (result) return result;
+    console.error("Failed to parse braced JSON");
+  }
+  
+  throw new Error("无法解析 AI 返回的 JSON 数据。这通常是因为返回内容过长导致截断，或者内容中包含特殊字符。请尝试缩小分析范围或稍后再试。");
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 3, initialDelay: number = 2000): Promise<T> {
@@ -237,7 +265,7 @@ export class GeminiProvider implements AIProvider {
           
           任务：
           1. 提供变更的整体摘要。
-          2. 识别关键变更条目，并评估风险等级。
+          2. 识别关键变更条目，并评估风险等级。**如果变更条目过多（超过 15 个），请优先分析风险等级较高的条目，并对相似的条目进行合并，以确保输出的 JSON 完整且不被截断。**
           3. **深度分析与兼容性指导**：对于“高”和“中”风险项，提供深度分析和代码示例。
           4. **生成 Excel 结构化数据**：为了方便导出，请同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
           
@@ -361,10 +389,18 @@ export class OpenAICompatibleProvider implements AIProvider {
       if (this.config.useProxy) {
         // Use the proxy to avoid CORS (Works in full-stack environments like AI Studio)
         const response = await axios.post('/api/ai-proxy', { url, data, headers });
+        if (!response.data?.choices?.[0]?.message?.content) {
+          console.error("Invalid AI response structure:", response.data);
+          throw new Error("AI 服务返回了无效的数据结构。请检查模型配置或稍后再试。");
+        }
         return response.data.choices[0].message.content;
       } else {
         // Direct call (Works in static hosting if the AI provider allows CORS)
         const response = await axios.post(url, data, { headers });
+        if (!response.data?.choices?.[0]?.message?.content) {
+          console.error("Invalid AI response structure:", response.data);
+          throw new Error("AI 服务返回了无效的数据结构。请检查模型配置或稍后再试。");
+        }
         return response.data.choices[0].message.content;
       }
     } catch (error: any) {
