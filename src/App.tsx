@@ -19,12 +19,17 @@ import {
   Code2,
   Settings,
   Cpu,
-  Download
+  Download,
+  FileUp,
+  FileArchive,
+  FileSpreadsheet,
+  Trash2
 } from 'lucide-react';
 import * as ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -50,8 +55,8 @@ export default function App() {
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);
-  const [analysisMode, setAnalysisMode] = useState<'changelog' | 'full-diff'>('changelog');
-  const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs' | 'analyzing-full-diff'>('idle');
+  const [analysisMode, setAnalysisMode] = useState<'changelog' | 'full-diff' | 'batch'>('changelog');
+  const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs' | 'analyzing-full-diff' | 'batch-processing'>('idle');
   const [error, setError] = useState<string | null>(null);
   
   const [changeLogAnalysis, setChangeLogAnalysis] = useState<ChangeLogAnalysis | null>(null);
@@ -59,6 +64,10 @@ export default function App() {
   const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
+
+  // Batch Analysis State
+  const [batchItems, setBatchItems] = useState<BatchAnalysisItem[]>([]);
+  const [batchProcessing, setBatchProcessing] = useState(false);
 
   const handleAnalyze = async () => {
     if (analysisMode === 'full-diff') {
@@ -238,6 +247,75 @@ export default function App() {
     }
   };
 
+  const performFullDiffAnalysis = async (
+    targetRepoUrl: string, 
+    targetFromVersion: string, 
+    targetToVersion: string,
+    background: string
+  ): Promise<FullDiffAnalysis> => {
+    const repoInfo = GitHubService.parseRepoUrl(targetRepoUrl);
+    if (!repoInfo) throw new Error('Invalid GitHub URL');
+
+    const cleanToVersion = GitHubService.parseTagFromUrl(targetToVersion);
+    const cleanFromVersion = GitHubService.parseTagFromUrl(targetFromVersion);
+
+    const findActualTag = async (version: string) => {
+      try {
+        const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
+        const match = tags.find(t => 
+          t.name === version || 
+          t.name === `v${version}` || 
+          t.name === `rel/v${version}` || 
+          t.name === `rel/${version}` ||
+          t.name.endsWith(`/${version}`) ||
+          t.name.endsWith(`/v${version}`) ||
+          version.endsWith(`/${t.name}`) ||
+          version.endsWith(`/v${t.name}`)
+        );
+        return match?.name || version;
+      } catch (e) {
+        return version;
+      }
+    };
+
+    const actualToTag = await findActualTag(cleanToVersion);
+    const actualFromTag = await findActualTag(cleanFromVersion);
+
+    const [commitData, diff, releaseData] = await Promise.all([
+      GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
+      GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
+      (async () => {
+        try {
+          return await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+        } catch (e) {
+          return null;
+        }
+      })()
+    ]);
+    
+    if (!diff || diff.length < 10) {
+      throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
+    }
+
+    const releaseNotes = releaseData?.body || '';
+
+    const provider = getAIProvider(aiConfig);
+    const analysis = await provider.analyzeFullDiff(
+      diff, 
+      background, 
+      targetFromVersion, 
+      targetToVersion, 
+      releaseNotes, 
+      commitData.commits, 
+      commitData.files
+    );
+    
+    const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
+    analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
+    
+    return analysis;
+  };
+
   const handleFullDiffAnalyze = async () => {
     setLoading(true);
     setError(null);
@@ -247,80 +325,130 @@ export default function App() {
     setStep('analyzing-full-diff');
 
     try {
+      const analysis = await performFullDiffAnalysis(repoUrl, fromVersion, toVersion, projectBackground);
+      
+      // For single analysis, we still want to set resolved tags for the UI link
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
-      if (!repoInfo) throw new Error('Invalid GitHub URL');
-
-      const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
-      const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
-
-      const findActualTag = async (version: string) => {
-        try {
-          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-          const match = tags.find(t => 
-            t.name === version || 
-            t.name === `v${version}` || 
-            t.name === `rel/v${version}` || 
-            t.name === `rel/${version}` ||
-            t.name.endsWith(`/${version}`) ||
-            t.name.endsWith(`/v${version}`) ||
-            version.endsWith(`/${t.name}`) ||
-            version.endsWith(`/v${t.name}`)
-          );
-          return match?.name || version;
-        } catch (e) {
-          return version;
-        }
-      };
-
-      const actualToTag = await findActualTag(cleanToVersion);
-      const actualFromTag = await findActualTag(cleanFromVersion);
-      setResolvedTags({ from: actualFromTag, to: actualToTag });
-
-      // 1. Fetch Commits, Full Diff and Release Notes
-      setStep('analyzing-full-diff');
-      
-      const [commitData, diff, releaseData] = await Promise.all([
-        GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
-        GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
-        (async () => {
-          try {
-            return await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
-          } catch (e) {
-            return null;
-          }
-        })()
-      ]);
-      
-      if (!diff || diff.length < 10) {
-        throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
+      if (repoInfo) {
+        const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
+        const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
+        const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
+        const findTag = (v: string) => tags.find(t => t.name === v || t.name === `v${v}`)?.name || v;
+        setResolvedTags({ from: findTag(cleanFromVersion), to: findTag(cleanToVersion) });
       }
 
-      const releaseNotes = releaseData?.body || '';
-
-      // 2. Analyze Full Diff with Selected AI
-      const provider = getAIProvider(aiConfig);
-      const analysis = await provider.analyzeFullDiff(
-        diff, 
-        projectBackground, 
-        fromVersion, 
-        toVersion, 
-        releaseNotes, 
-        commitData.commits, 
-        commitData.files
-      );
-      
-      // Sort items by risk level: High > Medium > Low
-      const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
-      analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
-      
       setFullDiffAnalysis(analysis);
-      
     } catch (err: any) {
       console.error(err);
       setError(err.message || '深度分析过程中发生错误');
     } finally {
       setLoading(false);
     }
+  };
+
+  const generateExcelBuffer = async (analysis: FullDiffAnalysis, targetRepoUrl: string, targetFromVersion: string, targetToVersion: string) => {
+    if (!analysis.excelRows || analysis.excelRows.length === 0) {
+      throw new Error('分析数据为空，无法生成 Excel。');
+    }
+
+    const repoInfo = GitHubService.parseRepoUrl(targetRepoUrl);
+    const repoName = repoInfo ? repoInfo.repo : '项目';
+    const reportTitle = `${repoName} ${targetFromVersion} → ${targetToVersion} 升级变更分析报告`;
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Analysis Report');
+
+    // 1. Add Title Row
+    const titleRow = worksheet.addRow(['', reportTitle]);
+    titleRow.height = 30;
+    const titleCell = titleRow.getCell(2);
+    titleCell.font = { size: 18, bold: true, color: { argb: 'FF000000' } };
+    titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
+    worksheet.mergeCells(`B1:K1`);
+
+    worksheet.addRow([]);
+
+    // 2. Define headers
+    const headers = [
+      '版本号', '变更点（英文）', '变更点中文描述', '功能作用说明', 
+      '排查建议', '风险等级', '测试建议', '代码排查指导', 
+      '代码整改指导', '关联 Commit'
+    ];
+    const headerRow = worksheet.addRow(['', ...headers]);
+    headerRow.height = 35;
+    
+    const thinBorder: Partial<ExcelJS.Borders> = {
+      top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } },
+      right: { style: 'thin', color: { argb: 'FFCCCCCC' } }
+    };
+
+    headerRow.eachCell((cell, colNumber) => {
+      if (colNumber === 1) return;
+      cell.font = { size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: { argb: 'FF333333' }
+      };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = thinBorder;
+    });
+
+    worksheet.getColumn(1).width = 2;
+    worksheet.getColumn(2).width = 10;
+    worksheet.getColumn(3).width = 50;
+    worksheet.getColumn(4).width = 30;
+    worksheet.getColumn(5).width = 50;
+    worksheet.getColumn(6).width = 50;
+    worksheet.getColumn(7).width = 10;
+    worksheet.getColumn(8).width = 40;
+    worksheet.getColumn(9).width = 60;
+    worksheet.getColumn(10).width = 60;
+    worksheet.getColumn(11).width = 40;
+
+    // 3. Add Data Rows
+    analysis.excelRows.forEach(data => {
+      const row = worksheet.addRow([
+        '',
+        data.version,
+        data.changepoint,
+        data.chinese,
+        data.function,
+        data.suggestion,
+        data.risk,
+        data.test_suggestion,
+        data.code_discovery,
+        data.code_fix,
+        data.related_commits || ''
+      ]);
+      row.height = 200;
+
+      row.eachCell((cell, colNumber) => {
+        if (colNumber === 1) return;
+        cell.font = { size: 10 };
+        cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
+        cell.border = thinBorder;
+        
+        if (colNumber === 7) {
+          const value = cell.value?.toString() || '';
+          if (value.includes('高')) {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFCCCC' } };
+          } else if (value.includes('中')) {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFCC' } };
+          } else {
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFCCFFCC' } };
+          }
+          cell.alignment = { vertical: 'middle', horizontal: 'center' };
+        }
+      });
+    });
+
+    worksheet.autoFilter = { from: 'B3', to: 'K3' };
+    worksheet.views = [{ state: 'frozen', xSplit: 0, ySplit: 3 }];
+
+    return await workbook.xlsx.writeBuffer();
   };
 
   const handleDownloadExcel = async () => {
@@ -332,115 +460,7 @@ export default function App() {
     setExcelLoading(true);
     setError(null);
     try {
-      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
-      const repoName = repoInfo ? repoInfo.repo : '项目';
-      const reportTitle = `${repoName} ${fromVersion} → ${toVersion} 升级变更分析报告`;
-
-      // Generate Excel using ExcelJS
-      const workbook = new ExcelJS.Workbook();
-      const worksheet = workbook.addWorksheet('Analysis Report');
-
-      // 1. Add Title Row
-      const titleRow = worksheet.addRow(['', reportTitle]); // Start from B
-      titleRow.height = 30;
-      const titleCell = titleRow.getCell(2);
-      titleCell.font = { size: 18, bold: true, color: { argb: 'FF000000' } };
-      titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
-      worksheet.mergeCells(`B1:K1`);
-
-      // Add an empty row for spacing (like the Python example's row 3)
-      worksheet.addRow([]);
-
-      // 2. Define headers (Row 3)
-      const headers = [
-        '版本号', '变更点（英文）', '变更点中文描述', '功能作用说明', 
-        '排查建议', '风险等级', '测试建议', '代码排查指导', 
-        '代码整改指导', '关联 Commit'
-      ];
-      const headerRow = worksheet.addRow(['', ...headers]);
-      headerRow.height = 35;
-      
-      const thinBorder: any = {
-        top: { style: 'thin', color: { argb: 'FFCCCCCC' } },
-        left: { style: 'thin', color: { argb: 'FFCCCCCC' } },
-        bottom: { style: 'thin', color: { argb: 'FFCCCCCC' } },
-        right: { style: 'thin', color: { argb: 'FFCCCCCC' } }
-      };
-
-      headerRow.eachCell((cell, colNumber) => {
-        if (colNumber === 1) return; // Skip empty first column
-        cell.font = { size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
-        cell.fill = {
-          type: 'pattern',
-          pattern: 'solid',
-          fgColor: { argb: 'FF333333' }
-        };
-        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-        cell.border = thinBorder;
-      });
-
-      // Set column widths (starting from B)
-      worksheet.getColumn(1).width = 2;   // Spacer column A
-      worksheet.getColumn(2).width = 10;  // 版本号
-      worksheet.getColumn(3).width = 50;  // 变更点（英文）
-      worksheet.getColumn(4).width = 30;  // 变更点中文描述
-      worksheet.getColumn(5).width = 50;  // 功能作用说明
-      worksheet.getColumn(6).width = 50;  // 排查建议
-      worksheet.getColumn(7).width = 10;  // 风险等级
-      worksheet.getColumn(8).width = 40;  // 测试建议
-      worksheet.getColumn(9).width = 60;  // 代码排查指导
-      worksheet.getColumn(10).width = 60; // 代码整改指导
-      worksheet.getColumn(11).width = 40; // 关联 Commit
-
-      // 3. Add Data Rows
-      fullDiffAnalysis.excelRows.forEach(data => {
-        const row = worksheet.addRow([
-          '', // Spacer A
-          data.version,
-          data.changepoint,
-          data.chinese,
-          data.function,
-          data.suggestion,
-          data.risk,
-          data.test_suggestion,
-          data.code_discovery,
-          data.code_fix,
-          data.related_commits || ''
-        ]);
-        row.height = 200;
-
-        // Style data cells
-        row.eachCell((cell, colNumber) => {
-          if (colNumber === 1) return; // Skip empty first column
-          cell.font = { size: 10 };
-          cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
-          cell.border = thinBorder;
-          
-          // Color risk level (Column G / 7)
-          if (colNumber === 7) {
-            const value = cell.value?.toString() || '';
-            if (value.includes('高')) {
-              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFCCCC' } };
-            } else if (value.includes('中')) {
-              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFCC' } };
-            } else {
-              cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFCCFFCC' } };
-            }
-            cell.alignment = { vertical: 'middle', horizontal: 'center' };
-          }
-        });
-      });
-
-      // 4. Enable Auto Filter on header row (B3:K3)
-      worksheet.autoFilter = { from: 'B3', to: 'K3' };
-
-      // 5. Freeze panes (freeze top 3 rows)
-      worksheet.views = [
-        { state: 'frozen', xSplit: 0, ySplit: 3 }
-      ];
-
-      // Write to buffer and download
-      const buffer = await workbook.xlsx.writeBuffer();
+      const buffer = await generateExcelBuffer(fullDiffAnalysis, repoUrl, fromVersion, toVersion);
       const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       const url = window.URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -496,6 +516,122 @@ export default function App() {
 
     // Trigger all scans in parallel
     await Promise.all(targetItems.map(item => analyzePR(item.prNumber!, item.title)));
+  };
+
+  const handleExcelUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(await file.arrayBuffer());
+      const worksheet = workbook.worksheets[0];
+      
+      const newItems: BatchAnalysisItem[] = [];
+      worksheet.eachRow((row, rowNumber) => {
+        if (rowNumber === 1) return; // Skip header
+        
+        const repoUrl = row.getCell(1).text?.trim();
+        const fromVersion = row.getCell(2).text?.trim();
+        const toVersion = row.getCell(3).text?.trim();
+        
+        if (repoUrl && fromVersion && toVersion) {
+          newItems.push({
+            repoUrl,
+            fromVersion,
+            toVersion,
+            status: 'pending'
+          });
+        }
+      });
+      
+      setBatchItems(prev => [...prev, ...newItems]);
+      e.target.value = ''; // Reset input
+    } catch (err: any) {
+      console.error('Excel upload error:', err);
+      setError('解析 Excel 失败，请确保格式正确（三列：仓库地址、起始版本、目标版本）。');
+    }
+  };
+
+  const handleBatchAnalyze = async () => {
+    if (batchItems.length === 0 || batchProcessing) return;
+    
+    setBatchProcessing(true);
+    setError(null);
+    setStep('batch-processing');
+
+    const items = [...batchItems];
+    
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].status === 'completed') continue;
+      
+      items[i] = { ...items[i], status: 'processing' };
+      setBatchItems([...items]);
+      
+      try {
+        const analysis = await performFullDiffAnalysis(
+          items[i].repoUrl, 
+          items[i].fromVersion, 
+          items[i].toVersion, 
+          projectBackground
+        );
+        items[i] = { ...items[i], status: 'completed', analysis };
+      } catch (err: any) {
+        console.error(`Error processing ${items[i].repoUrl}:`, err);
+        items[i] = { ...items[i], status: 'failed', error: err.message || '分析失败' };
+      }
+      
+      setBatchItems([...items]);
+      // Small delay between items to avoid hitting rate limits too hard
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    setBatchProcessing(false);
+    setStep('idle');
+  };
+
+  const handleDownloadBatchZip = async () => {
+    const completedItems = batchItems.filter(item => item.status === 'completed' && item.analysis);
+    if (completedItems.length === 0) {
+      setError('没有已完成的分析结果可供下载。');
+      return;
+    }
+
+    setExcelLoading(true);
+    try {
+      const zip = new JSZip();
+      
+      for (const item of completedItems) {
+        const repoInfo = GitHubService.parseRepoUrl(item.repoUrl);
+        const repoName = repoInfo ? repoInfo.repo : 'repo';
+        const fileName = `${repoName}_${item.fromVersion}_to_${item.toVersion}.xlsx`;
+        
+        const buffer = await generateExcelBuffer(item.analysis!, item.repoUrl, item.fromVersion, item.toVersion);
+        zip.file(fileName, buffer);
+      }
+      
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = window.URL.createObjectURL(content);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `Batch_Analysis_Reports_${new Date().toISOString().split('T')[0]}.zip`;
+      anchor.click();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error('ZIP generation error:', err);
+      setError('生成 ZIP 压缩包失败: ' + err.message);
+    } finally {
+      setExcelLoading(false);
+    }
+  };
+
+  const removeBatchItem = (index: number) => {
+    setBatchItems(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const clearBatchItems = () => {
+    if (batchProcessing) return;
+    setBatchItems([]);
   };
 
   return (
@@ -617,7 +753,7 @@ export default function App() {
                     <button 
                       onClick={() => setAnalysisMode('changelog')}
                       className={cn(
-                        "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                        "flex-1 py-2 text-[10px] font-bold rounded-lg transition-all",
                         analysisMode === 'changelog' ? "bg-white shadow-sm text-black" : "text-black/40 hover:text-black/60"
                       )}
                     >
@@ -626,56 +762,99 @@ export default function App() {
                     <button 
                       onClick={() => setAnalysisMode('full-diff')}
                       className={cn(
-                        "flex-1 py-2 text-xs font-bold rounded-lg transition-all",
+                        "flex-1 py-2 text-[10px] font-bold rounded-lg transition-all",
                         analysisMode === 'full-diff' ? "bg-white shadow-sm text-black" : "text-black/40 hover:text-black/60"
                       )}
                     >
                       全量 Diff 模式
                     </button>
+                    <button 
+                      onClick={() => setAnalysisMode('batch')}
+                      className={cn(
+                        "flex-1 py-2 text-[10px] font-bold rounded-lg transition-all",
+                        analysisMode === 'batch' ? "bg-white shadow-sm text-black" : "text-black/40 hover:text-black/60"
+                      )}
+                    >
+                      批量分析模式
+                    </button>
                   </div>
                   <p className="text-[10px] text-black/30 px-1">
                     {analysisMode === 'changelog' 
                       ? "基于 Release Notes 或 Commit 记录进行初步评估。" 
-                      : "直接获取两个版本间的完整代码差异进行深度扫描。"}
+                      : analysisMode === 'full-diff'
+                      ? "直接获取两个版本间的完整代码差异进行深度扫描。"
+                      : "上传 Excel 列表，批量执行全量 Diff 深度分析。"}
                   </p>
                 </div>
 
-                <div className="space-y-2">
-                  <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub 仓库地址</label>
-                  <div className="relative">
-                    <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-black/20" size={18} />
-                    <input 
-                      type="text" 
-                      value={repoUrl}
-                      onChange={(e) => setRepoUrl(e.target.value)}
-                      className="w-full pl-10 pr-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder="https://github.com/owner/repo"
-                    />
-                  </div>
-                </div>
+                {analysisMode !== 'batch' ? (
+                  <>
+                    <div className="space-y-2">
+                      <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub 仓库地址</label>
+                      <div className="relative">
+                        <Github className="absolute left-3 top-1/2 -translate-y-1/2 text-black/20" size={18} />
+                        <input 
+                          type="text" 
+                          value={repoUrl}
+                          onChange={(e) => setRepoUrl(e.target.value)}
+                          className="w-full pl-10 pr-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                          placeholder="https://github.com/owner/repo"
+                        />
+                      </div>
+                    </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">起始版本 (From)</label>
-                    <input 
-                      type="text" 
-                      value={fromVersion}
-                      onChange={(e) => setFromVersion(e.target.value)}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder="0.21.0"
-                    />
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">起始版本 (From)</label>
+                        <input 
+                          type="text" 
+                          value={fromVersion}
+                          onChange={(e) => setFromVersion(e.target.value)}
+                          className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                          placeholder="0.21.0"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">目标版本 (To)</label>
+                        <input 
+                          type="text" 
+                          value={toVersion}
+                          onChange={(e) => setToVersion(e.target.value)}
+                          className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                          placeholder="0.22.0"
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="p-6 border-2 border-dashed border-black/10 rounded-2xl flex flex-col items-center justify-center gap-3 bg-[#F9F9F9] hover:bg-black/[0.02] transition-colors relative group">
+                      <FileUp size={32} className="text-black/20 group-hover:text-emerald-500 transition-colors" />
+                      <div className="text-center">
+                        <p className="text-sm font-bold">上传分析列表</p>
+                        <p className="text-[10px] text-black/40 mt-1">支持 .xlsx 格式，需包含：仓库地址、起始版本、目标版本</p>
+                      </div>
+                      <input 
+                        type="file" 
+                        accept=".xlsx"
+                        onChange={handleExcelUpload}
+                        className="absolute inset-0 opacity-0 cursor-pointer"
+                      />
+                    </div>
+                    
+                    {batchItems.length > 0 && (
+                      <div className="flex items-center justify-between px-1">
+                        <span className="text-[10px] font-bold text-black/40 uppercase tracking-wider">已加载 {batchItems.length} 个项目</span>
+                        <button 
+                          onClick={clearBatchItems}
+                          className="text-[10px] font-bold text-red-500 uppercase tracking-wider hover:underline"
+                        >
+                          清空列表
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">目标版本 (To)</label>
-                    <input 
-                      type="text" 
-                      value={toVersion}
-                      onChange={(e) => setToVersion(e.target.value)}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder="0.22.0"
-                    />
-                  </div>
-                </div>
+                )}
 
                 <div className="space-y-2">
                   <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">项目背景</label>
@@ -689,15 +868,15 @@ export default function App() {
                 </div>
 
                 <button 
-                  onClick={handleAnalyze}
-                  disabled={loading}
+                  onClick={analysisMode === 'batch' ? handleBatchAnalyze : handleAnalyze}
+                  disabled={loading || batchProcessing || (analysisMode === 'batch' && batchItems.length === 0)}
                   className="w-full bg-black text-white py-4 rounded-2xl font-bold flex items-center justify-center gap-2 hover:bg-black/90 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
                 >
-                  {loading ? (
+                  {loading || batchProcessing ? (
                     <Loader2 className="animate-spin" size={20} />
                   ) : (
                     <>
-                      开始分析
+                      {analysisMode === 'batch' ? '开始批量分析' : '开始分析'}
                       <ArrowRight size={20} className="group-hover:translate-x-1 transition-transform" />
                     </>
                   )}
@@ -715,7 +894,76 @@ export default function App() {
 
           {/* Right Column: Results */}
           <div className="lg:col-span-8 space-y-8">
-            {!changeLogAnalysis && !fullDiffAnalysis && !loading && (
+            {analysisMode === 'batch' && batchItems.length > 0 && (
+              <section className="bg-white rounded-3xl p-8 shadow-sm border border-black/5">
+                <div className="flex items-center justify-between mb-6">
+                  <h2 className="text-xl font-bold flex items-center gap-2">
+                    <History size={20} className="text-emerald-500" />
+                    批量分析队列 ({batchItems.filter(i => i.status === 'completed').length}/{batchItems.length})
+                  </h2>
+                  {batchItems.some(i => i.status === 'completed') && (
+                    <button 
+                      onClick={handleDownloadBatchZip}
+                      className="flex items-center gap-2 px-4 py-2 bg-emerald-500 text-white rounded-xl text-xs font-bold hover:bg-emerald-600 transition-all shadow-sm"
+                    >
+                      <FileArchive size={14} />
+                      下载汇总 ZIP
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-3">
+                  {batchItems.map((item, idx) => (
+                    <div 
+                      key={idx} 
+                      onClick={() => item.status === 'completed' && item.analysis && setFullDiffAnalysis(item.analysis)}
+                      className={cn(
+                        "flex items-center justify-between p-4 bg-[#F9F9F9] rounded-xl border border-black/5 transition-all",
+                        item.status === 'completed' && item.analysis ? "cursor-pointer hover:bg-black/[0.02] hover:border-emerald-500/30" : ""
+                      )}
+                    >
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-bold truncate max-w-[200px]">{item.repoUrl.split('/').pop()}</span>
+                          <span className="text-[10px] text-black/40 font-mono">{item.fromVersion} → {item.toVersion}</span>
+                        </div>
+                        {item.error && <p className="text-[10px] text-red-500 font-medium">{item.error}</p>}
+                      </div>
+                      <div className="flex items-center gap-3">
+                        {item.status === 'processing' && <Loader2 className="animate-spin text-emerald-500" size={16} />}
+                        {item.status === 'completed' && <CheckCircle2 className="text-emerald-500" size={16} />}
+                        {item.status === 'failed' && <AlertTriangle className="text-red-500" size={16} />}
+                        <span className={cn(
+                          "text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded",
+                          item.status === 'pending' ? "bg-black/5 text-black/40" :
+                          item.status === 'processing' ? "bg-emerald-50 text-emerald-600" :
+                          item.status === 'completed' ? "bg-emerald-500 text-white" :
+                          "bg-red-50 text-red-600"
+                        )}>
+                          {item.status === 'pending' ? '等待中' : 
+                           item.status === 'processing' ? '分析中' : 
+                           item.status === 'completed' ? '查看结果' : '失败'}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {analysisMode === 'batch' && batchItems.length === 0 && !loading && (
+              <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-center space-y-4 bg-white/50 border border-dashed border-black/10 rounded-3xl">
+                <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center text-black/20">
+                  <FileSpreadsheet size={32} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold">批量分析队列为空</h3>
+                  <p className="text-sm text-black/40 max-w-xs mx-auto">请在左侧上传包含待分析项目列表的 Excel 文件以开始批量处理。</p>
+                </div>
+              </div>
+            )}
+
+            {analysisMode !== 'batch' && !changeLogAnalysis && !fullDiffAnalysis && !loading && (
               <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-center space-y-4 bg-white/50 border border-dashed border-black/10 rounded-3xl">
                 <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center text-black/20">
                   <History size={32} />

@@ -73,6 +73,15 @@ export interface ExcelAnalysis {
   rows: ExcelAnalysisRow[];
 }
 
+export interface BatchAnalysisItem {
+  repoUrl: string;
+  fromVersion: string;
+  toVersion: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  error?: string;
+  analysis?: FullDiffAnalysis;
+}
+
 export interface AIProvider {
   analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis>;
   analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis>;
