@@ -313,6 +313,11 @@ export default function App() {
     const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
     analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
     
+    analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
+    analysis.repoUrl = targetRepoUrl;
+    analysis.fromVersion = targetFromVersion;
+    analysis.toVersion = targetToVersion;
+    
     return analysis;
   };
 
@@ -327,14 +332,8 @@ export default function App() {
     try {
       const analysis = await performFullDiffAnalysis(repoUrl, fromVersion, toVersion, projectBackground);
       
-      // For single analysis, we still want to set resolved tags for the UI link
-      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
-      if (repoInfo) {
-        const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
-        const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
-        const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-        const findTag = (v: string) => tags.find(t => t.name === v || t.name === `v${v}`)?.name || v;
-        setResolvedTags({ from: findTag(cleanFromVersion), to: findTag(cleanToVersion) });
+      if (analysis.resolvedTags) {
+        setResolvedTags(analysis.resolvedTags);
       }
 
       setFullDiffAnalysis(analysis);
@@ -1038,7 +1037,7 @@ export default function App() {
                   <div className="flex items-center justify-between px-2">
                     <h2 className="text-xl font-bold">变更详情 (按风险等级排序)</h2>
                     <a 
-                      href={`${repoUrl}/compare/${resolvedTags.from || fromVersion}...${resolvedTags.to || toVersion}`}
+                      href={`${fullDiffAnalysis.repoUrl || repoUrl}/compare/${fullDiffAnalysis.resolvedTags?.from || resolvedTags.from || fromVersion}...${fullDiffAnalysis.resolvedTags?.to || resolvedTags.to || toVersion}`}
                       target="_blank"
                       rel="noreferrer"
                       className="text-xs font-bold text-blue-500 hover:underline flex items-center gap-1"

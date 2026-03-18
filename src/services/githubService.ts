@@ -35,7 +35,7 @@ export class GitHubService {
   }
 
   static async getTags(owner: string, repo: string): Promise<{ name: string }[]> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags`);
+    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags?per_page=100`);
     return response.data;
   }
 

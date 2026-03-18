@@ -54,6 +54,13 @@ export interface FullDiffAnalysis {
   overallRisk: 'High' | 'Medium' | 'Low';
   recommendations: string[];
   excelRows?: ExcelAnalysisRow[];
+  resolvedTags?: {
+    from: string;
+    to: string;
+  };
+  repoUrl?: string;
+  fromVersion?: string;
+  toVersion?: string;
 }
 
 export interface ExcelAnalysisRow {
