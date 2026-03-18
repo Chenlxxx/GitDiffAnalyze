@@ -7,7 +7,8 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
   // GitHub API Proxy
   app.get("/api/github/*", async (req, res) => {
@@ -120,12 +121,23 @@ async function startServer() {
         }
       }
 
-      const response = await axios.post(url, data, { headers });
+      const response = await axios.post(url, data, { 
+        headers,
+        timeout: 300000 // 300 seconds timeout for AI generation
+      });
       res.json(response.data);
     } catch (error: any) {
       const status = error.response?.status;
       const errorData = error.response?.data;
       
+      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+        console.error(`AI Proxy Timeout for ${req.body.url}`);
+        return res.status(504).json({
+          message: 'AI 服务响应超时。由于分析内容较多或模型生成较慢，请求已超过 5 分钟限制。',
+          details: error.message
+        });
+      }
+
       console.error(`AI Proxy Error (${status}):`, JSON.stringify(errorData || error.message));
       
       if (status === 401) {
