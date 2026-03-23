@@ -1,5 +1,5 @@
 {
-  "name": "GitDiff 变更分析器",
+  "name": "CompatAnalyzer",
   "description": "利用 AI 分析 GitHub 库更新，并评估对您项目的兼容性风险。",
   "requestFramePermissions": []
 }

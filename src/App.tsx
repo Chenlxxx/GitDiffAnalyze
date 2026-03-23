@@ -643,7 +643,7 @@ export default function App() {
               <Github size={24} />
             </div>
             <div>
-              <h1 className="font-bold text-lg tracking-tight">GitDiff 变更分析器</h1>
+              <h1 className="font-bold text-lg tracking-tight">CompatAnalyzer</h1>
               <p className="text-[10px] uppercase tracking-widest text-black/40 font-semibold">AI 兼容性评估引擎</p>
             </div>
           </div>
@@ -1374,7 +1374,7 @@ export default function App() {
         <div className="flex flex-col md:flex-row items-center justify-between gap-6">
           <div className="flex items-center gap-2 text-black/40">
             <Github size={18} />
-            <span className="text-sm font-medium">GitDiff 变更分析器 v1.0</span>
+            <span className="text-sm font-medium">CompatAnalyzer v1.0</span>
           </div>
           <div className="flex items-center gap-8">
             <a href="#" className="text-xs font-bold uppercase tracking-widest text-black/40 hover:text-black transition-colors">文档</a>

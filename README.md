@@ -1,20 +1,38 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# CompatAnalyzer
 
-# Run and deploy your AI Studio app
+CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮助开发者在升级依赖库时，快速评估新版本带来的兼容性风险和破坏性变更。
 
-This contains everything you need to run your app locally.
+## 核心功能
 
-View your app in AI Studio: https://ai.studio/apps/2b1b8238-f5a0-423b-8e2f-abb1d41edcbd
+- **变更日志分析**：自动抓取 GitHub Release Notes 或 CHANGELOG 文件，识别受影响的条目并评估风险。
+- **全量 Diff 深度扫描**：直接对比两个版本间的代码差异，精准识别 API 变更、逻辑调整等潜在风险。
+- **批量分析模式**：支持通过 Excel 上传多个项目，一键执行批量深度扫描。
+- **结构化报告导出**：分析完成后，可导出详尽的 Excel 报告，包含变更描述、排查建议、测试建议及代码整改指导。
+- **多模型支持**：兼容 Gemini、Qwen (通义千问)、DeepSeek 等主流 AI 模型。
 
-## Run Locally
+## 使用指南
 
-**Prerequisites:**  Node.js
+### 1. 配置 AI 模型
+在使用前，请点击页面右上角的 **设置** 图标，配置您的 AI 提供商：
+- **提供商**：选择 Google Gemini 或 OpenAI 兼容接口。
+- **API Key**：填入您的 API 密钥。
+- **Base URL & 模型名称**：如果使用 OpenAI 兼容接口（如通义千问），请填写对应的 API 地址和模型 ID。
 
+### 2. 开始分析
+1. **输入仓库地址**：填写 GitHub 仓库的完整 URL（例如 `https://github.com/apache/httpcomponents-client`）。
+2. **选择版本范围**：填写起始版本（From）和目标版本（To）。
+3. **填写项目背景**：描述您的项目是如何使用该库的，这有助于 AI 提供更精准的兼容性建议。
+4. **选择模式**：
+   - **变更日志模式**：快速预览。
+   - **全量 Diff 模式**：深度分析。
+5. **点击“开始分析”**。
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+### 3. 查看与导出结果
+- 分析完成后，页面将展示风险摘要、核心建议及详细的变更条目。
+- 对于全量 Diff 模式，您可以点击 **“下载 Excel 报告”** 获取可供团队共享的详细文档。
+
+## 注意事项
+
+- 本工具仅基于提供的文本内容（Diff、Commits、Release Notes）进行静态分析，不执行实际代码。
+- 建议在分析大型仓库时，尽量缩小版本跨度，以获得更详细的分析结果。
+- 如果遇到 API 速率限制，请尝试在设置中配置您的专属 API Key。

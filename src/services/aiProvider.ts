@@ -160,7 +160,7 @@ export class GeminiProvider implements AIProvider {
           项目背景：${projectBackground}
           
           差异内容：
-          ${diff.slice(0, 20000)}
+          ${diff.slice(0, 30000)}
         
         任务：
         1. 识别任何破坏性变更（API 更改、删除的方法、更改的签名）。
@@ -239,8 +239,8 @@ export class GeminiProvider implements AIProvider {
           发布日志 (Release Notes)：
           ${releaseNotes || '未提供'}
           
-          差异内容（Diff 前 40000 字符）：
-          ${diff.slice(0, 40000)}
+          差异内容（Diff 前 60000 字符）：
+          ${diff.slice(0, 60000)}
           
           任务：
           1. 提供变更的整体摘要。
@@ -443,7 +443,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       项目背景：${projectBackground}
       
       差异内容：
-      ${diff.slice(0, 20000)}
+      ${diff.slice(0, 30000)}
       
       请以 JSON 格式返回，结构如下：
       {
@@ -461,8 +461,8 @@ export class OpenAICompatibleProvider implements AIProvider {
   }
 
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
-    const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
-    const fileSummary = files ? files.slice(0, 50).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
+    const commitSummary = commits ? commits.slice(0, 100).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+    const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
     
     const prompt = `
       你是一个极其严谨的资深架构师和安全专家。请分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
@@ -497,8 +497,8 @@ export class OpenAICompatibleProvider implements AIProvider {
       发布日志 (Release Notes)：
       ${releaseNotes || '未提供'}
       
-      差异内容（前 25000 字符）：
-      ${diff.slice(0, 25000)}
+      差异内容（前 60000 字符）：
+      ${diff.slice(0, 60000)}
       
       任务：
       1. 提供变更的整体摘要。
