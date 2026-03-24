@@ -44,7 +44,7 @@ export class GitHubService {
     return response.data;
   }
 
-  static async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<string> {
+  static async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<{ diff: string, error?: any }> {
     // Use GitHub API with diff media type
     try {
       const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
@@ -52,11 +52,26 @@ export class GitHubService {
           'Accept': 'application/vnd.github.v3.diff'
         }
       });
-      return response.data;
+      return { diff: response.data };
     } catch (e: any) {
       console.error('Failed to fetch diff from GitHub API:', e.message);
-      // If the diff is too large, GitHub API might return 403 or 422
-      // We return empty string to allow the app to proceed with commit-based analysis
+      return { diff: '', error: e };
+    }
+  }
+
+  static async getFileDiff(owner: string, repo: string, base: string, head: string, path: string): Promise<string> {
+    try {
+      const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
+        headers: {
+          'Accept': 'application/vnd.github.v3.diff'
+        },
+        params: {
+          path: path
+        }
+      });
+      return response.data;
+    } catch (e: any) {
+      console.error(`Failed to fetch diff for file ${path}:`, e.message);
       return '';
     }
   }

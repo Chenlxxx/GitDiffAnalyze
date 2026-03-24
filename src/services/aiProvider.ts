@@ -186,36 +186,45 @@ export class GeminiProvider implements AIProvider {
               properties: {
                 before: { type: Type.STRING },
                 after: { type: Type.STRING }
-              },
-              required: ["before", "after"]
+              }
             }
           },
-          required: ["riskLevel", "breakingChanges", "compatibilityNotes", "recommendations", "codeExample"]
+          required: ["riskLevel", "breakingChanges", "compatibilityNotes", "recommendations"]
         }
       }
     }));
     return parseJSON(response.text || '{}');
   } catch (err: any) {
     console.error("Gemini analyzeDiff error:", err);
-    if (err.message?.includes("401") || err.status === 401) {
-      throw new Error("Gemini API 身份验证失败 (401)。请检查您的 API Key 是否正确。");
-    }
-    if (err.message?.includes("429") || err.message?.includes("RESOURCE_EXHAUSTED")) {
-      throw new Error("Gemini API 配额已耗尽。请稍后再试，或在设置中更换 API Key。");
-    }
-    if (err.message?.includes("Rpc failed") || err.message?.includes("xhr error")) {
-      throw new Error("Gemini API 暂时不可用或差异内容过大导致请求失败，请稍后再试。");
-    }
     throw err;
   }
 }
 
-  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
+  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
     try {
       // Slice commits to avoid huge payload
       const commitSummary = commits ? commits.slice(0, 100).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
       const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}, Changes: +${f.additions}/-${f.deletions}`).join('\n') : '';
       
+      const mode = metadata?.mode || 'full_diff';
+      const fallbackReason = metadata?.fallbackReason || '';
+      const confidenceNote = metadata?.confidenceNote || '';
+
+      let modeInstruction = '';
+      if (mode === 'segmented_full_diff') {
+        modeInstruction = `
+          **当前分析模式：分片式深度分析 (Segmented Deep Analysis)**
+          由于版本差异规模较大，我们优先提取了高优先级关键文件的 Diff 片段进行分析。
+          请重点分析 API 表面、配置变更、迁移路径及核心逻辑变化。
+        `;
+      } else if (mode === 'partial_full_diff') {
+        modeInstruction = `
+          **当前分析模式：降级部分分析 (Partial Analysis)**
+          由于无法获取完整代码差异（原因：${fallbackReason}），本次分析主要基于 Commit 记录、文件变更列表和发布日志。
+          请在输出中明确标注这是“基于有限证据的兼容性评估”，并给出高风险推断及建议人工复核的点。
+        `;
+      }
+
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
@@ -223,8 +232,10 @@ export class GeminiProvider implements AIProvider {
           
           **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
 
+          ${modeInstruction}
+          
           **分析输入：**
-          1. **代码差异 (Diff)**：最真实的代码变更。
+          1. **代码差异 (Diff)**：最真实的代码变更（当前模式下可能仅包含部分关键片段）。
           2. **Commit 记录**：变更的具体意图。
           3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
           
@@ -239,13 +250,14 @@ export class GeminiProvider implements AIProvider {
           发布日志 (Release Notes)：
           ${releaseNotes || '未提供'}
           
-          差异内容（Diff 前 60000 字符）：
+          差异内容（前 60000 字符）：
           ${diff.slice(0, 60000)}
           
           任务：
           1. 提供变更的整体摘要。
           2. 识别关键变更条目，评估风险等级。
           3. 生成 Excel 结构化数据。
+          4. **必须在返回的 JSON 中包含 analysisMode, confidenceNote, fallbackReason 字段。**
           
           请务必使用中文回答。
         `,
@@ -257,6 +269,9 @@ export class GeminiProvider implements AIProvider {
               summary: { type: Type.STRING },
               overallRisk: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
               recommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
+              analysisMode: { type: Type.STRING },
+              confidenceNote: { type: Type.STRING },
+              fallbackReason: { type: Type.STRING },
               items: {
                 type: Type.ARRAY,
                 items: {
@@ -308,11 +323,17 @@ export class GeminiProvider implements AIProvider {
                 }
               }
             },
-            required: ["summary", "overallRisk", "recommendations", "items", "excelRows"]
+            required: ["summary", "overallRisk", "recommendations", "items", "excelRows", "analysisMode", "confidenceNote"]
           }
         }
       }));
-      return parseJSON(response.text || '{}');
+      const result = parseJSON(response.text || '{}');
+      return {
+        ...result,
+        analysisMode: result.analysisMode || mode,
+        confidenceNote: result.confidenceNote || confidenceNote,
+        fallbackReason: result.fallbackReason || fallbackReason
+      };
     } catch (err: any) {
       console.error("Gemini analyzeFullDiff error:", err);
       if (err.message?.includes("401") || err.status === 401) {
@@ -386,7 +407,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       if (error.response?.status === 400) {
         const msg = error.response.data?.error?.message || error.response.data?.message || "";
         if (msg.includes("http call")) {
-          throw new Error("AI 服务拒绝了请求，因为它尝试使用联网功能（如搜索）但未获授权。已尝试在提示词中禁用此功能，请重试。如果问题持续，请更换模型或 API Key。");
+          throw new Error("AI 服务拒绝了请求，因为它尝试使用联网功能（如搜索）但未获授权。已尝试在提示词中禁用此功能，请重试。如果问题持续，请更换模型 or API Key。");
         }
         throw new Error(`AI 服务请求失败 (400): ${msg || "无效的请求参数"}`);
       }
@@ -460,17 +481,38 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
 
-  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis> {
+  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
     const commitSummary = commits ? commits.slice(0, 100).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
     const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
     
+    const mode = metadata?.mode || 'full_diff';
+    const fallbackReason = metadata?.fallbackReason || '';
+    const confidenceNote = metadata?.confidenceNote || '';
+
+    let modeInstruction = '';
+    if (mode === 'segmented_full_diff') {
+      modeInstruction = `
+        **当前分析模式：分片式深度分析 (Segmented Deep Analysis)**
+        由于版本差异规模较大，我们优先提取了高优先级关键文件的 Diff 片段进行分析。
+        请重点分析 API 表面、配置变更、迁移路径及核心逻辑变化。
+      `;
+    } else if (mode === 'partial_full_diff') {
+      modeInstruction = `
+        **当前分析模式：降级部分分析 (Partial Analysis)**
+        由于无法获取完整代码差异（原因：${fallbackReason}），本次分析主要基于 Commit 记录、文件变更列表和发布日志。
+        请在输出中明确标注这是“基于有限证据的兼容性评估”，并给出高风险推断及建议人工复核的点。
+      `;
+    }
+
     const prompt = `
       你是一个极其严谨的资深架构师和安全专家。请分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
       
       **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
 
+      ${modeInstruction}
+
       **分析输入：**
-      1. **代码差异 (Diff)**：最真实的代码变更。
+      1. **代码差异 (Diff)**：最真实的代码变更（当前模式下可能仅包含部分关键片段）。
       2. **Commit 记录**：变更的具体意图。
       3. **发布日志 (Release Notes/Change Log)**：作者提醒的高危变更和功能说明。
       
@@ -505,6 +547,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       2. 识别关键变更条目，评估风险等级。
       3. **深度分析**：对中高风险项进行深度分析并提供迁移代码示例。
       4. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
+      5. **必须在返回的 JSON 中包含 analysisMode, confidenceNote, fallbackReason 字段。**
       
       **Excel 字段深度要求：**
       - **version**: ${toVersion}
@@ -522,6 +565,9 @@ export class OpenAICompatibleProvider implements AIProvider {
       {
         "summary": "整体摘要",
         "overallRisk": "High/Medium/Low",
+        "analysisMode": "full_diff/segmented_full_diff/partial_full_diff",
+        "confidenceNote": "置信度说明",
+        "fallbackReason": "降级原因",
         "recommendations": ["建议1", "建议2"],
         "items": [
           {
@@ -557,8 +603,14 @@ export class OpenAICompatibleProvider implements AIProvider {
       
       请务必使用中文回答。
     `;
-    const result = await this.callAI(prompt);
-    return parseJSON(result);
+    const resultStr = await this.callAI(prompt);
+    const result = parseJSON(resultStr);
+    return {
+      ...result,
+      analysisMode: result.analysisMode || mode,
+      confidenceNote: result.confidenceNote || confidenceNote,
+      fallbackReason: result.fallbackReason || fallbackReason
+    };
   }
 }
 

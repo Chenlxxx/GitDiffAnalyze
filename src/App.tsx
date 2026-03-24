@@ -30,6 +30,9 @@ import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
+import { determineDiffStrategy } from './services/diffStrategy';
+import { sortFilesByPriority } from './services/filePriority';
+import { parseGitHubError } from './services/githubErrorUtils';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -281,23 +284,62 @@ export default function App() {
     const actualToTag = await findActualTag(cleanToVersion);
     const actualFromTag = await findActualTag(cleanFromVersion);
 
-    const [commitData, diff, releaseData] = await Promise.all([
-      GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
-      GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag),
-      (async () => {
-        try {
-          return await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
-        } catch (e) {
-          return null;
-        }
-      })()
-    ]);
-    
-    if (!diff || diff.length < 10) {
-      throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
+    // 1. Fetch commit data first to determine strategy
+    const commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+    const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
+
+    let diff = '';
+    let metadata: { mode: string, fallbackReason?: string, confidenceNote?: string } = {
+      mode: strategy.mode,
+      confidenceNote: strategy.confidenceNote
+    };
+
+    // 2. Fetch diff based on strategy
+    if (strategy.mode === 'full_diff') {
+      const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+      if (diffResult.error) {
+        // Fallback to segmented if full diff fails (e.g., 403 or too large)
+        const parsedError = parseGitHubError(diffResult.error);
+        console.warn('Full diff failed, falling back to segmented analysis:', parsedError.message);
+        
+        metadata.mode = 'segmented_full_diff';
+        metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
+        metadata.confidenceNote = '由于无法获取完整差异，已降级为关键文件分片分析。';
+        
+        // Fetch segmented diff
+        const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 15);
+        const diffs = await Promise.all(priorityFiles.map(async (file) => {
+          const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+          return `File: ${file.filename}\n${fileDiff}`;
+        }));
+        diff = diffs.join('\n\n');
+      } else {
+        diff = diffResult.diff;
+      }
+    } else if (strategy.mode === 'segmented_full_diff') {
+      const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 15);
+      const diffs = await Promise.all(priorityFiles.map(async (file) => {
+        const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+        return `File: ${file.filename}\n${fileDiff}`;
+      }));
+      diff = diffs.join('\n\n');
+    } else {
+      // partial_full_diff - no diff content, just metadata
+      diff = '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
     }
 
-    const releaseNotes = releaseData?.body || '';
+    // 3. Fetch release notes
+    let releaseNotes = '';
+    try {
+      const releaseData = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+      releaseNotes = releaseData?.body || '';
+    } catch (e) {
+      console.warn('Failed to fetch release notes:', e);
+    }
+
+    if (!diff && strategy.mode !== 'partial_full_diff') {
+      throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
+    }
 
     const provider = getAIProvider(aiConfig);
     const analysis = await provider.analyzeFullDiff(
@@ -307,7 +349,8 @@ export default function App() {
       targetToVersion, 
       releaseNotes, 
       commitData.commits, 
-      commitData.files
+      commitData.files,
+      metadata
     );
     
     const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
@@ -1008,12 +1051,39 @@ export default function App() {
                         )}>
                           整体风险: {fullDiffAnalysis.overallRisk === 'High' ? '高' : fullDiffAnalysis.overallRisk === 'Medium' ? '中' : '低'}
                         </span>
+                        {fullDiffAnalysis.analysisMode && (
+                          <span className="px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border bg-blue-50 text-blue-700 border-blue-100 flex items-center gap-1">
+                            <Cpu size={10} />
+                            模式: {
+                              fullDiffAnalysis.analysisMode === 'full_diff' ? '完整分析' :
+                              fullDiffAnalysis.analysisMode === 'segmented_full_diff' ? '分片分析' :
+                              '降级分析'
+                            }
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
-                  <div className="prose prose-sm max-w-none text-black/70 whitespace-pre-wrap">
+                  <div className="prose prose-sm max-w-none text-black/70 whitespace-pre-wrap mb-4">
                     {fullDiffAnalysis.summary}
                   </div>
+                  
+                  {(fullDiffAnalysis.confidenceNote || fullDiffAnalysis.fallbackReason) && (
+                    <div className="mt-4 p-4 bg-amber-50/50 border border-amber-100 rounded-2xl space-y-2">
+                      {fullDiffAnalysis.confidenceNote && (
+                        <div className="flex gap-2 text-xs text-amber-800">
+                          <Info size={14} className="shrink-0 mt-0.5" />
+                          <span><strong>置信度说明：</strong>{fullDiffAnalysis.confidenceNote}</span>
+                        </div>
+                      )}
+                      {fullDiffAnalysis.fallbackReason && (
+                        <div className="flex gap-2 text-xs text-amber-800">
+                          <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                          <span><strong>降级原因：</strong>{fullDiffAnalysis.fallbackReason}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </section>
 
                 {/* Recommendations Section */}

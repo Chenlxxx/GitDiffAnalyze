@@ -54,6 +54,9 @@ export interface FullDiffAnalysis {
   overallRisk: 'High' | 'Medium' | 'Low';
   recommendations: string[];
   excelRows?: ExcelAnalysisRow[];
+  analysisMode?: 'full_diff' | 'segmented_full_diff' | 'partial_full_diff';
+  confidenceNote?: string;
+  fallbackReason?: string;
   resolvedTags?: {
     from: string;
     to: string;
@@ -92,5 +95,5 @@ export interface BatchAnalysisItem {
 export interface AIProvider {
   analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis>;
   analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis>;
-  analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[]): Promise<FullDiffAnalysis>;
+  analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis>;
 }

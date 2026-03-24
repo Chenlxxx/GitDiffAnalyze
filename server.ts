@@ -21,6 +21,7 @@ async function startServer() {
       console.log(`Proxying request to: ${url}`);
       
       const customAccept = req.headers['accept'];
+      const clientAuth = req.headers['authorization'];
       const headers: any = {
         'Accept': customAccept || 'application/vnd.github.v3+json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -28,8 +29,10 @@ async function startServer() {
         'Pragma': 'no-cache'
       };
 
-      // Use token from environment if available (helps avoid 403 without user config)
-      if (process.env.GITHUB_TOKEN) {
+      // Use token from client if provided, otherwise fallback to environment
+      if (clientAuth) {
+        headers['Authorization'] = clientAuth;
+      } else if (process.env.GITHUB_TOKEN) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
       
