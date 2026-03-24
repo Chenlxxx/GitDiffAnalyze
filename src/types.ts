@@ -98,6 +98,19 @@ export interface BatchAnalysisResult {
   recommendations: string[];
 }
 
+export interface FileEvidence {
+  filename: string;
+  group: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch?: string;
+  patchAvailable: boolean;
+  diffFetchFailed: boolean;
+  riskHint: string;
+  reviewHint: string;
+}
+
 export interface AIProvider {
   analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis>;
   analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis>;

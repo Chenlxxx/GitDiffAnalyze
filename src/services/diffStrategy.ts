@@ -11,8 +11,8 @@ export const MAX_FILES_FOR_FULL_DIFF = Number(import.meta.env.VITE_MAX_FILES_FOR
 export const MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF = Number(import.meta.env.VITE_MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF) || 15;
 export const BATCH_ANALYSIS_GROUP_SIZE = Number(import.meta.env.VITE_BATCH_ANALYSIS_GROUP_SIZE) || 5;
 export const BATCH_ANALYSIS_FILE_BATCH_SIZE = Number(import.meta.env.VITE_BATCH_ANALYSIS_FILE_BATCH_SIZE) || 10;
-export const MAX_FILES_FOR_BATCH_ANALYSIS = Number(import.meta.env.VITE_MAX_FILES_FOR_BATCH_ANALYSIS) || 500;
-export const MAX_BATCHES_PER_ANALYSIS = Number(import.meta.env.VITE_MAX_BATCHES_PER_ANALYSIS) || 50;
+export const MAX_FILES_FOR_BATCH_ANALYSIS = Number(import.meta.env.VITE_MAX_FILES_FOR_BATCH_ANALYSIS) || 1000;
+export const MAX_BATCHES_PER_ANALYSIS = Number(import.meta.env.VITE_MAX_BATCHES_PER_ANALYSIS) || 100;
 
 /**
  * Determines the best analysis strategy based on the scale of changes.

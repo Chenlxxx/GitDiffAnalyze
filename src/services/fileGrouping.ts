@@ -7,6 +7,42 @@ export interface FileGroup {
 }
 
 /**
+ * Returns a risk hint based on the file group.
+ */
+export function getRiskHint(groupName: string): string {
+  switch (groupName) {
+    case 'Public API / Interface / Types':
+      return 'CRITICAL: Changes to public surface area can break downstream consumers.';
+    case 'Config / Build / Dependencies':
+      return 'HIGH: Configuration changes can affect deployment, security, and runtime behavior.';
+    case 'Migration / Release Notes':
+      return 'HIGH: Migration logic is prone to data loss or versioning issues.';
+    case 'Core Logic / Security / Engine':
+      return 'HIGH: Core logic changes have wide-reaching impact on system stability.';
+    default:
+      return 'MEDIUM: General implementation changes.';
+  }
+}
+
+/**
+ * Returns a review hint based on the file group.
+ */
+export function getReviewHint(groupName: string): string {
+  switch (groupName) {
+    case 'Public API / Interface / Types':
+      return 'Verify semantic versioning, check for removed exports, and ensure backward compatibility of types.';
+    case 'Config / Build / Dependencies':
+      return 'Check for sensitive credential leaks, dependency version conflicts, and build pipeline impacts.';
+    case 'Migration / Release Notes':
+      return 'Review data transformation logic, rollback procedures, and documentation accuracy.';
+    case 'Core Logic / Security / Engine':
+      return 'Audit for security vulnerabilities, performance regressions, and side effects in critical paths.';
+    default:
+      return 'Review for logic correctness, code style, and test coverage.';
+  }
+}
+
+/**
  * Groups changed files by their compatibility risk surface.
  */
 export function groupFiles(files: FileChange[]): FileGroup[] {

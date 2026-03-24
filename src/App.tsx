@@ -32,8 +32,9 @@ import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
 import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
-import { groupFiles } from './services/fileGrouping';
+import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
+import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -344,25 +345,56 @@ export default function App() {
               break;
             }
             const batchFiles = batches[i];
-            const batchDiffs = await Promise.all(batchFiles.map(async (file) => {
-              const metadata = `File: ${file.filename}\nStatus: ${file.status}\nChanges: +${file.additions}/-${file.deletions}`;
+            
+            // Create structured evidence for each file in the batch
+            const batchEvidence: FileEvidence[] = await Promise.all(batchFiles.map(async (file) => {
+              let patch = file.patch;
+              let diffFetchFailed = false;
               
-              if (file.patch) {
-                return `${metadata}\n${file.patch}`;
+              if (!patch) {
+                try {
+                  patch = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+                } catch (e) {
+                  console.warn(`Failed to fetch diff for ${file.filename}:`, e);
+                  diffFetchFailed = true;
+                }
               }
-              
-              try {
-                // For batch mode, we try to fetch individual diffs if patch is missing
-                const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-                return `${metadata}\n${fileDiff}`;
-              } catch (e) {
-                return `${metadata}\n(Failed to fetch full diff content)`;
-              }
+
+              return {
+                filename: file.filename,
+                group: group.name,
+                status: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+                patch: patch || undefined,
+                patchAvailable: !!patch,
+                diffFetchFailed,
+                riskHint: getRiskHint(group.name),
+                reviewHint: getReviewHint(group.name)
+              };
             }));
 
-            const batchDiff = batchDiffs.join('\n\n');
+            // Format evidence as a structured string for the AI
+            const evidenceString = batchEvidence.map(ev => {
+              let str = `[File Evidence]\n`;
+              str += `Path: ${ev.filename}\n`;
+              str += `Group: ${ev.group}\n`;
+              str += `Status: ${ev.status}\n`;
+              str += `Changes: +${ev.additions}/-${ev.deletions}\n`;
+              str += `Risk Hint: ${ev.riskHint}\n`;
+              str += `Review Hint: ${ev.reviewHint}\n`;
+              str += `Patch Available: ${ev.patchAvailable ? 'YES' : 'NO'}\n`;
+              if (ev.diffFetchFailed) {
+                str += `!!! DIFF_FETCH_FAILED: YES (Please analyze based on metadata and commit context)\n`;
+              }
+              if (ev.patchAvailable && ev.patch) {
+                str += `Patch Content:\n${ev.patch}\n`;
+              }
+              return str;
+            }).join('\n---\n\n');
+
             const batchResult = await provider.analyzeBatchDiff(
-              batchDiff,
+              evidenceString,
               background,
               targetFromVersion,
               targetToVersion,

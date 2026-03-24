@@ -207,12 +207,13 @@ export class GeminiProvider implements AIProvider {
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
-          你是一个极其严谨的资深架构师。正在进行分批代码差异分析。
+          你是一个极其严谨的资深架构师，正在进行“安全优先”的兼容性风险分析。
           当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
           版本范围：${fromVersion} -> ${toVersion}
           项目背景：${projectBackground}
 
-          **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
+          **核心原则：安全优先。宁可误报，不可漏报。**
+          即使某些文件缺少 Patch 内容（DIFF_FETCH_FAILED），也必须根据其路径、状态、变更行数以及相关的 Commit 记录进行推断分析。
 
           发布日志 (Release Notes)：
           ${releaseNotes || '未提供'}
@@ -220,13 +221,15 @@ export class GeminiProvider implements AIProvider {
           相关 Commits 列表（前 50 个）：
           ${commitSummary}
 
-          差异内容：
+          本批次结构化证据 (Batch Evidence)：
           ${diff.slice(0, 30000)}
 
           任务：
           1. 识别该批次代码变更中的所有潜在兼容性风险。
-          2. 对每个风险项提供详细描述、风险等级、兼容性分析和代码示例。
-          3. 提供该批次变更的简要总结。
+          2. 特别关注：Public API 变更、配置项修改、数据库迁移、安全相关的核心逻辑。
+          3. **严禁遗漏**：即使文件缺少 Patch（Patch Available: NO），也必须基于其路径、状态、变更行数以及相关的 Commit 记录进行推断分析，并给出“风险提示 (Risk Hint)”。
+          4. 对每个风险项提供详细描述、风险等级、兼容性分析和代码示例。
+          5. 提供该批次变更的简要总结。
 
           请务必使用中文回答。
         `,
@@ -278,12 +281,13 @@ export class GeminiProvider implements AIProvider {
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
-          你是一个极其严谨的资深架构师。请汇总多个批次的差异分析结果，生成最终的全量分析报告。
+          你是一个极其严谨的资深架构师。请汇总多个批次的兼容性分析结果，生成最终的“安全优先”分析报告。
           版本范围：${fromVersion} -> ${toVersion}
           项目背景：${projectBackground}
           发布日志：${releaseNotes || '未提供'}
 
-          **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
+          **核心原则：安全优先。宁可误报，不可漏报。**
+          请确保汇总结果覆盖了所有批次中发现的高风险项，特别是 API 变更、核心逻辑修改和配置变更。
 
           待汇总的批次结果摘要：
           ${resultsSummary}
@@ -293,9 +297,10 @@ export class GeminiProvider implements AIProvider {
 
           任务：
           1. 汇总所有批次的发现，去除重复项，合并相似项。
-          2. 结合发布日志和项目背景，给出整体风险评估和核心建议。
-          3. 生成最终的结构化报告，包括 Excel 导出所需的行数据。
-          4. 确保 ExcelRows 中的内容详实，特别是 function, suggestion, code_discovery, code_fix 字段。
+          2. 消除重复项，合并相似风险。
+          3. 评估整体风险等级 (High/Medium/Low)。
+          4. 提供针对性的升级建议和测试建议。
+          5. 生成最终的结构化报告，包括 Excel 导出所需的行数据。
 
           请务必使用中文回答。
         `,
@@ -655,7 +660,7 @@ export class OpenAICompatibleProvider implements AIProvider {
     const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
     
     const prompt = `
-      分析以下代码差异以识别兼容性风险。
+      你是一个极其严谨的资深架构师，正在进行“安全优先”的兼容性风险分析。
       当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
       版本范围：${fromVersion} -> ${toVersion}
       项目背景：${projectBackground}
@@ -666,8 +671,11 @@ export class OpenAICompatibleProvider implements AIProvider {
       相关 Commits 列表（前 50 个）：
       ${commitSummary}
 
-      差异内容：
+      本批次结构化证据 (Batch Evidence)：
       ${diff.slice(0, 30000)}
+
+      **核心原则：安全优先。宁可误报，不可漏报。**
+      **严禁遗漏**：即使文件缺少 Patch（Patch Available: NO），也必须基于其路径、状态、变更行数以及相关的 Commit 记录进行推断分析，并给出“风险提示 (Risk Hint)”。
 
       请以 JSON 格式返回，结构如下：
       {
@@ -696,10 +704,13 @@ export class OpenAICompatibleProvider implements AIProvider {
     const allItems = batchResults.flatMap(r => r.items);
 
     const prompt = `
-      汇总多个批次的差异分析结果，生成最终的全量分析报告。
+      你是一个极其严谨的资深架构师。请汇总多个批次的兼容性分析结果，生成最终的“安全优先”分析报告。
       版本范围：${fromVersion} -> ${toVersion}
       项目背景：${projectBackground}
       发布日志：${releaseNotes || '未提供'}
+
+      **核心原则：安全优先。宁可误报，不可漏报。**
+      请确保汇总结果覆盖了所有批次中发现的高风险项，特别是 API 变更、核心逻辑修改和配置变更。
 
       待汇总的批次结果摘要：
       ${resultsSummary}
