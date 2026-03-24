@@ -1,4 +1,4 @@
-export type DiffAnalysisMode = 'full_diff' | 'segmented_full_diff' | 'partial_full_diff';
+export type DiffAnalysisMode = 'full_diff' | 'segmented_full_diff' | 'multi_batch_full_diff' | 'partial_full_diff';
 
 export interface DiffStrategy {
   mode: DiffAnalysisMode;
@@ -8,6 +8,8 @@ export interface DiffStrategy {
 // Thresholds for determining analysis strategy
 export const MAX_COMMITS_FOR_FULL_DIFF = Number(import.meta.env.VITE_MAX_COMMITS_FOR_FULL_DIFF) || 100;
 export const MAX_FILES_FOR_FULL_DIFF = Number(import.meta.env.VITE_MAX_FILES_FOR_FULL_DIFF) || 50;
+export const BATCH_ANALYSIS_FILE_BATCH_SIZE = Number(import.meta.env.VITE_BATCH_ANALYSIS_FILE_BATCH_SIZE) || 10;
+export const MAX_FILES_FOR_BATCH_ANALYSIS = Number(import.meta.env.VITE_MAX_FILES_FOR_BATCH_ANALYSIS) || 500;
 
 /**
  * Determines the best analysis strategy based on the scale of changes.
@@ -20,10 +22,10 @@ export function determineDiffStrategy(commitCount: number, fileCount: number): D
     };
   }
 
-  if (fileCount <= 300) {
+  if (fileCount <= MAX_FILES_FOR_BATCH_ANALYSIS) {
     return {
-      mode: 'segmented_full_diff',
-      confidenceNote: '版本差异规模较大，已执行关键文件分片深度分析。'
+      mode: 'multi_batch_full_diff',
+      confidenceNote: '版本差异规模较大，已执行全量索引 + 分组分批深度分析。'
     };
   }
 

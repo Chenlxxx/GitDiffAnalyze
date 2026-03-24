@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
-import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis } from "../types";
+import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult } from "../types";
 
 function parseJSON(text: string): any {
   if (!text) return {};
@@ -200,6 +200,162 @@ export class GeminiProvider implements AIProvider {
   }
 }
 
+  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number): Promise<BatchAnalysisResult> {
+    try {
+      const response = await withRetry(() => this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          你是一个极其严谨的资深架构师。正在进行分批代码差异分析。
+          当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
+          版本范围：${fromVersion} -> ${toVersion}
+          项目背景：${projectBackground}
+
+          **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
+
+          差异内容：
+          ${diff.slice(0, 30000)}
+
+          任务：
+          1. 识别该批次代码变更中的所有潜在兼容性风险。
+          2. 对每个风险项提供详细描述、风险等级、兼容性分析和代码示例。
+          3. 提供该批次变更的简要总结。
+
+          请务必使用中文回答。
+        `,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: { type: Type.STRING },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    riskLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                    compatibilityAnalysis: { type: Type.STRING },
+                    sourceSnippet: { type: Type.STRING },
+                    codeExample: {
+                      type: Type.OBJECT,
+                      properties: {
+                        before: { type: Type.STRING },
+                        after: { type: Type.STRING }
+                      }
+                    }
+                  },
+                  required: ["title", "description", "riskLevel"]
+                }
+              },
+              recommendations: { type: Type.ARRAY, items: { type: Type.STRING } }
+            },
+            required: ["summary", "items", "recommendations"]
+          }
+        }
+      }));
+      return parseJSON(response.text || '{}');
+    } catch (err: any) {
+      console.error("Gemini analyzeBatchDiff error:", err);
+      throw err;
+    }
+  }
+
+  async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
+    try {
+      const resultsSummary = batchResults.map((r, i) => `Batch ${i + 1} Summary: ${r.summary}\nItems: ${r.items.map(item => `- ${item.title} (${item.riskLevel})`).join(', ')}`).join('\n\n');
+      const allItems = batchResults.flatMap(r => r.items);
+      
+      const response = await withRetry(() => this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: `
+          你是一个极其严谨的资深架构师。请汇总多个批次的差异分析结果，生成最终的全量分析报告。
+          版本范围：${fromVersion} -> ${toVersion}
+          项目背景：${projectBackground}
+          发布日志：${releaseNotes || '未提供'}
+
+          **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
+
+          待汇总的批次结果摘要：
+          ${resultsSummary}
+
+          全量条目详情（共 ${allItems.length} 条）：
+          ${JSON.stringify(allItems.slice(0, 100))} 
+
+          任务：
+          1. 汇总所有批次的发现，去除重复项，合并相似项。
+          2. 结合发布日志和项目背景，给出整体风险评估和核心建议。
+          3. 生成最终的结构化报告，包括 Excel 导出所需的行数据。
+          4. 确保 ExcelRows 中的内容详实，特别是 function, suggestion, code_discovery, code_fix 字段。
+
+          请务必使用中文回答。
+        `,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: { type: Type.STRING },
+              overallRisk: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+              recommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
+              items: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING },
+                    description: { type: Type.STRING },
+                    riskLevel: { type: Type.STRING, enum: ["High", "Medium", "Low"] },
+                    compatibilityAnalysis: { type: Type.STRING },
+                    sourceSnippet: { type: Type.STRING },
+                    codeExample: {
+                      type: Type.OBJECT,
+                      properties: {
+                        before: { type: Type.STRING },
+                        after: { type: Type.STRING }
+                      }
+                    }
+                  },
+                  required: ["title", "description", "riskLevel"]
+                }
+              },
+              excelRows: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    version: { type: Type.STRING },
+                    changepoint: { type: Type.STRING },
+                    chinese: { type: Type.STRING },
+                    function: { type: Type.STRING },
+                    suggestion: { type: Type.STRING },
+                    risk: { type: Type.STRING, enum: ["高", "中", "低"] },
+                    test_suggestion: { type: Type.STRING },
+                    code_discovery: { type: Type.STRING },
+                    code_fix: { type: Type.STRING },
+                    related_commits: { type: Type.STRING }
+                  },
+                  required: ["version", "changepoint", "chinese", "function", "suggestion", "risk", "test_suggestion", "code_discovery", "code_fix"]
+                }
+              }
+            },
+            required: ["summary", "overallRisk", "recommendations", "items", "excelRows"]
+          }
+        }
+      }));
+      const result = parseJSON(response.text || '{}');
+      return {
+        ...result,
+        analysisMode: 'multi_batch_full_diff',
+        confidenceNote: '已执行全量索引 + 分组分批深度分析，覆盖率较高。'
+      };
+    } catch (err: any) {
+      console.error("Gemini aggregateBatchResults error:", err);
+      throw err;
+    }
+  }
+
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
     try {
       // Slice commits to avoid huge payload
@@ -216,6 +372,12 @@ export class GeminiProvider implements AIProvider {
           **当前分析模式：分片式深度分析 (Segmented Deep Analysis)**
           由于版本差异规模较大，我们优先提取了高优先级关键文件的 Diff 片段进行分析。
           请重点分析 API 表面、配置变更、迁移路径及核心逻辑变化。
+        `;
+      } else if (mode === 'multi_batch_full_diff') {
+        modeInstruction = `
+          **当前分析模式：全量分组分批分析 (Multi-Batch Full Analysis)**
+          由于版本差异规模较大，我们已将所有变更文件按风险表面分组并分批进行了深度分析。
+          当前正在进行最终的汇总评估。
         `;
       } else if (mode === 'partial_full_diff') {
         modeInstruction = `
@@ -481,6 +643,71 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
 
+  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number): Promise<BatchAnalysisResult> {
+    const prompt = `
+      分析以下代码差异以识别兼容性风险。
+      当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
+      版本范围：${fromVersion} -> ${toVersion}
+      项目背景：${projectBackground}
+
+      请以 JSON 格式返回，结构如下：
+      {
+        "summary": "...",
+        "items": [
+          {
+            "title": "...",
+            "description": "...",
+            "riskLevel": "High/Medium/Low",
+            "compatibilityAnalysis": "...",
+            "sourceSnippet": "...",
+            "codeExample": { "before": "...", "after": "..." }
+          }
+        ],
+        "recommendations": ["..."]
+      }
+      
+      请务必使用中文回答。
+    `;
+    const result = await this.callAI(prompt);
+    return parseJSON(result);
+  }
+
+  async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
+    const resultsSummary = batchResults.map((r, i) => `Batch ${i + 1} Summary: ${r.summary}\nItems: ${r.items.map(item => `- ${item.title} (${item.riskLevel})`).join(', ')}`).join('\n\n');
+    const allItems = batchResults.flatMap(r => r.items);
+
+    const prompt = `
+      汇总多个批次的差异分析结果，生成最终的全量分析报告。
+      版本范围：${fromVersion} -> ${toVersion}
+      项目背景：${projectBackground}
+      发布日志：${releaseNotes || '未提供'}
+
+      待汇总的批次结果摘要：
+      ${resultsSummary}
+
+      全量条目详情（共 ${allItems.length} 条）：
+      ${JSON.stringify(allItems.slice(0, 50))} 
+
+      请以 JSON 格式返回，结构如下：
+      {
+        "summary": "...",
+        "overallRisk": "High/Medium/Low",
+        "recommendations": ["..."],
+        "items": [...],
+        "excelRows": [...]
+      }
+      
+      请务必使用中文回答。
+    `;
+    const resultStr = await this.callAI(prompt);
+    const result = parseJSON(resultStr);
+    return {
+      ...result,
+      analysisMode: 'multi_batch_full_diff',
+      confidenceNote: '已执行全量索引 + 分组分批深度分析。'
+    };
+  }
+
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
     const commitSummary = commits ? commits.slice(0, 100).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
     const fileSummary = files ? files.slice(0, 100).map(f => `- File: ${f.filename}, Status: ${f.status}`).join('\n') : '';
@@ -495,6 +722,12 @@ export class OpenAICompatibleProvider implements AIProvider {
         **当前分析模式：分片式深度分析 (Segmented Deep Analysis)**
         由于版本差异规模较大，我们优先提取了高优先级关键文件的 Diff 片段进行分析。
         请重点分析 API 表面、配置变更、迁移路径及核心逻辑变化。
+      `;
+    } else if (mode === 'multi_batch_full_diff') {
+      modeInstruction = `
+        **当前分析模式：全量分组分批分析 (Multi-Batch Full Analysis)**
+        由于版本差异规模较大，我们已将所有变更文件按风险表面分组并分批进行了深度分析。
+        当前正在进行最终的汇总评估。
       `;
     } else if (mode === 'partial_full_diff') {
       modeInstruction = `

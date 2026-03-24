@@ -30,8 +30,9 @@ import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
-import { determineDiffStrategy } from './services/diffStrategy';
+import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
+import { groupFiles } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -293,7 +294,7 @@ export default function App() {
     const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
 
     let diff = '';
-    let metadata: { mode: 'full_diff' | 'segmented_full_diff' | 'partial_full_diff', fallbackReason?: string, confidenceNote?: string } = {
+    let metadata: { mode: DiffAnalysisMode, fallbackReason?: string, confidenceNote?: string } = {
       mode: strategy.mode,
       confidenceNote: strategy.confidenceNote
     };
@@ -304,29 +305,87 @@ export default function App() {
         const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
         if (diffResult.error) {
           const parsedError = parseGitHubError(diffResult.error);
-          console.warn('Full diff failed, falling back to segmented analysis:', parsedError.message);
-          
-          metadata.mode = 'segmented_full_diff';
+          console.warn('Full diff failed, falling back to multi-batch analysis:', parsedError.message);
+          strategy.mode = 'multi_batch_full_diff';
+          metadata.mode = 'multi_batch_full_diff';
           metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
-          metadata.confidenceNote = '由于无法获取完整差异，已降级为关键文件分片分析。';
-          
-          // Execute segmented logic
-          const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
-          const diffs = await Promise.all(priorityFiles.map(async (file) => {
-            if (file.patch) {
-              return `File: ${file.filename}\n${file.patch}`;
-            }
-            try {
-              const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-              return `File: ${file.filename}\n${fileDiff}`;
-            } catch (e) {
-              return `File: ${file.filename}\n(Failed to fetch diff)`;
-            }
-          }));
-          diff = diffs.join('\n\n');
+          metadata.confidenceNote = '由于无法获取完整差异，已降级为分组分批分析。';
         } else {
           diff = diffResult.diff;
         }
+      }
+
+      const provider = getAIProvider(aiConfig);
+
+      if (strategy.mode === 'multi_batch_full_diff') {
+        // 3. Multi-batch analysis logic
+        const groups = groupFiles(commitData.files);
+        const batchResults: any[] = [];
+
+        // Fetch release notes early for context
+        let releaseNotes = '';
+        try {
+          const releaseData = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+          releaseNotes = releaseData?.body || '';
+        } catch (e) {
+          console.warn('Failed to fetch release notes:', e);
+        }
+
+        for (const group of groups) {
+          const sortedFiles = sortFilesByPriority(group.files);
+          const batches = [];
+          for (let i = 0; i < sortedFiles.length; i += BATCH_ANALYSIS_FILE_BATCH_SIZE) {
+            batches.push(sortedFiles.slice(i, i + BATCH_ANALYSIS_FILE_BATCH_SIZE));
+          }
+
+          for (let i = 0; i < batches.length; i++) {
+            const batchFiles = batches[i];
+            const batchDiffs = await Promise.all(batchFiles.map(async (file) => {
+              if (file.patch) {
+                return `File: ${file.filename}\n${file.patch}`;
+              }
+              try {
+                // For batch mode, we try to fetch individual diffs if patch is missing
+                const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+                return `File: ${file.filename}\n${fileDiff}`;
+              } catch (e) {
+                return `File: ${file.filename}\n(Failed to fetch diff)`;
+              }
+            }));
+
+            const batchDiff = batchDiffs.join('\n\n');
+            const batchResult = await provider.analyzeBatchDiff(
+              batchDiff,
+              background,
+              targetFromVersion,
+              targetToVersion,
+              group.name,
+              i,
+              batches.length
+            );
+            batchResults.push(batchResult);
+          }
+        }
+
+        // 4. Aggregate results
+        const finalAnalysis = await provider.aggregateBatchResults(
+          batchResults,
+          background,
+          targetFromVersion,
+          targetToVersion,
+          releaseNotes
+        );
+
+        // Ensure all required fields are present
+        finalAnalysis.analysisMode = 'multi_batch_full_diff';
+        finalAnalysis.confidenceNote = metadata.confidenceNote || strategy.confidenceNote;
+        finalAnalysis.fallbackReason = metadata.fallbackReason;
+        finalAnalysis.resolvedTags = { from: actualFromTag, to: actualToTag };
+        finalAnalysis.repoUrl = targetRepoUrl;
+        finalAnalysis.fromVersion = targetFromVersion;
+        finalAnalysis.toVersion = targetToVersion;
+
+        return finalAnalysis;
       } else if (strategy.mode === 'segmented_full_diff') {
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
         const diffs = await Promise.all(priorityFiles.map(async (file) => {
@@ -341,7 +400,7 @@ export default function App() {
           }
         }));
         diff = diffs.join('\n\n');
-      } else {
+      } else if (strategy.mode === 'partial_full_diff') {
         // partial_full_diff - use available patches
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 5);
         const patches = priorityFiles
@@ -351,6 +410,40 @@ export default function App() {
         
         diff = patches || '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
       }
+
+      // 5. Fetch release notes for non-batch modes
+      let releaseNotes = '';
+      try {
+        const releaseData = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
+        releaseNotes = releaseData?.body || '';
+      } catch (e) {
+        console.warn('Failed to fetch release notes:', e);
+      }
+
+      const analysis = await provider.analyzeFullDiff(
+        diff, 
+        background, 
+        targetFromVersion, 
+        targetToVersion, 
+        releaseNotes, 
+        commitData.commits, 
+        commitData.files,
+        metadata
+      );
+      
+      const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
+      analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
+      
+      // Ensure all required fields are present in the final result
+      analysis.analysisMode = metadata.mode;
+      analysis.confidenceNote = metadata.confidenceNote;
+      analysis.fallbackReason = metadata.fallbackReason;
+      analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
+      analysis.repoUrl = targetRepoUrl;
+      analysis.fromVersion = targetFromVersion;
+      analysis.toVersion = targetToVersion;
+      
+      return analysis;
     } catch (err) {
       console.error('Error during diff extraction, falling back to partial analysis:', err);
       metadata.mode = 'partial_full_diff';
@@ -364,42 +457,29 @@ export default function App() {
         .map(f => `File: ${f.filename}\n${f.patch}`)
         .join('\n\n');
       diff = patches || '由于差异提取失败，已降级为基于元数据的概览分析。';
-    }
 
-    // 3. Fetch release notes
-    let releaseNotes = '';
-    try {
-      const releaseData = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
-      releaseNotes = releaseData?.body || '';
-    } catch (e) {
-      console.warn('Failed to fetch release notes:', e);
+      const provider = getAIProvider(aiConfig);
+      const analysis = await provider.analyzeFullDiff(
+        diff, 
+        background, 
+        targetFromVersion, 
+        targetToVersion, 
+        '', 
+        commitData.commits, 
+        commitData.files,
+        metadata
+      );
+      
+      analysis.analysisMode = metadata.mode;
+      analysis.confidenceNote = metadata.confidenceNote;
+      analysis.fallbackReason = metadata.fallbackReason;
+      analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
+      analysis.repoUrl = targetRepoUrl;
+      analysis.fromVersion = targetFromVersion;
+      analysis.toVersion = targetToVersion;
+      
+      return analysis;
     }
-
-    const provider = getAIProvider(aiConfig);
-    const analysis = await provider.analyzeFullDiff(
-      diff, 
-      background, 
-      targetFromVersion, 
-      targetToVersion, 
-      releaseNotes, 
-      commitData.commits, 
-      commitData.files,
-      metadata
-    );
-    
-    const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
-    analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
-    
-    // Ensure all required fields are present in the final result
-    analysis.analysisMode = metadata.mode;
-    analysis.confidenceNote = metadata.confidenceNote;
-    analysis.fallbackReason = metadata.fallbackReason;
-    analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
-    analysis.repoUrl = targetRepoUrl;
-    analysis.fromVersion = targetFromVersion;
-    analysis.toVersion = targetToVersion;
-    
-    return analysis;
   };
 
   const handleFullDiffAnalyze = async () => {
