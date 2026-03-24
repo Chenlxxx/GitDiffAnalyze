@@ -200,8 +200,10 @@ export class GeminiProvider implements AIProvider {
   }
 }
 
-  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number): Promise<BatchAnalysisResult> {
+  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
     try {
+      const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+      
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
@@ -211,6 +213,12 @@ export class GeminiProvider implements AIProvider {
           项目背景：${projectBackground}
 
           **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
+
+          发布日志 (Release Notes)：
+          ${releaseNotes || '未提供'}
+
+          相关 Commits 列表（前 50 个）：
+          ${commitSummary}
 
           差异内容：
           ${diff.slice(0, 30000)}
@@ -643,12 +651,23 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
 
-  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number): Promise<BatchAnalysisResult> {
+  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
+    const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
+    
     const prompt = `
       分析以下代码差异以识别兼容性风险。
       当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
       版本范围：${fromVersion} -> ${toVersion}
       项目背景：${projectBackground}
+
+      发布日志 (Release Notes)：
+      ${releaseNotes || '未提供'}
+
+      相关 Commits 列表（前 50 个）：
+      ${commitSummary}
+
+      差异内容：
+      ${diff.slice(0, 30000)}
 
       请以 JSON 格式返回，结构如下：
       {

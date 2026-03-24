@@ -30,7 +30,7 @@ import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
-import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode } from './services/diffStrategy';
+import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
@@ -339,17 +339,24 @@ export default function App() {
           }
 
           for (let i = 0; i < batches.length; i++) {
+            if (batchResults.length >= MAX_BATCHES_PER_ANALYSIS) {
+              console.warn(`Reached MAX_BATCHES_PER_ANALYSIS (${MAX_BATCHES_PER_ANALYSIS}), skipping remaining batches.`);
+              break;
+            }
             const batchFiles = batches[i];
             const batchDiffs = await Promise.all(batchFiles.map(async (file) => {
+              const metadata = `File: ${file.filename}\nStatus: ${file.status}\nChanges: +${file.additions}/-${file.deletions}`;
+              
               if (file.patch) {
-                return `File: ${file.filename}\n${file.patch}`;
+                return `${metadata}\n${file.patch}`;
               }
+              
               try {
                 // For batch mode, we try to fetch individual diffs if patch is missing
                 const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-                return `File: ${file.filename}\n${fileDiff}`;
+                return `${metadata}\n${fileDiff}`;
               } catch (e) {
-                return `File: ${file.filename}\n(Failed to fetch diff)`;
+                return `${metadata}\n(Failed to fetch full diff content)`;
               }
             }));
 
@@ -361,7 +368,9 @@ export default function App() {
               targetToVersion,
               group.name,
               i,
-              batches.length
+              batches.length,
+              releaseNotes,
+              commitData.commits
             );
             batchResults.push(batchResult);
           }
