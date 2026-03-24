@@ -31,7 +31,7 @@ import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
 import { determineDiffStrategy } from './services/diffStrategy';
-import { sortFilesByPriority } from './services/filePriority';
+import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { parseGitHubError } from './services/githubErrorUtils';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -285,47 +285,71 @@ export default function App() {
     const actualFromTag = await findActualTag(cleanFromVersion);
 
     // 1. Fetch commit data first to determine strategy
+    // Only compareCommits failure is allowed to throw
     const commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
     const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
 
     let diff = '';
-    let metadata: { mode: string, fallbackReason?: string, confidenceNote?: string } = {
+    let metadata: { mode: 'full_diff' | 'segmented_full_diff' | 'partial_full_diff', fallbackReason?: string, confidenceNote?: string } = {
       mode: strategy.mode,
       confidenceNote: strategy.confidenceNote
     };
 
     // 2. Fetch diff based on strategy
-    if (strategy.mode === 'full_diff') {
-      const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
-      if (diffResult.error) {
-        // Fallback to segmented if full diff fails (e.g., 403 or too large)
-        const parsedError = parseGitHubError(diffResult.error);
-        console.warn('Full diff failed, falling back to segmented analysis:', parsedError.message);
-        
-        metadata.mode = 'segmented_full_diff';
-        metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
-        metadata.confidenceNote = '由于无法获取完整差异，已降级为关键文件分片分析。';
-        
-        // Fetch segmented diff
-        const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 15);
+    try {
+      if (strategy.mode === 'full_diff') {
+        const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+        if (diffResult.error) {
+          const parsedError = parseGitHubError(diffResult.error);
+          console.warn('Full diff failed, falling back to segmented analysis:', parsedError.message);
+          
+          metadata.mode = 'segmented_full_diff';
+          metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
+          metadata.confidenceNote = '由于无法获取完整差异，已降级为关键文件分片分析。';
+          
+          // Execute segmented logic
+          const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
+          const diffs = await Promise.all(priorityFiles.map(async (file) => {
+            // Use existing patch if available
+            if (file.patch) {
+              return `File: ${file.filename}\n${file.patch}`;
+            }
+            // Otherwise fetch individual file diff
+            try {
+              const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+              return `File: ${file.filename}\n${fileDiff}`;
+            } catch (e) {
+              return `File: ${file.filename}\n(Failed to fetch diff)`;
+            }
+          }));
+          diff = diffs.join('\n\n');
+        } else {
+          diff = diffResult.diff;
+        }
+      } else if (strategy.mode === 'segmented_full_diff') {
+        const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
         const diffs = await Promise.all(priorityFiles.map(async (file) => {
-          const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-          return `File: ${file.filename}\n${fileDiff}`;
+          if (file.patch) {
+            return `File: ${file.filename}\n${file.patch}`;
+          }
+          try {
+            const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
+            return `File: ${file.filename}\n${fileDiff}`;
+          } catch (e) {
+            return `File: ${file.filename}\n(Failed to fetch diff)`;
+          }
         }));
         diff = diffs.join('\n\n');
       } else {
-        diff = diffResult.diff;
+        // partial_full_diff
+        diff = '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
       }
-    } else if (strategy.mode === 'segmented_full_diff') {
-      const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 15);
-      const diffs = await Promise.all(priorityFiles.map(async (file) => {
-        const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-        return `File: ${file.filename}\n${fileDiff}`;
-      }));
-      diff = diffs.join('\n\n');
-    } else {
-      // partial_full_diff - no diff content, just metadata
-      diff = '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
+    } catch (err) {
+      console.error('Error during diff extraction, falling back to partial analysis:', err);
+      metadata.mode = 'partial_full_diff';
+      metadata.fallbackReason = `差异提取过程中发生异常: ${err instanceof Error ? err.message : String(err)}`;
+      metadata.confidenceNote = '由于差异提取失败，已降级为基于元数据的概览分析。';
+      diff = '由于差异提取失败，已降级为基于元数据的概览分析。';
     }
 
     // 3. Fetch release notes
@@ -335,10 +359,6 @@ export default function App() {
       releaseNotes = releaseData?.body || '';
     } catch (e) {
       console.warn('Failed to fetch release notes:', e);
-    }
-
-    if (!diff && strategy.mode !== 'partial_full_diff') {
-      throw new Error('未获取到有效的代码差异，请检查版本号是否正确。');
     }
 
     const provider = getAIProvider(aiConfig);
@@ -356,6 +376,10 @@ export default function App() {
     const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
     analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
     
+    // Ensure all required fields are present in the final result
+    analysis.analysisMode = metadata.mode;
+    analysis.confidenceNote = metadata.confidenceNote;
+    analysis.fallbackReason = metadata.fallbackReason;
     analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
     analysis.repoUrl = targetRepoUrl;
     analysis.fromVersion = targetFromVersion;

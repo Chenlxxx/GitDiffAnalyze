@@ -4,7 +4,10 @@ export interface FileChange {
   additions: number;
   deletions: number;
   changes: number;
+  patch?: string;
 }
+
+export const MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF = Number(import.meta.env.VITE_MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF) || 15;
 
 /**
  * Scores a file based on its importance for compatibility analysis.

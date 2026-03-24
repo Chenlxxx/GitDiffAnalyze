@@ -6,8 +6,8 @@ export interface DiffStrategy {
 }
 
 // Thresholds for determining analysis strategy
-export const MAX_COMMITS_FOR_FULL_DIFF = 100;
-export const MAX_FILES_FOR_FULL_DIFF = 50;
+export const MAX_COMMITS_FOR_FULL_DIFF = Number(import.meta.env.VITE_MAX_COMMITS_FOR_FULL_DIFF) || 100;
+export const MAX_FILES_FOR_FULL_DIFF = Number(import.meta.env.VITE_MAX_FILES_FOR_FULL_DIFF) || 50;
 
 /**
  * Determines the best analysis strategy based on the scale of changes.
