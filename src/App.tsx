@@ -262,10 +262,13 @@ export default function App() {
     const cleanToVersion = GitHubService.parseTagFromUrl(targetToVersion);
     const cleanFromVersion = GitHubService.parseTagFromUrl(targetFromVersion);
 
+    let cachedTags: { name: string }[] | null = null;
     const findActualTag = async (version: string) => {
       try {
-        const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-        const match = tags.find(t => 
+        if (!cachedTags) {
+          cachedTags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
+        }
+        const match = cachedTags.find(t => 
           t.name === version || 
           t.name === `v${version}` || 
           t.name === `rel/v${version}` || 
@@ -310,11 +313,9 @@ export default function App() {
           // Execute segmented logic
           const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
           const diffs = await Promise.all(priorityFiles.map(async (file) => {
-            // Use existing patch if available
             if (file.patch) {
               return `File: ${file.filename}\n${file.patch}`;
             }
-            // Otherwise fetch individual file diff
             try {
               const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
               return `File: ${file.filename}\n${fileDiff}`;
@@ -341,15 +342,28 @@ export default function App() {
         }));
         diff = diffs.join('\n\n');
       } else {
-        // partial_full_diff
-        diff = '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
+        // partial_full_diff - use available patches
+        const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 5);
+        const patches = priorityFiles
+          .filter(f => f.patch)
+          .map(f => `File: ${f.filename}\n${f.patch}`)
+          .join('\n\n');
+        
+        diff = patches || '由于版本差异过大，未提取具体代码差异。请参考 Commit 记录和发布日志进行分析。';
       }
     } catch (err) {
       console.error('Error during diff extraction, falling back to partial analysis:', err);
       metadata.mode = 'partial_full_diff';
       metadata.fallbackReason = `差异提取过程中发生异常: ${err instanceof Error ? err.message : String(err)}`;
       metadata.confidenceNote = '由于差异提取失败，已降级为基于元数据的概览分析。';
-      diff = '由于差异提取失败，已降级为基于元数据的概览分析。';
+      
+      // Try to get some patches even in error case
+      const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 5);
+      const patches = priorityFiles
+        .filter(f => f.patch)
+        .map(f => `File: ${f.filename}\n${f.patch}`)
+        .join('\n\n');
+      diff = patches || '由于差异提取失败，已降级为基于元数据的概览分析。';
     }
 
     // 3. Fetch release notes

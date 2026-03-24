@@ -12,16 +12,23 @@ export const MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF = Number(import.meta.env.VITE
 /**
  * Scores a file based on its importance for compatibility analysis.
  */
-export function getFilePriorityScore(filename: string): number {
+export function getFilePriorityScore(file: FileChange): number {
   let score = 0;
+  const filename = file.filename;
+
+  // 0. Patch presence (very important for segmented analysis)
+  if (file.patch) score += 15;
 
   // 1. Keywords in filename or path
   const highPriorityKeywords = [
     'api', 'interface', 'contract', 'model', 'schema', 'types', 'migration',
-    'config', 'settings', 'security', 'auth', 'core', 'engine', 'util', 'common'
+    'config', 'settings', 'security', 'auth', 'core', 'engine', 'util', 'common',
+    'breaking', 'deprecation', 'export', 'readme', 'changelog', 'release', 'entry',
+    'surface', 'manifest', 'version', 'main', 'index', 'provider', 'service', 'client'
   ];
   const lowPriorityKeywords = [
-    'test', 'spec', 'docs', 'example', 'demo', 'mock', 'stub', 'bench', 'perf'
+    'test', 'spec', 'docs', 'example', 'demo', 'mock', 'stub', 'bench', 'perf',
+    'vendor', 'node_modules', 'dist', 'build', 'assets', 'images', 'icons', 'testdata'
   ];
 
   const lowerFilename = filename.toLowerCase();
@@ -31,12 +38,12 @@ export function getFilePriorityScore(filename: string): number {
   });
 
   lowPriorityKeywords.forEach(kw => {
-    if (lowerFilename.includes(kw)) score -= 15;
+    if (lowerFilename.includes(kw)) score -= 20;
   });
 
   // 2. File extension
-  const highPriorityExtensions = ['.ts', '.tsx', '.java', '.go', '.py', '.rb', '.cs', '.php', '.js', '.jsx'];
-  const lowPriorityExtensions = ['.md', '.txt', '.json', '.yaml', '.yml', '.xml', '.css', '.scss', '.html'];
+  const highPriorityExtensions = ['.ts', '.tsx', '.java', '.go', '.py', '.rb', '.cs', '.php', '.js', '.jsx', '.proto', '.graphql'];
+  const lowPriorityExtensions = ['.md', '.txt', '.json', '.yaml', '.yml', '.xml', '.css', '.scss', '.html', '.less', '.svg', '.png', '.jpg', '.jpeg'];
 
   highPriorityExtensions.forEach(ext => {
     if (lowerFilename.endsWith(ext)) score += 5;
@@ -66,8 +73,8 @@ export function getFilePriorityScore(filename: string): number {
  */
 export function sortFilesByPriority(files: FileChange[]): FileChange[] {
   return [...files].sort((a, b) => {
-    const scoreA = getFilePriorityScore(a.filename);
-    const scoreB = getFilePriorityScore(b.filename);
+    const scoreA = getFilePriorityScore(a);
+    const scoreB = getFilePriorityScore(b);
     return scoreB - scoreA;
   });
 }
