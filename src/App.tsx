@@ -242,6 +242,23 @@ export default function App() {
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
       analysis.items.sort((a, b) => riskOrder[a.impactLevel] - riskOrder[b.impactLevel]);
       
+      // Fallback for excelRows if AI failed to provide it
+      if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
+        console.warn('AI failed to provide excelRows for changelog, generating from items fallback.');
+        analysis.excelRows = analysis.items.map(item => ({
+          version: toVersion,
+          changepoint: item.title,
+          chinese: item.reason,
+          function: item.compatibilityAnalysis || item.reason,
+          suggestion: item.reason,
+          risk: item.impactLevel === 'High' ? '高' : item.impactLevel === 'Medium' ? '中' : '低',
+          test_suggestion: item.reason,
+          code_discovery: '请参考变更日志',
+          code_fix: item.codeExample?.after || '请参考变更日志',
+          related_commits: item.prNumber ? `#${item.prNumber}` : ''
+        }));
+      }
+
       setChangeLogAnalysis(analysis);
       
     } catch (err: any) {
@@ -426,6 +443,23 @@ export default function App() {
         finalAnalysis.fromVersion = targetFromVersion;
         finalAnalysis.toVersion = targetToVersion;
 
+        // Fallback for excelRows if AI failed to provide it
+        if ((!finalAnalysis.excelRows || finalAnalysis.excelRows.length === 0) && finalAnalysis.items.length > 0) {
+          console.warn('AI failed to provide excelRows, generating from items fallback.');
+          finalAnalysis.excelRows = finalAnalysis.items.map(item => ({
+            version: targetToVersion,
+            changepoint: item.title,
+            chinese: item.description,
+            function: item.compatibilityAnalysis || item.description,
+            suggestion: item.description,
+            risk: item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低',
+            test_suggestion: item.description,
+            code_discovery: item.sourceSnippet || '请参考代码变更',
+            code_fix: item.codeExample?.after || '请参考代码变更',
+            related_commits: ''
+          }));
+        }
+
         return finalAnalysis;
       } else if (strategy.mode === 'segmented_full_diff') {
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
@@ -484,6 +518,23 @@ export default function App() {
       analysis.fromVersion = targetFromVersion;
       analysis.toVersion = targetToVersion;
       
+      // Fallback for excelRows if AI failed to provide it
+      if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
+        console.warn('AI failed to provide excelRows, generating from items fallback.');
+        analysis.excelRows = analysis.items.map(item => ({
+          version: targetToVersion,
+          changepoint: item.title,
+          chinese: item.description,
+          function: item.compatibilityAnalysis || item.description,
+          suggestion: item.description,
+          risk: item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低',
+          test_suggestion: item.description,
+          code_discovery: item.sourceSnippet || '请参考代码变更',
+          code_fix: item.codeExample?.after || '请参考代码变更',
+          related_commits: ''
+        }));
+      }
+
       return analysis;
     } catch (err) {
       console.error('Error during diff extraction, falling back to partial analysis:', err);
@@ -519,6 +570,23 @@ export default function App() {
       analysis.fromVersion = targetFromVersion;
       analysis.toVersion = targetToVersion;
       
+      // Fallback for excelRows if AI failed to provide it
+      if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
+        console.warn('AI failed to provide excelRows, generating from items fallback.');
+        analysis.excelRows = analysis.items.map(item => ({
+          version: targetToVersion,
+          changepoint: item.title,
+          chinese: item.description,
+          function: item.compatibilityAnalysis || item.description,
+          suggestion: item.description,
+          risk: item.riskLevel === 'High' ? '高' : item.riskLevel === 'Medium' ? '中' : '低',
+          test_suggestion: item.description,
+          code_discovery: item.sourceSnippet || '请参考代码变更',
+          code_fix: item.codeExample?.after || '请参考代码变更',
+          related_commits: ''
+        }));
+      }
+
       return analysis;
     }
   };
@@ -547,7 +615,29 @@ export default function App() {
     }
   };
 
-  const generateExcelBuffer = async (analysis: FullDiffAnalysis, targetRepoUrl: string, targetFromVersion: string, targetToVersion: string) => {
+  const handleDownloadChangeLogExcel = async () => {
+    if (!changeLogAnalysis) return;
+    setLoading(true);
+    try {
+      const buffer = await generateExcelBuffer(changeLogAnalysis as any, repoUrl, fromVersion, toVersion);
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
+      const repoName = repoInfo ? repoInfo.repo : 'repo';
+      a.download = `${repoName}_${fromVersion}_to_${toVersion}_changelog_analysis.xlsx`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || '生成 Excel 失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const generateExcelBuffer = async (analysis: FullDiffAnalysis | ChangeLogAnalysis, targetRepoUrl: string, targetFromVersion: string, targetToVersion: string) => {
     if (!analysis.excelRows || analysis.excelRows.length === 0) {
       throw new Error('分析数据为空，无法生成 Excel。');
     }
@@ -610,9 +700,9 @@ export default function App() {
     worksheet.getColumn(11).width = 40;
 
     // 3. Add Data Rows
-    analysis.excelRows.forEach(data => {
+    analysis.excelRows.forEach((data, index) => {
       const row = worksheet.addRow([
-        '',
+        index + 1,
         data.version,
         data.changepoint,
         data.chinese,
@@ -1411,9 +1501,20 @@ export default function App() {
                         </button>
                       )}
                     </div>
-                    <span className="text-xs font-medium text-black/40 bg-black/5 px-2 py-1 rounded-lg">
-                      共 {changeLogAnalysis.items.length} 项变更
-                    </span>
+                    <div className="flex items-center gap-3">
+                      {changeLogAnalysis.excelRows && changeLogAnalysis.excelRows.length > 0 && (
+                        <button
+                          onClick={handleDownloadChangeLogExcel}
+                          className="flex items-center gap-2 px-4 py-1.5 bg-emerald-600 text-white rounded-full text-xs font-bold hover:bg-emerald-700 transition-all shadow-sm hover:shadow-md active:scale-95"
+                        >
+                          <Download size={14} />
+                          下载 Excel 报告
+                        </button>
+                      )}
+                      <span className="text-xs font-medium text-black/40 bg-black/5 px-2 py-1 rounded-lg">
+                        共 {changeLogAnalysis.items.length} 项变更
+                      </span>
+                    </div>
                   </div>
                   
                   <div className="grid gap-4">

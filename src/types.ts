@@ -21,6 +21,7 @@ export interface ChangeLogAnalysis {
     };
   }[];
   summary: string;
+  excelRows?: ExcelAnalysisRow[];
 }
 
 export interface DiffAnalysis {

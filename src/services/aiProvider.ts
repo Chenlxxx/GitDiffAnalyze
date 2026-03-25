@@ -95,7 +95,20 @@ export class GeminiProvider implements AIProvider {
            - \`codeExample\`: 提供详细的 "before" 和 "after" 代码示例，展示项目代码可能需要如何调整。
         5. 如果影响等级为“低”，请在 \`reason\` 中简要解释原因。
         6. 必须提取每个条目对应的 Pull Request 编号（例如 #123 或 PR #123）。
-        
+        7. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
+
+        **Excel 字段深度要求：**
+        - **version**: 当前分析的版本号（如 v1.2.3）
+        - **changepoint**: 变更点（英文）
+        - **chinese**: 变更点中文描述
+        - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+        - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。
+        - **risk**: 高/中/低
+        - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+        - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
+        - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
+        - **related_commits**: 关联的 PR 编号或 Commit SHA（如有，多个用逗号分隔）
+
         请务必使用中文回答，确保输出的 items 数组长度与变更日志中的条目总数一致。
       `,
       config: {
@@ -125,9 +138,28 @@ export class GeminiProvider implements AIProvider {
                 required: ["title", "reason", "impactLevel"]
               }
             },
-            summary: { type: Type.STRING }
+            summary: { type: Type.STRING },
+            excelRows: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  version: { type: Type.STRING },
+                  changepoint: { type: Type.STRING },
+                  chinese: { type: Type.STRING },
+                  function: { type: Type.STRING },
+                  suggestion: { type: Type.STRING },
+                  risk: { type: Type.STRING, enum: ["高", "中", "低"] },
+                  test_suggestion: { type: Type.STRING },
+                  code_discovery: { type: Type.STRING },
+                  code_fix: { type: Type.STRING },
+                  related_commits: { type: Type.STRING }
+                },
+                required: ["version", "changepoint", "chinese", "function", "suggestion", "risk", "test_suggestion", "code_discovery", "code_fix"]
+              }
+            }
           },
-          required: ["items", "summary"]
+          required: ["items", "summary", "excelRows"]
         }
       }
     }));
@@ -235,6 +267,7 @@ export class GeminiProvider implements AIProvider {
         `,
         config: {
           responseMimeType: "application/json",
+          maxOutputTokens: 16384,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -300,12 +333,25 @@ export class GeminiProvider implements AIProvider {
           2. 消除重复项，合并相似风险。
           3. 评估整体风险等级 (High/Medium/Low)。
           4. 提供针对性的升级建议和测试建议。
-          5. 生成最终的结构化报告，包括 Excel 导出所需的行数据。
+          5. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
+          
+          **Excel 字段深度要求：**
+          - **version**: ${toVersion}
+          - **changepoint**: 变更点（英文）
+          - **chinese**: 变更点中文描述
+          - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+          - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。
+          - **risk**: 高/中/低
+          - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+          - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
+          - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
+          - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
 
           请务必使用中文回答。
         `,
         config: {
           responseMimeType: "application/json",
+          maxOutputTokens: 16384,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -431,13 +477,26 @@ export class GeminiProvider implements AIProvider {
           任务：
           1. 提供变更的整体摘要。
           2. 识别关键变更条目，评估风险等级。
-          3. 生成 Excel 结构化数据。
+          3. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
+          
+          **Excel 字段深度要求：**
+          - **version**: ${toVersion}
+          - **changepoint**: 变更点（英文）
+          - **chinese**: 变更点中文描述
+          - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+          - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。
+          - **risk**: 高/中/低
+          - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+          - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
+          - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
+          - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
           4. **必须在返回的 JSON 中包含 analysisMode, confidenceNote, fallbackReason 字段。**
           
           请务必使用中文回答。
         `,
         config: {
           responseMimeType: "application/json",
+          maxOutputTokens: 16384,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -535,7 +594,8 @@ export class OpenAICompatibleProvider implements AIProvider {
       model: this.config.model,
       messages: [{ role: 'user', content: prompt }],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
-      temperature: 0.1
+      temperature: 0.1,
+      max_tokens: 16384
     };
     const headers = {
       'Authorization': `Bearer ${this.config.apiKey}`,
@@ -607,7 +667,20 @@ export class OpenAICompatibleProvider implements AIProvider {
       3. 评估影响等级（High, Medium, Low）。
       4. 对于 High/Medium 风险项，提供 \`compatibilityAnalysis\` 和 \`codeExample\` (before/after)。
       5. 提取 PR 编号。
-      
+      6. **生成 Excel 结构化数据**：同时生成一套符合 Excel 格式的结构化数据行。要求内容详实，严禁简略。
+
+      **Excel 字段深度要求：**
+      - **version**: 当前分析的版本号（如 v1.2.3）
+      - **changepoint**: 变更点（英文）
+      - **chinese**: 变更点中文描述
+      - **function**: 变更点涉及的功能作用说明。**必须结合业务场景**，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。
+      - **suggestion**: 排查建议。必须包含**【典型问题场景】**（描述升级后可能出现的具体异常现象）和**【排查步骤】**（详细的排查路径）。
+      - **risk**: 高/中/低
+      - **test_suggestion**: 测试建议。**请提供尽可能多且详尽的测试建议**，涵盖正常路径、边界情况及异常场景。
+      - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
+      - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
+      - **related_commits**: 关联的 PR 编号或 Commit SHA（如有，多个用逗号分隔）
+
       请以 JSON 格式返回，结构如下：
       {
         "items": [
@@ -620,7 +693,21 @@ export class OpenAICompatibleProvider implements AIProvider {
             "codeExample": { "before": "...", "after": "..." }
           }
         ],
-        "summary": "..."
+        "summary": "...",
+        "excelRows": [
+          {
+            "version": "...",
+            "changepoint": "...",
+            "chinese": "...",
+            "function": "...",
+            "suggestion": "...",
+            "risk": "高/中/低",
+            "test_suggestion": "...",
+            "code_discovery": "...",
+            "code_fix": "...",
+            "related_commits": "..."
+          }
+        ]
       }
       
       请务必使用中文回答。
@@ -676,6 +763,7 @@ export class OpenAICompatibleProvider implements AIProvider {
 
       **核心原则：安全优先。宁可误报，不可漏报。**
       **严禁遗漏**：即使文件缺少 Patch（Patch Available: NO），也必须基于其路径、状态、变更行数以及相关的 Commit 记录进行推断分析，并给出“风险提示 (Risk Hint)”。
+      **内容详实**：每个变更项的描述必须详尽，严禁简略。
 
       请以 JSON 格式返回，结构如下：
       {
@@ -711,20 +799,42 @@ export class OpenAICompatibleProvider implements AIProvider {
 
       **核心原则：安全优先。宁可误报，不可漏报。**
       请确保汇总结果覆盖了所有批次中发现的高风险项，特别是 API 变更、核心逻辑修改和配置变更。
+      **内容详实**：汇总报告必须包含所有关键发现，严禁简略。
 
       待汇总的批次结果摘要：
       ${resultsSummary}
 
       全量条目详情（共 ${allItems.length} 条）：
-      ${JSON.stringify(allItems.slice(0, 50))} 
+      ${JSON.stringify(allItems.slice(0, 100))} 
 
       请以 JSON 格式返回，结构如下：
       {
-        "summary": "...",
+        "summary": "整体摘要",
         "overallRisk": "High/Medium/Low",
-        "recommendations": ["..."],
-        "items": [...],
-        "excelRows": [...]
+        "recommendations": ["建议1", "建议2"],
+        "items": [
+          {
+            "title": "变更标题",
+            "description": "变更描述",
+            "riskLevel": "High/Medium/Low",
+            "compatibilityAnalysis": "深度兼容性影响分析",
+            "codeExample": { "before": "...", "after": "..." }
+          }
+        ],
+        "excelRows": [
+          {
+            "version": "${toVersion}",
+            "changepoint": "变更点（英文）",
+            "chinese": "变更点中文描述",
+            "function": "变更点涉及的功能作用说明。必须结合业务场景，详细说明该功能的作用以及在哪些具体业务场景下会产生影响。",
+            "suggestion": "排查建议。必须包含【典型问题场景】（描述升级后可能出现的具体异常现象）和【排查步骤】（详细的排查路径）。",
+            "risk": "高/中/低",
+            "test_suggestion": "测试建议。请提供尽可能多且详尽的测试建议，涵盖正常路径、边界情况及异常场景。",
+            "code_discovery": "代码排查指导。必须包含【调用入口点】（用户代码中可能调用的受影响 API 或接口）和【变更源码位置】（变更涉及的库内部具体类或方法）。",
+            "code_fix": "代码整改指导。必须提供能够兼容的前后代码修改示例（Before/After），展示如何调整代码以适配新版本。",
+            "related_commits": "关联的 Commit SHA（如有，多个用逗号分隔）"
+          }
+        ]
       }
       
       请务必使用中文回答。
@@ -823,6 +933,8 @@ export class OpenAICompatibleProvider implements AIProvider {
       - **code_discovery**: 代码排查指导。必须包含**【调用入口点】**（用户代码中可能调用的受影响 API 或接口）和**【变更源码位置】**（变更涉及的库内部具体类或方法）。
       - **code_fix**: 代码整改指导。必须提供**能够兼容的前后代码修改示例**（Before/After），展示如何调整代码以适配新版本。
       - **related_commits**: 关联的 Commit SHA（如有，多个用逗号分隔）
+
+      **强制要求**：如果 \`items\` 数组不为空，则 \`excelRows\` 数组也**绝对不能**为空。\`excelRows\` 必须包含 \`items\` 中所有重要变更的详细信息。
 
       请以 JSON 格式返回，结构如下：
       {
