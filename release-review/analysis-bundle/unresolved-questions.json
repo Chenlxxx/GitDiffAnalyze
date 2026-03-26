@@ -1,0 +1,38 @@
+[
+  {
+    "id": "chg-001-q1",
+    "parent_id": "chg-001",
+    "title": "当前仓库是否实际使用 Digest 认证，并且对接端是否支持 RFC 7616 / SHA-256？",
+    "why_uncertain": "仅凭 changelog 行无法确认实际接入协议与服务端能力。"
+  },
+  {
+    "id": "chg-001-q2",
+    "parent_id": "chg-001",
+    "title": "是否存在并发共享 HttpClientContext 导致 nextnonce 状态污染？",
+    "why_uncertain": "需要结合本地代码和运行时上下文管理方式确认。"
+  },
+  {
+    "id": "chg-002-q1",
+    "parent_id": "chg-002",
+    "title": "当前仓库是否启用了 httpclient5-cache，且共享缓存是否跨租户复用？",
+    "why_uncertain": "需要在仓库中搜索缓存配置与缓存 key 设计。"
+  },
+  {
+    "id": "chg-002-q2",
+    "parent_id": "chg-002",
+    "title": "运行时是否存在网关或缓存层对响应头进行二次改写？",
+    "why_uncertain": "可能依赖部署环境与外部组件。"
+  },
+  {
+    "id": "chg-003-q1",
+    "parent_id": "chg-003",
+    "title": "当前仓库是否使用默认自动重定向，并在跳转前手工设置敏感头？",
+    "why_uncertain": "需要在本地代码中搜索 HttpClient 初始化与请求构造逻辑。"
+  },
+  {
+    "id": "chg-003-q2",
+    "parent_id": "chg-003",
+    "title": "是否存在外部网关或框架对 302 跳转做了封装，导致仓库代码不直接显式出现？",
+    "why_uncertain": "可能依赖运行框架与基础设施层。"
+  }
+]

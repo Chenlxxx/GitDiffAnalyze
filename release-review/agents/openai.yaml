@@ -1,0 +1,3 @@
+interface:
+  display_name: Release Review
+  short_description: 基于内置风险包对当前仓库做中文升级复核

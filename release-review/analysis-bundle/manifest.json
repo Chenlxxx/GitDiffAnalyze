@@ -1,0 +1,19 @@
+{
+  "repo": "local-repository",
+  "component": "Apache HttpClient 5.5",
+  "from_ref": "unknown",
+  "to_ref": "v5.5",
+  "analysis_mode": "changelog",
+  "generated_at": "2026-03-26T11:59:56Z",
+  "language": "zh-CN",
+  "finding_count": 3,
+  "high_risk_count": 3,
+  "medium_risk_count": 0,
+  "low_risk_count": 0,
+  "confidence": "upstream-high / repo-unverified",
+  "limitations": [
+    "当前 bundle 来源于 changelog 分析表格，而不是完整 diff",
+    "上游平台尚未直接读取本地代码仓，因此所有结论都需要在当前仓库中二次验证",
+    "若存在运行时动态配置、外部网关或下游服务行为，可能无法仅凭当前仓库完全确认"
+  ]
+}

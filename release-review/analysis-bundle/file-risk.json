@@ -1,0 +1,93 @@
+[
+  {
+    "id": "chg-001",
+    "version": "v5.5",
+    "title": "RFC 7616 Digest Authentication Upgrade",
+    "title_zh": "HTTP Digest 认证全面升级至 RFC 7616 标准，支持 rspauth、nextnonce、SHA-256/SHA-512-256 算法及增强型 cnonce",
+    "severity": "high",
+    "functional_purpose": "提升 Digest 认证安全性与标准兼容性。直接影响对接 SAP Gateway、OData V4 服务、华为云 ROMA Connect 或政务外网 REST API 的集成流。若服务端未升级至 RFC 7616，可能导致 401 Unauthorized；若业务代码未适配 nextnonce 状态管理，可能触发 nonce 重用拒绝。",
+    "triage_advice": [
+      "检查所有使用 DigestScheme 的 RestClient 初始化代码",
+      "抓包分析认证握手过程，确认客户端是否发送 rspauth，是否在 Authentication-Info 中提取 nextnonce",
+      "查看 HttpClient 日志，搜索 NextNonceInterceptor、rspauth、DigestScheme 相关 warn/error"
+    ],
+    "test_advice": [
+      "使用 SHA-256 Digest 对接 RFC 7616 兼容服务端，验证全流程成功",
+      "测试 MD5 Digest 对接旧版服务端，应降级失败并抛出明确异常",
+      "验证无效 nextnonce、nextnonce 丢失、并发共享 HttpClientContext 的状态隔离性"
+    ],
+    "code_investigation_guide": [
+      "HttpClientBuilder.setAuthSchemeRegistry()",
+      "UsernamePasswordCredentials",
+      "DigestSchemeFactory",
+      "DigestScheme",
+      "NextNonceInterceptor"
+    ],
+    "code_remediation_guide": [
+      "显式设置 Digest 算法为 SHA-256 或符合目标服务端能力的算法",
+      "在 HttpClientBuilder 中增加 NextNonceInterceptor",
+      "检查并隔离并发请求中的 HttpClientContext 状态"
+    ],
+    "confidence": "high-upstream / needs-local-validation"
+  },
+  {
+    "id": "chg-002",
+    "version": "v5.5",
+    "title": "Response Caching Policy Relaxation for Authorization Responses",
+    "title_zh": "响应缓存策略放宽：当响应包含 Cache-Control: must-revalidate/s-maxage/public 时，即使请求含 Authorization 头，该响应也可被共享缓存",
+    "severity": "high",
+    "functional_purpose": "提升缓存效率并符合 RFC 9111。在多租户集成平台中，若租户 A 带 Token 的请求返回 Cache-Control: public，则共享缓存可能把响应错误返回给租户 B，造成跨租户数据泄露。",
+    "triage_advice": [
+      "扫描所有启用 httpclient5-cache 的 Integration Flow",
+      "检查 CacheConfig 是否 setSharedCache(true)",
+      "审计响应头中是否存在 public、must-revalidate、s-maxage 且请求含 Authorization",
+      "检查 Redis 等缓存存储中是否存在跨租户缓存 key"
+    ],
+    "test_advice": [
+      "模拟租户 A 请求并返回 public 响应，验证是否被缓存",
+      "再由租户 B 发起同 URL 请求，验证是否命中租户 A 的缓存数据",
+      "验证 private 响应、无 Authorization 请求、以及 setSharedCache(false) 下的行为"
+    ],
+    "code_investigation_guide": [
+      "CacheConfig.custom().setSharedCache(true)",
+      "CachingExec",
+      "AsyncCachingExec",
+      "ResponseCachingPolicy"
+    ],
+    "code_remediation_guide": [
+      "对涉及租户隔离的场景显式设置 setSharedCache(false)",
+      "或在 HttpResponseInterceptor 中移除 public 指令，避免共享缓存错误命中"
+    ],
+    "confidence": "high-upstream / needs-local-validation"
+  },
+  {
+    "id": "chg-003",
+    "version": "v5.5",
+    "title": "Automatic Redirect Blocking on Sensitive Headers",
+    "title_zh": "自动重定向策略收紧：若原始请求手动设置了 Cookie、Authorization 等敏感头，HttpClient 将拒绝自动执行 3xx 重定向",
+    "severity": "high",
+    "functional_purpose": "防止敏感凭据泄露至开放重定向目标。直接影响使用 HttpClient 自动重定向的场景，包括 OAuth 2.0 授权码跳转、SSO 单点登录重定向、API 网关路由等。升级后，此类流程可能直接抛出 ClientProtocolException 而非完成跳转。",
+    "triage_advice": [
+      "搜索所有使用 setRedirectStrategy 或默认重定向的 HttpClient 初始化代码",
+      "检查所有 execute() 前是否调用 setHeader() 设置 Authorization 或 Cookie",
+      "开启 HttpClient DEBUG 日志，搜索 Redirect、ClientProtocolException 关键字"
+    ],
+    "test_advice": [
+      "构造含 Authorization 的请求并返回 302，验证是否抛出 ClientProtocolException",
+      "请求不含敏感头时返回 302，验证自动跳转成功",
+      "验证 DefaultHeaders、Fluent API、同源重定向场景"
+    ],
+    "code_investigation_guide": [
+      "HttpClientBuilder.setDefaultHeaders()",
+      "HttpRequestBase.setHeader()",
+      "Fluent Request.addHeader()",
+      "RedirectExec",
+      "disableRedirectHandling()"
+    ],
+    "code_remediation_guide": [
+      "关闭自动重定向并手动处理 3xx 响应",
+      "确保敏感头不跨重定向传递"
+    ],
+    "confidence": "high-upstream / needs-local-validation"
+  }
+]
