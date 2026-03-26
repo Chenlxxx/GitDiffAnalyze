@@ -1,6 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
-import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult } from "../types";
+import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult, SkillBundle } from "../types";
+import { SKILL_BUNDLE_PROMPT } from "./skillBundlePrompt";
 
 function parseJSON(text: string): any {
   if (!text) return {};
@@ -17,7 +18,21 @@ function parseJSON(text: string): any {
       try {
         return JSON.parse(fixed);
       } catch (e2) {
-        return null;
+        // 2. Try to fix truncated JSON by adding missing closing braces/brackets
+        let truncated = fixed;
+        const openBraces = (truncated.match(/{/g) || []).length;
+        const closeBraces = (truncated.match(/}/g) || []).length;
+        const openBrackets = (truncated.match(/\[/g) || []).length;
+        const closeBrackets = (truncated.match(/]/g) || []).length;
+        
+        for (let i = 0; i < openBraces - closeBraces; i++) truncated += '}';
+        for (let i = 0; i < openBrackets - closeBrackets; i++) truncated += ']';
+        
+        try {
+          return JSON.parse(truncated);
+        } catch (e3) {
+          return null;
+        }
       }
     }
   };
@@ -40,6 +55,11 @@ function parseJSON(text: string): any {
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     result = tryParse(cleanText.substring(firstBrace, lastBrace + 1));
     if (result) return result;
+    
+    // 4. Try from first brace to the end (in case it was truncated)
+    result = tryParse(cleanText.substring(firstBrace));
+    if (result) return result;
+    
     console.error("Failed to parse braced JSON");
   }
   
@@ -113,7 +133,7 @@ export class GeminiProvider implements AIProvider {
       `,
       config: {
         responseMimeType: "application/json",
-        maxOutputTokens: 16384,
+        maxOutputTokens: 8192,
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -267,7 +287,7 @@ export class GeminiProvider implements AIProvider {
         `,
         config: {
           responseMimeType: "application/json",
-          maxOutputTokens: 16384,
+          maxOutputTokens: 8192,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -351,7 +371,7 @@ export class GeminiProvider implements AIProvider {
         `,
         config: {
           responseMimeType: "application/json",
-          maxOutputTokens: 16384,
+          maxOutputTokens: 8192,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -496,7 +516,7 @@ export class GeminiProvider implements AIProvider {
         `,
         config: {
           responseMimeType: "application/json",
-          maxOutputTokens: 16384,
+          maxOutputTokens: 8192,
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -579,6 +599,30 @@ export class GeminiProvider implements AIProvider {
       throw err;
     }
   }
+
+  async generateSkillBundle(analysis: ChangeLogAnalysis, projectBackground: string, repoUrl: string, fromVersion: string, toVersion: string): Promise<SkillBundle> {
+    const prompt = SKILL_BUNDLE_PROMPT
+      .replace('{{PROJECT_BACKGROUND}}', projectBackground)
+      .replace('{{REPO_URL}}', repoUrl)
+      .replace('{{FROM_VERSION}}', fromVersion)
+      .replace('{{TO_VERSION}}', toVersion)
+      .replace('{{ANALYSIS_RESULTS}}', JSON.stringify(analysis));
+
+    try {
+      const response = await withRetry(() => this.ai.models.generateContent({
+        model: "gemini-3.1-pro-preview",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          maxOutputTokens: 8192
+        }
+      }));
+      return parseJSON(response.text || '{}');
+    } catch (err: any) {
+      console.error("Gemini generateSkillBundle error:", err);
+      throw err;
+    }
+  }
 }
 
 export class OpenAICompatibleProvider implements AIProvider {
@@ -595,7 +639,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       messages: [{ role: 'user', content: prompt }],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
       temperature: 0.1,
-      max_tokens: 16384
+      max_tokens: 8000
     };
     const headers = {
       'Authorization': `Bearer ${this.config.apiKey}`,
@@ -986,6 +1030,18 @@ export class OpenAICompatibleProvider implements AIProvider {
       confidenceNote: result.confidenceNote || confidenceNote,
       fallbackReason: result.fallbackReason || fallbackReason
     };
+  }
+
+  async generateSkillBundle(analysis: ChangeLogAnalysis, projectBackground: string, repoUrl: string, fromVersion: string, toVersion: string): Promise<SkillBundle> {
+    const prompt = SKILL_BUNDLE_PROMPT
+      .replace('{{PROJECT_BACKGROUND}}', projectBackground)
+      .replace('{{REPO_URL}}', repoUrl)
+      .replace('{{FROM_VERSION}}', fromVersion)
+      .replace('{{TO_VERSION}}', toVersion)
+      .replace('{{ANALYSIS_RESULTS}}', JSON.stringify(analysis));
+
+    const resultStr = await this.callAI(prompt);
+    return parseJSON(resultStr);
   }
 }
 

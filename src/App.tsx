@@ -29,7 +29,7 @@ import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, SkillBundle } from './types';
 import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
@@ -37,6 +37,13 @@ import { parseGitHubError } from './services/githubErrorUtils';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { 
+  SKILL_MD, 
+  OPENAI_YAML, 
+  EXAMPLE_REPORT_MD, 
+  USAGE_MD, 
+  EXPORT_DOCX_PY 
+} from './constants/skillStaticFiles';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -60,6 +67,7 @@ export default function App() {
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);
+  const [skillLoading, setSkillLoading] = useState(false);
   const [analysisMode, setAnalysisMode] = useState<'changelog' | 'full-diff' | 'batch'>('changelog');
   const [step, setStep] = useState<'idle' | 'analyzing-changelog' | 'analyzing-diffs' | 'analyzing-full-diff' | 'batch-processing'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -634,6 +642,52 @@ export default function App() {
       setError(err.message || '生成 Excel 失败');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleDownloadSkill = async () => {
+    if (!changeLogAnalysis) return;
+    setSkillLoading(true);
+    try {
+      const provider = getAIProvider(aiConfig);
+      const bundle = await provider.generateSkillBundle(
+        changeLogAnalysis,
+        projectBackground,
+        repoUrl,
+        fromVersion,
+        toVersion
+      );
+
+      const zip = new JSZip();
+      
+      // Static files
+      zip.file('SKILL.md', SKILL_MD);
+      zip.file('agents/openai.yaml', OPENAI_YAML);
+      zip.file('references/example-report.md', EXAMPLE_REPORT_MD);
+      zip.file('references/usage.md', USAGE_MD);
+      zip.file('scripts/export_docx.py', EXPORT_DOCX_PY);
+
+      // Dynamic bundle files
+      zip.file('analysis-bundle/manifest.json', JSON.stringify(bundle.manifest, null, 2));
+      zip.file('analysis-bundle/file-risk.json', JSON.stringify(bundle.fileRisk, null, 2));
+      zip.file('analysis-bundle/diff-evidence.jsonl', bundle.diffEvidence);
+      zip.file('analysis-bundle/unresolved-questions.json', JSON.stringify(bundle.unresolvedQuestions, null, 2));
+      zip.file('analysis-bundle/platform-summary.md', bundle.platformSummary);
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = window.URL.createObjectURL(content);
+      const a = document.createElement('a');
+      a.href = url;
+      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
+      const repoName = repoInfo ? repoInfo.repo : 'repo';
+      a.download = `${repoName}_release_review_skill.zip`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || '生成 Skill 失败');
+    } finally {
+      setSkillLoading(false);
     }
   };
 
@@ -1503,13 +1557,23 @@ export default function App() {
                     </div>
                     <div className="flex items-center gap-3">
                       {changeLogAnalysis.excelRows && changeLogAnalysis.excelRows.length > 0 && (
-                        <button
-                          onClick={handleDownloadChangeLogExcel}
-                          className="flex items-center gap-2 px-4 py-1.5 bg-emerald-600 text-white rounded-full text-xs font-bold hover:bg-emerald-700 transition-all shadow-sm hover:shadow-md active:scale-95"
-                        >
-                          <Download size={14} />
-                          下载 Excel 报告
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={handleDownloadChangeLogExcel}
+                            className="flex items-center gap-2 px-4 py-1.5 bg-emerald-600 text-white rounded-full text-xs font-bold hover:bg-emerald-700 transition-all shadow-sm hover:shadow-md active:scale-95"
+                          >
+                            <Download size={14} />
+                            下载 Excel 报告
+                          </button>
+                          <button
+                            onClick={handleDownloadSkill}
+                            disabled={skillLoading}
+                            className="flex items-center gap-2 px-4 py-1.5 bg-blue-600 text-white rounded-full text-xs font-bold hover:bg-blue-700 transition-all shadow-sm hover:shadow-md active:scale-95 disabled:opacity-50"
+                          >
+                            {skillLoading ? <Loader2 className="animate-spin" size={14} /> : <FileArchive size={14} />}
+                            下载 Skill
+                          </button>
+                        </div>
                       )}
                       <span className="text-xs font-medium text-black/40 bg-black/5 px-2 py-1 rounded-lg">
                         共 {changeLogAnalysis.items.length} 项变更
