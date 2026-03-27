@@ -34,6 +34,7 @@ import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
+import { buildAnalysisBundleFromChangeLog } from './services/skillBundleGenerator';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -73,6 +74,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   
   const [changeLogAnalysis, setChangeLogAnalysis] = useState<ChangeLogAnalysis | null>(null);
+  const [preparedSkillBundle, setPreparedSkillBundle] = useState<SkillBundle | null>(null);
   const [fullDiffAnalysis, setFullDiffAnalysis] = useState<FullDiffAnalysis | null>(null);
   const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
@@ -90,6 +92,7 @@ export default function App() {
     setLoading(true);
     setError(null);
     setChangeLogAnalysis(null);
+    setPreparedSkillBundle(null);
     setFullDiffAnalysis(null);
     setDiffAnalyses({});
     setStep('analyzing-changelog');
@@ -268,6 +271,20 @@ export default function App() {
       }
 
       setChangeLogAnalysis(analysis);
+
+      // 预先准备好 Skill Bundle，避免下载时再次调用 AI
+      try {
+        const bundle = buildAnalysisBundleFromChangeLog(
+          analysis,
+          repoUrl,
+          fromVersion,
+          toVersion,
+          projectBackground
+        );
+        setPreparedSkillBundle(bundle);
+      } catch (bundleErr) {
+        console.error('Failed to prepare skill bundle:', bundleErr);
+      }
       
     } catch (err: any) {
       console.error(err);
@@ -646,18 +663,13 @@ export default function App() {
   };
 
   const handleDownloadSkill = async () => {
-    if (!changeLogAnalysis) return;
+    if (!preparedSkillBundle) {
+      setError('Skill Bundle 尚未准备好，请先完成分析。');
+      return;
+    }
     setSkillLoading(true);
     try {
-      const provider = getAIProvider(aiConfig);
-      const bundle = await provider.generateSkillBundle(
-        changeLogAnalysis,
-        projectBackground,
-        repoUrl,
-        fromVersion,
-        toVersion
-      );
-
+      const bundle = preparedSkillBundle;
       const zip = new JSZip();
       
       // Static files

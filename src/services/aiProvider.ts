@@ -1,7 +1,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
 import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult, SkillBundle } from "../types";
-import { SKILL_BUNDLE_PROMPT } from "./skillBundlePrompt";
 
 function parseJSON(text: string): any {
   if (!text) return {};
@@ -599,30 +598,6 @@ export class GeminiProvider implements AIProvider {
       throw err;
     }
   }
-
-  async generateSkillBundle(analysis: ChangeLogAnalysis, projectBackground: string, repoUrl: string, fromVersion: string, toVersion: string): Promise<SkillBundle> {
-    const prompt = SKILL_BUNDLE_PROMPT
-      .replace('{{PROJECT_BACKGROUND}}', projectBackground)
-      .replace('{{REPO_URL}}', repoUrl)
-      .replace('{{FROM_VERSION}}', fromVersion)
-      .replace('{{TO_VERSION}}', toVersion)
-      .replace('{{ANALYSIS_RESULTS}}', JSON.stringify(analysis));
-
-    try {
-      const response = await withRetry(() => this.ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          maxOutputTokens: 8192
-        }
-      }));
-      return parseJSON(response.text || '{}');
-    } catch (err: any) {
-      console.error("Gemini generateSkillBundle error:", err);
-      throw err;
-    }
-  }
 }
 
 export class OpenAICompatibleProvider implements AIProvider {
@@ -1030,18 +1005,6 @@ export class OpenAICompatibleProvider implements AIProvider {
       confidenceNote: result.confidenceNote || confidenceNote,
       fallbackReason: result.fallbackReason || fallbackReason
     };
-  }
-
-  async generateSkillBundle(analysis: ChangeLogAnalysis, projectBackground: string, repoUrl: string, fromVersion: string, toVersion: string): Promise<SkillBundle> {
-    const prompt = SKILL_BUNDLE_PROMPT
-      .replace('{{PROJECT_BACKGROUND}}', projectBackground)
-      .replace('{{REPO_URL}}', repoUrl)
-      .replace('{{FROM_VERSION}}', fromVersion)
-      .replace('{{TO_VERSION}}', toVersion)
-      .replace('{{ANALYSIS_RESULTS}}', JSON.stringify(analysis));
-
-    const resultStr = await this.callAI(prompt);
-    return parseJSON(resultStr);
   }
 }
 
