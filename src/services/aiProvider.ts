@@ -123,7 +123,7 @@ export class GeminiProvider implements AIProvider {
     this.ai = new GoogleGenAI({ apiKey });
   }
 
-  async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
+  async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {
     try {
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
@@ -135,6 +135,7 @@ export class GeminiProvider implements AIProvider {
         **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
 
         项目背景：${projectBackground}
+        ${sourceUrl ? `证据来源地址：${sourceUrl}` : ''}
         
         变更日志：
         ${changeLog}
@@ -216,7 +217,8 @@ export class GeminiProvider implements AIProvider {
         }
       }
     }));
-    return parseJSON(response.text || '{}');
+    const result = parseJSON(response.text || '{}');
+    return { ...result, sourceUrl };
   } catch (err: any) {
     console.error("Gemini analyzeChangeLog error:", err);
     if (err.message?.includes("401") || err.status === 401) {
@@ -771,13 +773,16 @@ export class OpenAICompatibleProvider implements AIProvider {
     }
   }
 
-  async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
+  async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {
     const prompt = `
+      你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
       分析以下 GitHub 发布变更日志，并识别对具有此背景的项目产生影响的所有条目。
       
       **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
 
       项目背景：${projectBackground}
+      ${sourceUrl ? `证据来源地址：${sourceUrl}` : ''}
       
       变更日志：
       ${changeLog}
@@ -833,12 +838,14 @@ export class OpenAICompatibleProvider implements AIProvider {
       
       请务必使用中文回答。
     `;
-    const result = await this.callAI(prompt);
-    return parseJSON(result);
+    const resultStr = await this.callAI(prompt);
+    return { ...parseJSON(resultStr), sourceUrl };
   }
 
   async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
     const prompt = `
+      你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
       分析以下代码差异以识别兼容性风险。
       
       **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
@@ -868,7 +875,9 @@ export class OpenAICompatibleProvider implements AIProvider {
     const commitSummary = commits ? commits.slice(0, 50).map(c => `- SHA: ${c.sha}, Message: ${c.commit.message}`).join('\n') : '';
     
     const prompt = `
-      你是一个极其严谨的资深架构师，正在进行“安全优先”的兼容性风险分析。
+      你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
+      你正在进行“安全优先”的兼容性风险分析。
       当前分析分组：${groupName} (第 ${batchIndex + 1} 批，共 ${totalBatches} 批)
       版本范围：${fromVersion} -> ${toVersion}
       项目背景：${projectBackground}
@@ -1119,7 +1128,7 @@ export class AnthropicProvider implements AIProvider {
     this.config = config;
   }
 
-  private async callAI(prompt: string): Promise<string> {
+  private async callAI(prompt: string, jsonMode: boolean = false): Promise<string> {
     let baseUrl = (this.config.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
     let url = baseUrl;
 
@@ -1128,12 +1137,20 @@ export class AnthropicProvider implements AIProvider {
       url = `${baseUrl}/v1/messages`;
     }
 
-    const data = {
+    const data: any = {
       model: this.config.model,
-      max_tokens: 8000,
-      system: "你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。",
-      messages: [{ role: 'user', content: prompt }]
+      max_tokens: 8192,
+      system: "你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。不要在 JSON 之外输出任何文字。",
+      messages: [
+        { role: 'user', content: prompt }
+      ]
     };
+
+    // Note: Anthropic doesn't have a native 'json_object' response_format like OpenAI,
+    // but we can ensure the prompt is clear.
+    if (jsonMode) {
+      data.system += " 请确保输出是合法的 JSON 格式。";
+    }
     const headers = {
       'x-api-key': this.config.apiKey,
       'Authorization': `Bearer ${this.config.apiKey}`, // Added for compatibility with some proxies
@@ -1163,23 +1180,27 @@ export class AnthropicProvider implements AIProvider {
 
       // Support multiple response formats (Anthropic, OpenAI, and common Chinese provider variants)
       let text = '';
+      let thinking = '';
+
       if (Array.isArray(aiResponse?.content)) {
         // Collect all text blocks, filtering out thinking blocks
         const textBlocks = aiResponse.content.filter((c: any) => c.type === 'text' || (c.text && c.type !== 'thinking'));
         text = textBlocks.map((c: any) => c.text).join('') || '';
         
-        if (!text) {
-          const isMaxTokens = aiResponse?.stop_reason === 'max_tokens';
-          const hasThinking = aiResponse.content.some((c: any) => c.type === 'thinking' || c.thinking);
-          if (isMaxTokens && hasThinking) {
-            throw new Error("Model output truncated before final text (模型在 thinking 阶段被截断，尚未产出最终文本)");
-          }
-        }
+        // Collect thinking for truncation detection
+        const thinkingBlocks = aiResponse.content.filter((c: any) => c.type === 'thinking' || c.thinking);
+        thinking = thinkingBlocks.map((c: any) => c.text || c.thinking).join('') || '';
+      }
+
+      // Fallback to OpenAI-style choices if content is empty or not an array
+      if (!text && Array.isArray(aiResponse?.choices)) {
+        const choice = aiResponse.choices[0];
+        text = choice?.message?.content || choice?.text || '';
+        thinking = choice?.message?.reasoning_content || choice?.message?.thinking || '';
       }
 
       if (!text) {
         text = 
-          aiResponse?.choices?.[0]?.message?.content ||
           aiResponse?.text ||
           (typeof aiResponse?.content === 'string' ? aiResponse.content : null) ||
           aiResponse?.message ||
@@ -1188,17 +1209,12 @@ export class AnthropicProvider implements AIProvider {
 
       if (!text) {
         const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
-        const suffix = isMaxTokens ? " (由于响应长度达到模型限制，内容已被截断)" : "";
-        console.error("Invalid AI response structure. Full response:", JSON.stringify(aiResponse));
-        
-        // If we have a response but can't find text, and it's not an error object, 
-        // maybe the entire object is the error or a different format.
-        const possibleError = aiResponse?.msg || aiResponse?.message || aiResponse?.error_msg;
-        if (possibleError) {
-          throw new Error(`AI 服务返回错误: ${possibleError}${suffix}`);
+        if (isMaxTokens && thinking) {
+          throw new Error("Model output truncated before final text (模型在 thinking 阶段被截断，尚未产出最终文本)");
         }
         
-        throw new Error(`AI 服务返回了无法解析的数据结构。请检查模型配置或稍后再试。${suffix}`);
+        console.error("Invalid AI response structure. Full response:", JSON.stringify(aiResponse));
+        throw new Error("AI 服务返回了无效的数据结构。请检查模型配置或稍后再试。");
       }
       return text;
     } catch (error: any) {
@@ -1212,33 +1228,33 @@ export class AnthropicProvider implements AIProvider {
     }
   }
 
-  async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
+  async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {
     const openai = new OpenAICompatibleProvider(this.config);
-    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
-    return openai.analyzeChangeLog(changeLog, projectBackground);
+    (openai as any).callAI = (prompt: string, jsonMode?: boolean) => this.callAI(prompt, jsonMode);
+    return openai.analyzeChangeLog(changeLog, projectBackground, sourceUrl);
   }
 
   async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
     const openai = new OpenAICompatibleProvider(this.config);
-    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    (openai as any).callAI = (prompt: string, jsonMode?: boolean) => this.callAI(prompt, jsonMode);
     return openai.analyzeDiff(diff, prTitle, projectBackground);
   }
 
   async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
     const openai = new OpenAICompatibleProvider(this.config);
-    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    (openai as any).callAI = (prompt: string, jsonMode?: boolean) => this.callAI(prompt, jsonMode);
     return openai.analyzeBatchDiff(diff, projectBackground, fromVersion, toVersion, groupName, batchIndex, totalBatches, releaseNotes, commits);
   }
 
   async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
     const openai = new OpenAICompatibleProvider(this.config);
-    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    (openai as any).callAI = (prompt: string, jsonMode?: boolean) => this.callAI(prompt, jsonMode);
     return openai.aggregateBatchResults(batchResults, projectBackground, fromVersion, toVersion, releaseNotes);
   }
 
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
     const openai = new OpenAICompatibleProvider(this.config);
-    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    (openai as any).callAI = (prompt: string, jsonMode?: boolean) => this.callAI(prompt, jsonMode);
     return openai.analyzeFullDiff(diff, projectBackground, fromVersion, toVersion, releaseNotes, commits, files, metadata);
   }
 }

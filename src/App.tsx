@@ -247,7 +247,7 @@ export default function App() {
 
       // 2. Analyze Change Log with Selected AI
       const provider = getAIProvider(aiConfig);
-      const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground);
+      const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl);
       
       // Sort items by risk level: High > Medium > Low
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
@@ -1557,6 +1557,19 @@ export default function App() {
                   <div className="prose prose-sm max-w-none text-black/70 whitespace-pre-wrap">
                     {changeLogAnalysis.summary}
                   </div>
+                  {changeLogAnalysis.sourceUrl && (
+                    <div className="mt-4 pt-4 border-t border-black/5">
+                      <a 
+                        href={changeLogAnalysis.sourceUrl} 
+                        target="_blank" 
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-2 text-xs text-blue-600 hover:text-blue-800 font-medium group"
+                      >
+                        <ExternalLink size={14} className="group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                        查看原始变更日志 (证据链)
+                      </a>
+                    </div>
+                  )}
                 </section>
 
                 {/* All Changes Section */}
