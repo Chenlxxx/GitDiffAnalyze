@@ -132,25 +132,39 @@ async function startServer() {
     } catch (error: any) {
       const status = error.response?.status;
       const errorData = error.response?.data;
+      const targetUrl = req.body.url;
       
       if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
-        console.error(`AI Proxy Timeout for ${req.body.url}`);
+        console.error(`AI Proxy Timeout for ${targetUrl}`);
         return res.status(504).json({
           message: 'AI 服务响应超时。由于分析内容较多或模型生成较慢，请求已超过 5 分钟限制。',
-          details: error.message
+          details: error.message,
+          url: targetUrl
         });
       }
 
-      console.error(`AI Proxy Error (${status}):`, JSON.stringify(errorData || error.message));
+      console.error(`AI Proxy Error (${status}) for ${targetUrl}:`, JSON.stringify(errorData || error.message));
       
       if (status === 401) {
         return res.status(401).json({
           message: '身份验证失败 (401)。请检查您的 API Key 是否正确，或者是否已在服务端配置了默认 Key。',
-          details: errorData
+          details: errorData,
+          url: targetUrl
+        });
+      }
+
+      if (status === 404) {
+        return res.status(404).json({
+          message: `AI 服务接口未找到 (404)。请检查 Base URL 配置是否正确。当前请求地址: ${targetUrl}`,
+          details: errorData,
+          url: targetUrl
         });
       }
       
-      res.status(status || 500).json(errorData || { message: error.message });
+      res.status(status || 500).json(errorData || { 
+        message: error.message,
+        url: targetUrl
+      });
     }
   });
 

@@ -1,4 +1,4 @@
-export type AIProviderType = 'gemini' | 'openai-compatible';
+export type AIProviderType = 'gemini' | 'openai-compatible' | 'anthropic';
 
 export interface AIConfig {
   provider: AIProviderType;

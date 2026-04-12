@@ -8,30 +8,53 @@ function parseJSON(text: string): any {
   
   // Helper to try parsing
   const tryParse = (str: string) => {
+    if (!str) return null;
     try {
       return JSON.parse(str);
     } catch (e) {
       // Try to fix common JSON issues:
       // 1. Remove trailing commas before closing braces/brackets
       let fixed = str.replace(/,\s*([\]}])/g, '$1');
+      
+      // 2. Remove raw control characters that break JSON.parse
+      // We keep \n, \r, \t but escape them if they are raw
+      fixed = fixed.replace(/[\x00-\x1F\x7F-\x9F]/g, (match) => {
+        if (match === '\n') return '\\n';
+        if (match === '\r') return '\\r';
+        if (match === '\t') return '\\t';
+        return '';
+      });
+
       try {
         return JSON.parse(fixed);
       } catch (e2) {
-        // 2. Try to fix truncated JSON by adding missing closing braces/brackets
+        // 3. Try to fix truncated JSON by adding missing closing braces/brackets
         let truncated = fixed;
+        
+        // If it ends with a partial string, close it
+        // Count unescaped double quotes
+        const quotes = (truncated.match(/(?<!\\)"/g) || []).length;
+        if (quotes % 2 !== 0) {
+          truncated += '"';
+        }
+
         const openBraces = (truncated.match(/{/g) || []).length;
         const closeBraces = (truncated.match(/}/g) || []).length;
         const openBrackets = (truncated.match(/\[/g) || []).length;
-        const closeBrackets = (truncated.match(/]/g) || []).length;
+        const closeBrackets = (truncated.match(/\]/g) || []).length;
         
-        for (let i = 0; i < openBraces - closeBraces; i++) truncated += '}';
-        for (let i = 0; i < openBrackets - closeBrackets; i++) truncated += ']';
-        
-        try {
-          return JSON.parse(truncated);
-        } catch (e3) {
-          return null;
+        if (openBraces > closeBraces || openBrackets > closeBrackets) {
+          for (let i = 0; i < openBraces - closeBraces; i++) truncated += '}';
+          for (let i = 0; i < openBrackets - closeBrackets; i++) truncated += ']';
+          
+          try {
+            return JSON.parse(truncated);
+          } catch (e3) {
+            // Last ditch effort: try to find the last valid object/array end
+            return null;
+          }
         }
+        return null;
       }
     }
   };
@@ -45,7 +68,6 @@ function parseJSON(text: string): any {
   if (jsonMatch && jsonMatch[1]) {
     result = tryParse(jsonMatch[1].trim());
     if (result) return result;
-    console.error("Failed to parse extracted JSON");
   }
   
   // 3. Try to find the first '{' and last '}'
@@ -58,10 +80,20 @@ function parseJSON(text: string): any {
     // 4. Try from first brace to the end (in case it was truncated)
     result = tryParse(cleanText.substring(firstBrace));
     if (result) return result;
+  }
+
+  // 5. Try to find the first '[' and last ']' (for array responses)
+  const firstBracket = cleanText.indexOf('[');
+  const lastBracket = cleanText.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    result = tryParse(cleanText.substring(firstBracket, lastBracket + 1));
+    if (result) return result;
     
-    console.error("Failed to parse braced JSON");
+    result = tryParse(cleanText.substring(firstBracket));
+    if (result) return result;
   }
   
+  console.error("Failed to parse JSON from AI response. Original text:", cleanText);
   throw new Error("无法解析 AI 返回的 JSON 数据。这通常是因为返回内容过长导致截断，或者内容中包含特殊字符。请尝试缩小分析范围或稍后再试。");
 }
 
@@ -96,6 +128,8 @@ export class GeminiProvider implements AIProvider {
       const response = await withRetry(() => this.ai.models.generateContent({
         model: "gemini-3.1-pro-preview",
         contents: `
+          你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
           分析以下 GitHub 发布变更日志，并识别对具有此背景的项目产生影响的所有条目：
         
         **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
@@ -608,10 +642,20 @@ export class OpenAICompatibleProvider implements AIProvider {
   }
 
   private async callAI(prompt: string, jsonMode: boolean = true): Promise<string> {
-    const url = `${this.config.baseUrl || 'https://api.openai.com/v1'}/chat/completions`;
+    let baseUrl = (this.config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+    let url = baseUrl;
+    
+    // If baseUrl doesn't look like a full endpoint, append the default one
+    if (!baseUrl.toLowerCase().endsWith('/chat/completions') && !baseUrl.toLowerCase().endsWith('/completions')) {
+      url = `${baseUrl}/chat/completions`;
+    }
+
     const data = {
       model: this.config.model,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        { role: 'system', content: "你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。" },
+        { role: 'user', content: prompt }
+      ],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
       temperature: 0.1,
       max_tokens: 8000
@@ -631,11 +675,40 @@ export class OpenAICompatibleProvider implements AIProvider {
           throw new Error("AI 服务返回了无效的 HTML 响应。这通常是因为请求超时或服务端发生错误。请尝试缩小分析范围或稍后再试。");
         }
 
-        if (!response.data?.choices?.[0]?.message?.content) {
-          console.error("Invalid AI response structure:", response.data);
-          throw new Error("AI 服务返回了无效的数据结构。请检查模型配置或稍后再试。");
+        const aiResponse = response.data;
+        if (aiResponse?.error) {
+          const errorMsg = aiResponse.error.message || aiResponse.error.code || (typeof aiResponse.error === 'string' ? aiResponse.error : JSON.stringify(aiResponse.error));
+          throw new Error(`AI 服务返回错误: ${errorMsg}`);
         }
-        return response.data.choices[0].message.content;
+
+        let content = 
+          aiResponse?.choices?.[0]?.message?.content || 
+          aiResponse?.text ||
+          (typeof aiResponse === 'string' ? aiResponse : null);
+
+        if (!content && Array.isArray(aiResponse?.content)) {
+          // Collect all text blocks
+          const textBlocks = aiResponse.content.filter((c: any) => c.type === 'text' || (c.text && c.type !== 'thinking'));
+          content = textBlocks.map((c: any) => c.text).join('') || '';
+          
+          if (!content) {
+            const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
+            const hasThinking = aiResponse.content.some((c: any) => c.type === 'thinking' || c.thinking);
+            if (isMaxTokens && hasThinking) {
+              throw new Error("Model output truncated before final text (模型在 thinking 阶段被截断，尚未产出最终文本)");
+            }
+          }
+        } else if (!content && aiResponse?.content) {
+          content = typeof aiResponse.content === 'string' ? aiResponse.content : JSON.stringify(aiResponse.content);
+        }
+
+        if (!content) {
+          const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
+          const suffix = isMaxTokens ? " (由于响应长度达到模型限制，内容已被截断)" : "";
+          console.error("Invalid AI response structure:", aiResponse);
+          throw new Error(`AI 服务返回了无法解析的数据结构（缺少 choices 或 content）。请检查模型配置或稍后再试。${suffix}`);
+        }
+        return content;
       } else {
         // Direct call (Works in static hosting if the AI provider allows CORS)
         const response = await axios.post(url, data, { headers, timeout: 310000 });
@@ -645,11 +718,40 @@ export class OpenAICompatibleProvider implements AIProvider {
           throw new Error("AI 服务返回了无效的 HTML 响应。请尝试检查 API 地址或稍后再试。");
         }
 
-        if (!response.data?.choices?.[0]?.message?.content) {
-          console.error("Invalid AI response structure:", response.data);
-          throw new Error("AI 服务返回了无效的数据结构。请检查模型配置或稍后再试。");
+        const aiResponse = response.data;
+        if (aiResponse?.error) {
+          const errorMsg = aiResponse.error.message || aiResponse.error.code || (typeof aiResponse.error === 'string' ? aiResponse.error : JSON.stringify(aiResponse.error));
+          throw new Error(`AI 服务返回错误: ${errorMsg}`);
         }
-        return response.data.choices[0].message.content;
+
+        let content = 
+          aiResponse?.choices?.[0]?.message?.content || 
+          aiResponse?.text ||
+          (typeof aiResponse === 'string' ? aiResponse : null);
+
+        if (!content && Array.isArray(aiResponse?.content)) {
+          // Collect all text blocks
+          const textBlocks = aiResponse.content.filter((c: any) => c.type === 'text' || (c.text && c.type !== 'thinking'));
+          content = textBlocks.map((c: any) => c.text).join('') || '';
+
+          if (!content) {
+            const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
+            const hasThinking = aiResponse.content.some((c: any) => c.type === 'thinking' || c.thinking);
+            if (isMaxTokens && hasThinking) {
+              throw new Error("Model output truncated before final text (模型在 thinking 阶段被截断，尚未产出最终文本)");
+            }
+          }
+        } else if (!content && aiResponse?.content) {
+          content = typeof aiResponse.content === 'string' ? aiResponse.content : JSON.stringify(aiResponse.content);
+        }
+
+        if (!content) {
+          const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
+          const suffix = isMaxTokens ? " (由于响应长度达到模型限制，内容已被截断)" : "";
+          console.error("Invalid AI response structure:", aiResponse);
+          throw new Error(`AI 服务返回了无法解析的数据结构（缺少 choices 或 content）。请检查模型配置或稍后再试。${suffix}`);
+        }
+        return content;
       }
     } catch (error: any) {
       if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
@@ -811,7 +913,9 @@ export class OpenAICompatibleProvider implements AIProvider {
     const allItems = batchResults.flatMap(r => r.items);
 
     const prompt = `
-      你是一个极其严谨的资深架构师。请汇总多个批次的兼容性分析结果，生成最终的“安全优先”分析报告。
+      你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
+      汇总多个批次的兼容性分析结果，生成最终的“安全优先”分析报告。
       版本范围：${fromVersion} -> ${toVersion}
       项目背景：${projectBackground}
       发布日志：${releaseNotes || '未提供'}
@@ -897,12 +1001,12 @@ export class OpenAICompatibleProvider implements AIProvider {
     }
 
     const prompt = `
-      你是一个极其严谨的资深架构师和安全专家。请分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
+      你是一个极其严谨的资深架构师和安全专家。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。
+
+      分析从 ${fromVersion} 到 ${toVersion} 版本之间的代码差异（Diff），并识别潜在的兼容性风险。
       
       **重要指令：禁止使用任何外部工具、搜索或联网功能。仅基于提供的文本内容进行分析。**
-
       ${modeInstruction}
-
       **分析输入：**
       1. **代码差异 (Diff)**：最真实的代码变更（当前模式下可能仅包含部分关键片段）。
       2. **Commit 记录**：变更的具体意图。
@@ -1008,9 +1112,143 @@ export class OpenAICompatibleProvider implements AIProvider {
   }
 }
 
+export class AnthropicProvider implements AIProvider {
+  private config: AIConfig;
+
+  constructor(config: AIConfig) {
+    this.config = config;
+  }
+
+  private async callAI(prompt: string): Promise<string> {
+    let baseUrl = (this.config.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+    let url = baseUrl;
+
+    // If baseUrl doesn't look like a full endpoint, append the default one
+    if (!baseUrl.toLowerCase().endsWith('/v1/messages') && !baseUrl.toLowerCase().endsWith('/messages')) {
+      url = `${baseUrl}/v1/messages`;
+    }
+
+    const data = {
+      model: this.config.model,
+      max_tokens: 8000,
+      system: "你是一个极其严谨的资深架构师。请直接输出结果，禁止输出任何思维链（thinking process）或推理过程。你的输出必须仅包含最终的 JSON 结果。",
+      messages: [{ role: 'user', content: prompt }]
+    };
+    const headers = {
+      'x-api-key': this.config.apiKey,
+      'Authorization': `Bearer ${this.config.apiKey}`, // Added for compatibility with some proxies
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json'
+    };
+
+    try {
+      let response;
+      if (this.config.useProxy) {
+        response = await axios.post('/api/ai-proxy', { url, data, headers }, { timeout: 310000 });
+      } else {
+        response = await axios.post(url, data, { headers, timeout: 310000 });
+      }
+
+      const aiResponse = response.data;
+
+      if (typeof aiResponse === 'string' && aiResponse.includes('<!doctype html>')) {
+        throw new Error("AI 服务返回了无效的 HTML 响应。这通常是因为请求超时或服务端发生错误。");
+      }
+
+      // Check for errors in the response body
+      if (aiResponse?.error) {
+        const errorMsg = aiResponse.error.message || aiResponse.error.code || (typeof aiResponse.error === 'string' ? aiResponse.error : JSON.stringify(aiResponse.error));
+        throw new Error(`AI 服务返回错误: ${errorMsg}`);
+      }
+
+      // Support multiple response formats (Anthropic, OpenAI, and common Chinese provider variants)
+      let text = '';
+      if (Array.isArray(aiResponse?.content)) {
+        // Collect all text blocks, filtering out thinking blocks
+        const textBlocks = aiResponse.content.filter((c: any) => c.type === 'text' || (c.text && c.type !== 'thinking'));
+        text = textBlocks.map((c: any) => c.text).join('') || '';
+        
+        if (!text) {
+          const isMaxTokens = aiResponse?.stop_reason === 'max_tokens';
+          const hasThinking = aiResponse.content.some((c: any) => c.type === 'thinking' || c.thinking);
+          if (isMaxTokens && hasThinking) {
+            throw new Error("Model output truncated before final text (模型在 thinking 阶段被截断，尚未产出最终文本)");
+          }
+        }
+      }
+
+      if (!text) {
+        text = 
+          aiResponse?.choices?.[0]?.message?.content ||
+          aiResponse?.text ||
+          (typeof aiResponse?.content === 'string' ? aiResponse.content : null) ||
+          aiResponse?.message ||
+          (typeof aiResponse === 'string' ? aiResponse : null);
+      }
+
+      if (!text) {
+        const isMaxTokens = aiResponse?.stop_reason === 'max_tokens' || aiResponse?.finish_reason === 'length';
+        const suffix = isMaxTokens ? " (由于响应长度达到模型限制，内容已被截断)" : "";
+        console.error("Invalid AI response structure. Full response:", JSON.stringify(aiResponse));
+        
+        // If we have a response but can't find text, and it's not an error object, 
+        // maybe the entire object is the error or a different format.
+        const possibleError = aiResponse?.msg || aiResponse?.message || aiResponse?.error_msg;
+        if (possibleError) {
+          throw new Error(`AI 服务返回错误: ${possibleError}${suffix}`);
+        }
+        
+        throw new Error(`AI 服务返回了无法解析的数据结构。请检查模型配置或稍后再试。${suffix}`);
+      }
+      return text;
+    } catch (error: any) {
+      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+        throw new Error("AI 分析请求超时。");
+      }
+      if (error.response?.status === 401) {
+        throw new Error("身份验证失败 (401)。请检查您的 API Key 是否正确。");
+      }
+      throw error;
+    }
+  }
+
+  async analyzeChangeLog(changeLog: string, projectBackground: string): Promise<ChangeLogAnalysis> {
+    const openai = new OpenAICompatibleProvider(this.config);
+    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    return openai.analyzeChangeLog(changeLog, projectBackground);
+  }
+
+  async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
+    const openai = new OpenAICompatibleProvider(this.config);
+    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    return openai.analyzeDiff(diff, prTitle, projectBackground);
+  }
+
+  async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
+    const openai = new OpenAICompatibleProvider(this.config);
+    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    return openai.analyzeBatchDiff(diff, projectBackground, fromVersion, toVersion, groupName, batchIndex, totalBatches, releaseNotes, commits);
+  }
+
+  async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
+    const openai = new OpenAICompatibleProvider(this.config);
+    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    return openai.aggregateBatchResults(batchResults, projectBackground, fromVersion, toVersion, releaseNotes);
+  }
+
+  async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
+    const openai = new OpenAICompatibleProvider(this.config);
+    (openai as any).callAI = (prompt: string) => this.callAI(prompt);
+    return openai.analyzeFullDiff(diff, projectBackground, fromVersion, toVersion, releaseNotes, commits, files, metadata);
+  }
+}
+
 export function getAIProvider(config: AIConfig): AIProvider {
   if (config.provider === 'gemini') {
     return new GeminiProvider(config.apiKey || '');
+  }
+  if (config.provider === 'anthropic') {
+    return new AnthropicProvider(config);
   }
   return new OpenAICompatibleProvider(config);
 }

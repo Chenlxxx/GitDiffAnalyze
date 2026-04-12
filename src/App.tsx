@@ -1034,13 +1034,28 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
               <div className="space-y-2">
                 <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">AI 提供商</label>
-                <select 
-                  value={aiConfig.provider}
-                  onChange={(e) => setAiConfig({...aiConfig, provider: e.target.value as any})}
-                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                >
+                  <select 
+                    value={aiConfig.provider}
+                    onChange={(e) => {
+                      const newProvider = e.target.value as any;
+                      let newConfig = { ...aiConfig, provider: newProvider };
+                      
+                      if (newProvider === 'anthropic') {
+                        newConfig.baseUrl = 'https://api.nengpa.com/anthropic';
+                        newConfig.model = 'MiniMax-M2.5';
+                        newConfig.apiKey = 'sk-cp-33559ebabc72ac5e103c00ae6baa8dd49bd971c449dd599e7b5f327fc8626b29';
+                      } else if (newProvider === 'openai-compatible') {
+                        newConfig.baseUrl = 'https://api.openai.com/v1';
+                        newConfig.model = 'gpt-4o';
+                      }
+                      
+                      setAiConfig(newConfig);
+                    }}
+                    className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                  >
                   <option value="gemini">Google Gemini</option>
                   <option value="openai-compatible">OpenAI 兼容 (豆包/Qwen/DeepSeek)</option>
+                  <option value="anthropic">Anthropic (MiniMax-M2.5)</option>
                 </select>
               </div>
               <div className="space-y-2">
@@ -1065,7 +1080,7 @@ export default function App() {
                 </label>
                 <p className="text-[10px] text-black/30 mt-1">在静态托管环境（如 Cloudflare Pages）下建议关闭此项。</p>
               </div>
-              {aiConfig.provider === 'openai-compatible' && (
+              {(aiConfig.provider === 'openai-compatible' || aiConfig.provider === 'anthropic') && (
                 <>
                   <div className="space-y-2">
                     <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">Base URL</label>
@@ -1074,7 +1089,7 @@ export default function App() {
                       value={aiConfig.baseUrl}
                       onChange={(e) => setAiConfig({...aiConfig, baseUrl: e.target.value})}
                       className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder="https://api.openai.com/v1"
+                      placeholder={aiConfig.provider === 'anthropic' ? 'https://api.nengpa.com/anthropic' : 'https://api.openai.com/v1'}
                     />
                   </div>
                   <div className="space-y-2">
@@ -1084,7 +1099,7 @@ export default function App() {
                       value={aiConfig.model}
                       onChange={(e) => setAiConfig({...aiConfig, model: e.target.value})}
                       className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder="gpt-4o / qwen-max"
+                      placeholder={aiConfig.provider === 'anthropic' ? 'MiniMax-M2.5' : 'gpt-4o / qwen-max'}
                     />
                   </div>
                 </>
