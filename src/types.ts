@@ -23,6 +23,10 @@ export interface ChangeLogAnalysis {
   summary: string;
   excelRows?: ExcelAnalysisRow[];
   sourceUrl?: string;
+  resolvedTags?: {
+    from: string;
+    to: string;
+  };
 }
 
 export interface DiffAnalysis {

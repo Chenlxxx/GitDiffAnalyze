@@ -66,6 +66,7 @@ export function scoreFile(filename: string): FileScore {
 }
 
 export function sortFilesByPriority(files: any[]): any[] {
+  if (!files || !Array.isArray(files)) return [];
   return [...files]
     .map(f => ({ ...f, _score: scoreFile(f.filename) }))
     .sort((a, b) => b._score.score - a._score.score);

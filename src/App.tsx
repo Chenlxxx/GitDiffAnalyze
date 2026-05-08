@@ -84,6 +84,58 @@ export default function App() {
   const [batchItems, setBatchItems] = useState<BatchAnalysisItem[]>([]);
   const [batchProcessing, setBatchProcessing] = useState(false);
 
+  const resolveActualTags = async (repoInfo: { owner: string; repo: string }, fromV: string, toV: string) => {
+    const cleanTo = GitHubService.parseTagFromUrl(toV);
+    const cleanFrom = GitHubService.parseTagFromUrl(fromV);
+    const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
+
+    const findMatch = (version: string) => {
+      const v = version.trim().toLowerCase();
+      // If the version already looks like a full tag name in our list, use it directly
+      const directMatch = tags.find(t => t.name.toLowerCase() === v);
+      if (directMatch) return directMatch;
+
+      return tags.find(t => {
+        const tn = t.name.toLowerCase();
+        return tn === v || 
+               tn === `v${v}` || 
+               tn === `rel/v${v}` || 
+               tn === `rel/${v}` ||
+               tn === `${repoInfo.repo.toLowerCase()}-${v}` ||
+               (tn.startsWith(`${repoInfo.repo.toLowerCase()}-`) && tn.endsWith(`-${v}`)) ||
+               tn.endsWith(`/${v}`) ||
+               tn.endsWith(`/v${v}`) ||
+               tn.endsWith(`-${v}`) ||
+               tn.endsWith(`-v${v}`) ||
+               v.endsWith(`/${tn}`) ||
+               v.endsWith(`/v${tn}`);
+      });
+    };
+
+    const toMatch = findMatch(cleanTo);
+    const fromMatch = findMatch(cleanFrom);
+
+    let actualToTag = toMatch?.name || cleanTo;
+    let actualFromTag = fromMatch?.name || cleanFrom;
+
+    // SPECIAL CASE: If start and end versions are the same, 
+    // auto-detect the previous tag to provide a meaningful delta
+    if (actualToTag === actualFromTag) {
+      console.log(`Same version detected (${actualToTag}). Attempting to find previous tag...`);
+      const targetTag = toMatch || findMatch(actualToTag);
+      if (targetTag) {
+        const toIndex = tags.findIndex(t => t.name === targetTag.name);
+        if (toIndex !== -1 && toIndex < tags.length - 1) {
+          const previousTag = tags[toIndex + 1].name;
+          console.log(`Auto-falling back to previous tag: ${previousTag}`);
+          actualFromTag = previousTag;
+        }
+      }
+    }
+
+    return { actualFromTag, actualToTag };
+  };
+
   const handleAnalyze = async () => {
     if (analysisMode === 'full-diff') {
       return handleFullDiffAnalyze();
@@ -101,46 +153,34 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-      const cleanToVersion = GitHubService.parseTagFromUrl(toVersion);
-      const cleanFromVersion = GitHubService.parseTagFromUrl(fromVersion);
+      const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, fromVersion, toVersion);
+      
+      if (actualToTag === actualFromTag) {
+        throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
+      }
 
-      // Helper to find actual tag name from version string
-      const findActualTag = async (version: string) => {
-        try {
-          const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-          // Try exact match, then v-prefix, then common prefixes like rel/
-          const match = tags.find(t => 
-            t.name === version || 
-            t.name === `v${version}` || 
-            t.name === `rel/v${version}` || 
-            t.name === `rel/${version}` ||
-            t.name.endsWith(`/${version}`) ||
-            t.name.endsWith(`/v${version}`) ||
-            version.endsWith(`/${t.name}`) ||
-            version.endsWith(`/v${t.name}`)
-          );
-          return match?.name || version;
-        } catch (e) {
-          return version;
-        }
-      };
-
-      const actualToTag = await findActualTag(cleanToVersion);
-      const actualFromTag = await findActualTag(cleanFromVersion);
       setResolvedTags({ from: actualFromTag, to: actualToTag });
 
       // Helper to extract relevant section from a cumulative changelog
       const extractVersionSection = (content: string, toV: string, fromV: string) => {
-        const cleanTo = toV.replace(/^v/, '').replace(/^rel\//, '');
-        const cleanFrom = fromV.replace(/^v/, '').replace(/^rel\//, '');
+        // Strip common prefixes to get the raw version number
+        const getPureVersion = (v: string) => {
+          return v.replace(/^(?:netty|rel|v|release|version)[-/]/i, '')
+                  .replace(/^(?:netty|rel|v|release|version)\s*/i, '')
+                  .replace(/^v/, '');
+        };
+
+        const cleanTo = getPureVersion(toV);
+        const cleanFrom = getPureVersion(fromV);
         
         const getVersionPos = (ver: string) => {
           const escapedVer = ver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const patterns = [
-            new RegExp(`(?:Release|Version|##|#|Tag)\\s*v?${escapedVer}`, 'i'),
+            new RegExp(`(?:Release|Version|##|#|Tag|Netty)\\s*v?${escapedVer}`, 'i'),
             new RegExp(`^v?${escapedVer}\\s*$`, 'im'),
             new RegExp(`^v?${escapedVer}\\s+[-=]+$`, 'im'),
             new RegExp(`\\[${escapedVer}\\]`, 'i'),
+            new RegExp(`(?:^|[^0-9.])${escapedVer}(?:[^0-9.]|$)`, 'im'),
           ];
           
           for (const p of patterns) {
@@ -181,46 +221,61 @@ export default function App() {
       try {
         // Try GitHub Release first
         const release = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
-        if (release) {
+        if (release && release.body && release.body.trim().length > 300) {
           releaseBody = release.body;
           releaseUrl = release.html_url;
         } else {
-          throw new Error('Release not found');
+          // If release body is very short or missing, it might just be a placeholder.
+          // We save what we have as a fallback but continue to look for better content.
+          if (release) {
+            releaseBody = release.body;
+            releaseUrl = release.html_url;
+          }
+          throw new Error('Release body too short or release not found, trying files');
         }
       } catch (err: any) {
         // Fallback 1: Try to find a changelog file in the repo (e.g., RELEASE_NOTES.txt)
         try {
-          const files = ['RELEASE_NOTES.txt', 'CHANGELOG.md', 'CHANGES.txt', 'RELEASENOTES.md', 'CHANGELOG.txt'];
+          const files = ['RELEASE_NOTES.txt', 'CHANGELOG.md', 'CHANGES.txt', 'RELEASENOTES.md', 'CHANGELOG.txt', 'notes/RELEASE_NOTES.txt'];
           let fileContent = '';
           let foundFile = '';
           for (const file of files) {
             try {
               fileContent = await GitHubService.getFileContent(repoInfo.owner, repoInfo.repo, file, actualToTag);
-              if (fileContent) {
+              if (fileContent && fileContent.length > 500) {
                 foundFile = file;
-                console.log(`Found changelog in file: ${file}`);
+                console.log(`Found substantial changelog in file: ${file}`);
                 break;
               }
             } catch (e) {}
           }
           
-          if (fileContent) {
-            releaseBody = extractVersionSection(fileContent, toVersion, fromVersion);
-            releaseUrl = `https://github.com/${repoInfo.owner}/${repoInfo.repo}/blob/${actualToTag}/${foundFile}`;
-          } else {
-            throw new Error('No changelog file found');
+          if (fileContent && fileContent.length > (releaseBody?.length || 0)) {
+            const section = extractVersionSection(fileContent, toVersion, fromVersion);
+            if (section && section.length > 100) {
+              releaseBody = section;
+              releaseUrl = `https://github.com/${repoInfo.owner}/${repoInfo.repo}/blob/${actualToTag}/${foundFile}`;
+            }
+          }
+          
+          if (!releaseBody || releaseBody.length < 100) {
+            throw new Error('No substantial changelog file found');
           }
         } catch (fileErr) {
-          // Fallback 2: Try to compare tags if release and files are not found
-          try {
-            const comparison = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
-            releaseUrl = comparison.html_url;
-            // Create a synthetic changelog from commit messages
-            releaseBody = "## Synthetic Changelog (Generated from Commits)\n\n" + 
-              comparison.commits.map((c: any) => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0, 7)})`).join('\n');
-            
-            console.log("Using synthetic changelog from commits");
-          } catch (compareErr: any) {
+          // Fallback 2: Try to compare tags if release and files are not found or too small
+          if (!releaseBody || releaseBody.length < 200) {
+            try {
+              console.log("No good changelog found in releases or files, trying synthetic changelog from commits...");
+              const comparison = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+              releaseUrl = comparison.html_url;
+              // Create a synthetic changelog from commit messages
+              const syntheticLog = "## Synthetic Changelog (Generated from Commits)\n\n" + 
+                comparison.commits.map((c: any) => `- ${c.commit.message.split('\n')[0]} (${c.sha.substring(0, 7)})`).join('\n');
+              
+              if (syntheticLog.length > (releaseBody?.length || 0)) {
+                releaseBody = syntheticLog;
+              }
+            } catch (compareErr: any) {
             // Log available tags to help user debug
             try {
               const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
@@ -244,18 +299,55 @@ export default function App() {
           }
         }
       }
+    }
 
       // 2. Analyze Change Log with Selected AI
       const provider = getAIProvider(aiConfig);
+      
+      if (!releaseBody || releaseBody.trim().length === 0) {
+        throw new Error(`未能找到从 ${actualFromTag} 到 ${actualToTag} 的 Release Note 内容。该项目可能没有在 GitHub Releases 中维护详细日志。建议尝试使用【全量比较 (Diff) 模式】进行分析，它会直接分析代码提交差异。`);
+      }
+
+      // Safety truncation to prevent payload issues (manifesting as 400/401/413)
+      const MAX_CHANGELOG_LENGTH = 25000;
+      if (releaseBody.length > MAX_CHANGELOG_LENGTH) {
+        console.warn(`Changelog content too long (${releaseBody.length}), truncating.`);
+        releaseBody = releaseBody.substring(0, MAX_CHANGELOG_LENGTH) + "\n\n... (为了保证分析效率，内容已部分截断，请结合原始 Release Note 查看)";
+      }
+
       const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl);
+      console.log('AI Analysis complete. Raw items count:', analysis.items?.length || 0);
+      
+      // Store resolved tags in analysis for completeness
+      analysis.resolvedTags = { from: actualFromTag, to: actualToTag };
+      analysis.sourceUrl = releaseUrl;
+      
+      // Ensure items is an array
+      if (!analysis.items) analysis.items = [];
+      
+      // If AI provided excelRows but no items, generate items from excelRows
+      if (analysis.items.length === 0 && analysis.excelRows && analysis.excelRows.length > 0) {
+        console.warn('AI provided excelRows but no items, generating items from excelRows.');
+        analysis.items = analysis.excelRows.map(row => ({
+          title: row.changepoint || row.chinese || '未知变更',
+          reason: row.chinese || row.function || '',
+          impactLevel: row.risk === '高' ? 'High' : row.risk === '中' ? 'Medium' : 'Low',
+          compatibilityAnalysis: row.suggestion || row.function || '',
+          prNumber: row.related_commits ? parseInt(row.related_commits.replace('#', '')) || undefined : undefined
+        }));
+      }
       
       // Sort items by risk level: High > Medium > Low
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
-      analysis.items.sort((a, b) => riskOrder[a.impactLevel] - riskOrder[b.impactLevel]);
+      analysis.items.sort((a, b) => {
+        const orderA = riskOrder[a.impactLevel] ?? 99;
+        const orderB = riskOrder[b.impactLevel] ?? 99;
+        return orderA - orderB;
+      });
       
-      // Fallback for excelRows if AI failed to provide it
-      if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
-        console.warn('AI failed to provide excelRows for changelog, generating from items fallback.');
+      // Sync excelRows from items to ensure consistency
+      if (!analysis.excelRows || analysis.excelRows.length === 0) {
+        console.log('Generating excelRows from items.');
         analysis.excelRows = analysis.items.map(item => ({
           version: toVersion,
           changepoint: item.title,
@@ -264,7 +356,7 @@ export default function App() {
           suggestion: item.reason,
           risk: item.impactLevel === 'High' ? '高' : item.impactLevel === 'Medium' ? '中' : '低',
           test_suggestion: item.reason,
-          code_discovery: '请参考变更日志',
+          code_discovery: '根据变更日志分析',
           code_fix: item.codeExample?.after || '请参考变更日志',
           related_commits: item.prNumber ? `#${item.prNumber}` : ''
         }));
@@ -303,33 +395,11 @@ export default function App() {
     const repoInfo = GitHubService.parseRepoUrl(targetRepoUrl);
     if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-    const cleanToVersion = GitHubService.parseTagFromUrl(targetToVersion);
-    const cleanFromVersion = GitHubService.parseTagFromUrl(targetFromVersion);
+    const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
 
-    let cachedTags: { name: string }[] | null = null;
-    const findActualTag = async (version: string) => {
-      try {
-        if (!cachedTags) {
-          cachedTags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-        }
-        const match = cachedTags.find(t => 
-          t.name === version || 
-          t.name === `v${version}` || 
-          t.name === `rel/v${version}` || 
-          t.name === `rel/${version}` ||
-          t.name.endsWith(`/${version}`) ||
-          t.name.endsWith(`/v${version}`) ||
-          version.endsWith(`/${t.name}`) ||
-          version.endsWith(`/v${t.name}`)
-        );
-        return match?.name || version;
-      } catch (e) {
-        return version;
-      }
-    };
-
-    const actualToTag = await findActualTag(cleanToVersion);
-    const actualFromTag = await findActualTag(cleanFromVersion);
+    if (actualToTag === actualFromTag) {
+      throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
+    }
 
     // 1. Fetch commit data first to determine strategy
     // Only compareCommits failure is allowed to throw
@@ -531,8 +601,15 @@ export default function App() {
         metadata
       );
       
+      // Ensure items is an array before sorting
+      if (!analysis.items) analysis.items = [];
+      
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
-      analysis.items.sort((a, b) => riskOrder[a.riskLevel] - riskOrder[b.riskLevel]);
+      analysis.items.sort((a, b) => {
+        const orderA = riskOrder[a.riskLevel] ?? 99;
+        const orderB = riskOrder[b.riskLevel] ?? 99;
+        return orderA - orderB;
+      });
       
       // Ensure all required fields are present in the final result
       analysis.analysisMode = metadata.mode;

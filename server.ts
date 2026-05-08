@@ -100,6 +100,159 @@ async function startServer() {
     }
   });
 
+  // AI Analysis Proxy (Server-side execution for security and stability)
+  app.post("/api/ai/analyze-changelog", async (req, res) => {
+    try {
+      const { provider, config, changeLog, projectBackground, sourceUrl, type = 'changelog' } = req.body;
+      
+      // Better key resolution: strictly prefer non-empty client key, then fallback to environment
+      let apiKey = (config && config.apiKey && typeof config.apiKey === 'string' && config.apiKey.trim() !== '') ? config.apiKey.trim() : null;
+      
+      if (!apiKey) {
+        if (provider === 'gemini') {
+          apiKey = process.env.GEMINI_API_KEY || null;
+        } else if (provider === 'anthropic') {
+          apiKey = process.env.ANTHROPIC_API_KEY || null;
+        } else {
+          apiKey = process.env.OPEN_API_KEY || process.env.OPENAI_API_KEY || null;
+        }
+      }
+
+      // Final sanitization: remove potential quotes if user pasted them
+      if (apiKey) {
+        apiKey = apiKey.replace(/^["']|["']$/g, '').trim();
+      }
+
+      if (!apiKey) {
+        console.error(`AI Analysis Error: No API Key found for provider ${provider}.`);
+        return res.status(400).json({ message: `API Key for ${provider} is missing. Please provide it in settings.` });
+      }
+
+      // Special check for Gemini: users often accidentally paste the whole JSON config
+      if (provider === 'gemini' && apiKey.includes('{') && apiKey.includes('}')) {
+        return res.status(401).json({ 
+          message: "API Key 格式不正确。检测到您可能输入了 JSON 格式的密钥文件内容。Gemini 模式需要填入单一的 API Key 字符串（通常以 AIza 开头，由 Google AI Studio 提供）。" 
+        });
+      }
+
+      // Diagnostic log (don't log the full key!)
+      console.log(`AI Analysis Request: Provider=${provider}, Type=${type}, ContentLength=${changeLog?.length || 0}`);
+      if (apiKey) {
+        console.log(`Key Info: Length=${apiKey.length}, Preview=${apiKey.substring(0, 6)}...${apiKey.substring(apiKey.length - 4)}`);
+      }
+      
+      // Log beginning of changelog to ensure it's not empty/wrong
+      if (changeLog) {
+        console.log(`Changelog Preview: ${changeLog.substring(0, 200).replace(/\n/g, ' ')}...`);
+      }
+
+      if (provider === 'gemini') {
+        const { GoogleGenerativeAI } = await import("@google/generative-ai");
+        const genAI = new GoogleGenerativeAI(apiKey);
+        
+        // Use gemini-2.0-flash for best performance/speed balance
+        const modelName = "gemini-2.0-flash"; 
+        const model = genAI.getGenerativeModel({ 
+          model: modelName, 
+          generationConfig: {
+            maxOutputTokens: 8192,
+            temperature: 0.1,
+            responseMimeType: "application/json"
+          }
+        });
+
+        let prompt = "";
+        if (type === 'changelog') {
+          prompt = `
+            你是一个极其严谨的资深软件架构师和安全专家。
+            
+            任务：深入分析 GitHub Release Log，识别所有对项目产生实质性影响的变更条目。
+            
+            项目背景：
+            ${projectBackground}
+
+            待分析内容 (Release Note): 
+            ${changeLog}
+            ${sourceUrl ? `提示：内容来源于 ${sourceUrl}` : ''}
+
+            要求：
+            1. 必须输出纯 JSON 格式。
+            2. 识别并罗列变更日志中的每一个具体条目。不要进行宽泛的概括，要细化到具体的 PR 或 BugFix。
+            3. 每一个条目必须包含：标题、PR编号（如有）、变更原因、影响程度评价（High/Medium/Low）、兼容性影响分析。
+            4. 如果影响等级为“High”或“Medium”，必须提供具体的代码示例或配置调整展示。
+            5. 特别针对 Netty 等项目，请关注 Protocol, SSL, Buffer, EventLoop, Transport 等核心模块。
+
+            输出格式 (JSON):
+            {
+              "summary": "版本综合摘要（中文，100字左右）",
+              "items": [
+                {
+                  "title": "变更标题",
+                  "prNumber": 12345,
+                  "reason": "变更的详细背景说明",
+                  "impactLevel": "High | Medium | Low",
+                  "compatibilityAnalysis": "对现有代码的影响及排查建议",
+                  "codeExample": {
+                    "before": "旧版本用法",
+                    "after": "新版本用法"
+                  }
+                }
+              ],
+              "excelRows": [
+                {
+                  "version": "版本号",
+                  "changepoint": "标题",
+                  "chinese": "描述",
+                  "function": "场景",
+                  "suggestion": "排查点",
+                  "risk": "高/中/低",
+                  "test_suggestion": "测试建议",
+                  "code_discovery": "涉及类/关键字",
+                  "code_fix": "整改建议",
+                  "related_commits": "#12345"
+                }
+              ]
+            }
+
+            注意：严禁遗漏任何条目。如果输入内容为空或无效，请在 summary 中说明。
+          `;
+        } else {
+          // Generic prompt for other analysis types (diff, batch, etc.)
+          prompt = changeLog;
+        }
+
+        console.log(`[Gemini] Sending request: Type=${type}, ContentLength=${changeLog?.length || 0}`);
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text();
+        console.log(`[Gemini] Received response text length: ${responseText.length}`);
+        res.json({ text: responseText });
+      } else {
+        res.status(501).json({ message: "Server-side analysis for this provider is not implemented yet." });
+      }
+    } catch (error: any) {
+      console.error("Server-side Analysis Error:", error);
+      
+      let errorMessage = error.message || "未知错误";
+      let statusCode = 500;
+
+      if (errorMessage.includes("API key not valid") || errorMessage.includes("API_KEY_INVALID")) {
+        errorMessage = "API Key 无效。对于 Gemini，请确保您使用的是有效的 Google AI Studio Key。";
+        statusCode = 401;
+      } else if (errorMessage.includes("quota") || errorMessage.includes("429") || errorMessage.includes("RESOURCE_EXHAUSTED")) {
+        errorMessage = "API 配额已耗尽或请求过于频繁。请稍后再试。";
+        statusCode = 429;
+      } else if (errorMessage.includes("safety")) {
+        errorMessage = "请求内容被安全过滤器拦截。请尝试调整输入内容。";
+        statusCode = 400;
+      }
+
+      res.status(statusCode).json({ 
+        message: errorMessage,
+        rawError: error.message
+      });
+    }
+  });
+
   // Proxy for external AI APIs
   app.post("/api/ai-proxy", async (req, res) => {
     try {

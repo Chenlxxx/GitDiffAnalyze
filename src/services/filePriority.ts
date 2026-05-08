@@ -72,6 +72,7 @@ export function getFilePriorityScore(file: FileChange): number {
  * Sorts files by their priority score.
  */
 export function sortFilesByPriority(files: FileChange[]): FileChange[] {
+  if (!files || !Array.isArray(files)) return [];
   return [...files].sort((a, b) => {
     const scoreA = getFilePriorityScore(a);
     const scoreB = getFilePriorityScore(b);

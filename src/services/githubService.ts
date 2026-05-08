@@ -25,18 +25,62 @@ export class GitHubService {
   }
 
   static async getReleaseByTag(owner: string, repo: string, tag: string): Promise<GitHubRelease | null> {
-    try {
-      const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases/tags/${tag}`);
-      return response.data;
-    } catch (e: any) {
-      if (e.response?.status === 404) return null;
-      throw e;
+    const attempts = [
+      tag,                                   // 原始输入的 tag
+      tag.startsWith('v') ? tag : `v${tag}`,   // 常见的 v1.0.0 格式
+      tag.replace(/^v/, ''),                 // 去掉 v 的纯版本号
+      `${repo}-${tag}`,                      // Netty 风格: netty-4.1.133.Final
+    ];
+    
+    // 如果 tag 包含了完整的 netty-4.1.133.Final，我们也尝试提取中间的版本号
+    if (tag.includes('-')) {
+      const parts = tag.split('-');
+      const lastPart = parts[parts.length - 1];
+      if (!attempts.includes(lastPart)) attempts.push(lastPart);
     }
+
+    // 唯一化并过滤
+    const uniqueTags = [...new Set(attempts)].filter(Boolean);
+
+    for (const t of uniqueTags) {
+      try {
+        const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases/tags/${t}`);
+        if (response.data && response.data.body) {
+          return response.data;
+        }
+      } catch (e: any) {
+        if (e.response?.status === 404) continue;
+        console.warn(`Failed to fetch release for tag ${t}:`, e.message);
+      }
+    }
+
+    // 最后的挣扎：列出最近的 releases 并尝试模糊匹配
+    try {
+      const releases = await this.getReleases(owner, repo);
+      const match = releases.find(r => 
+        r.tag_name.includes(tag) || tag.includes(r.tag_name)
+      );
+      if (match) return match;
+    } catch (e) {}
+
+    return null;
   }
 
-  static async getTags(owner: string, repo: string): Promise<{ name: string }[]> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags?per_page=100`);
-    return response.data;
+  static async getTags(owner: string, repo: string, pages: number = 10): Promise<{ name: string }[]> {
+    let allTags: { name: string }[] = [];
+    for (let i = 1; i <= pages; i++) {
+        try {
+            const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags?per_page=100&page=${i}`);
+            if (response.data && response.data.length > 0) {
+                allTags = [...allTags, ...response.data];
+            } else {
+                break;
+            }
+        } catch (e) {
+            break;
+        }
+    }
+    return allTags;
   }
 
   static async compareCommits(owner: string, repo: string, base: string, head: string): Promise<{ commits: any[], files: any[], html_url: string }> {
