@@ -35,4 +35,4 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 
 - 本工具仅基于提供的文本内容（Diff、Commits、Release Notes）进行静态分析，不执行实际代码。
 - 建议在分析大型仓库时，尽量缩小版本跨度，以获得更详细的分析结果。
-- 如果遇到 API 速率限制，请尝试在设置中配置您的专属 API Key。
+- 如果遇到 GitHub API 速率限制（403），请在页面右上角设置中配置 GitHub Token（无需勾选任何权限，限额从 60 次/小时提升至 5000 次/小时），或在 `.env` 中配置 `GITHUB_TOKEN` 后重启服务。

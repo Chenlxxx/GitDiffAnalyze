@@ -34,7 +34,7 @@ import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
-import { buildAnalysisBundleFromChangeLog } from './services/skillBundleGenerator';
+import { buildAnalysisBundleFromChangeLog, buildAnalysisBundleFromFullDiff } from './services/skillBundleGenerator';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -56,15 +56,31 @@ export default function App() {
   const [toVersion, setToVersion] = useState('v5.5');
   const [projectBackground, setProjectBackground] = useState('平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
   
-  // AI Config
-  const [aiConfig, setAiConfig] = useState<AIConfig>({
+  // AI Config（与 GitHub Token 一起持久化在 localStorage）
+  const SETTINGS_STORAGE_KEY = 'diffanalyze-settings';
+  const loadSavedSettings = (): { aiConfig?: AIConfig; githubToken?: string } => {
+    try {
+      return JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
+    } catch {
+      return {};
+    }
+  };
+  const [aiConfig, setAiConfig] = useState<AIConfig>(() => loadSavedSettings().aiConfig || {
     provider: 'openai-compatible',
     apiKey: '',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     model: 'qwen-plus',
     useProxy: true
   });
+  const [githubToken, setGithubToken] = useState<string>(() => loadSavedSettings().githubToken || '');
   const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    GitHubService.setToken(githubToken);
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ aiConfig, githubToken }));
+    } catch {}
+  }, [aiConfig, githubToken]);
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);
@@ -287,8 +303,8 @@ export default function App() {
             const status = err.response?.status || compareErr.response?.status;
             const errorData = compareErr.response?.data || err.response?.data;
             
-            if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
-              const suggestion = errorData.suggestion || '请在设置中配置 GitHub Token 以提高限制。';
+            if (status === 403 && (errorData?.message?.includes('rate limit') || errorData?.message?.includes('速率限制'))) {
+              const suggestion = errorData.suggestion || '请点击右上角设置图标，配置 GitHub Token（无需勾选任何权限）以将限额从 60 次/小时提升至 5000 次/小时。';
               throw new Error(`GitHub API 速率限制已达到。${suggestion}`);
             } else if (status === 404) {
               throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。这通常是因为：\n1. 版本号输入错误\n2. 该版本在 GitHub 上既不是 Release 也不是 Tag\n3. 仓库地址错误\n\n当前尝试匹配的 Tag 为: ${actualToTag}`);
@@ -698,17 +714,32 @@ export default function App() {
     setError(null);
     setChangeLogAnalysis(null);
     setFullDiffAnalysis(null);
+    setPreparedSkillBundle(null);
     setDiffAnalyses({});
     setStep('analyzing-full-diff');
 
     try {
       const analysis = await performFullDiffAnalysis(repoUrl, fromVersion, toVersion, projectBackground);
-      
+
       if (analysis.resolvedTags) {
         setResolvedTags(analysis.resolvedTags);
       }
 
       setFullDiffAnalysis(analysis);
+
+      // 预先准备好 Skill Bundle，避免下载时再次调用 AI
+      try {
+        const bundle = buildAnalysisBundleFromFullDiff(
+          analysis,
+          repoUrl,
+          fromVersion,
+          toVersion,
+          projectBackground
+        );
+        setPreparedSkillBundle(bundle);
+      } catch (bundleErr) {
+        console.error('Failed to prepare skill bundle:', bundleErr);
+      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || '深度分析过程中发生错误');
@@ -1181,6 +1212,17 @@ export default function App() {
                   </div>
                 </>
               )}
+              <div className="space-y-2">
+                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub Token</label>
+                <input
+                  type="password"
+                  value={githubToken}
+                  onChange={(e) => setGithubToken(e.target.value)}
+                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
+                  placeholder="可选，ghp_ 或 github_pat_ 开头"
+                />
+                <p className="text-[10px] text-black/30 mt-1">未配置时匿名访问 GitHub（仅 60 次/小时，极易触发 403 限流）。配置后提升至 5000 次/小时，Token 无需勾选任何权限。</p>
+              </div>
             </div>
           </div>
         )}
@@ -1365,7 +1407,23 @@ export default function App() {
                   {batchItems.map((item, idx) => (
                     <div 
                       key={idx} 
-                      onClick={() => item.status === 'completed' && item.analysis && setFullDiffAnalysis(item.analysis)}
+                      onClick={() => {
+                        if (item.status !== 'completed' || !item.analysis) return;
+                        setFullDiffAnalysis(item.analysis);
+                        // 切换批量结果时同步重建 Skill Bundle，避免下载到上一个项目的内容
+                        try {
+                          setPreparedSkillBundle(buildAnalysisBundleFromFullDiff(
+                            item.analysis,
+                            item.repoUrl,
+                            item.fromVersion,
+                            item.toVersion,
+                            projectBackground
+                          ));
+                        } catch (bundleErr) {
+                          console.error('Failed to prepare skill bundle:', bundleErr);
+                          setPreparedSkillBundle(null);
+                        }
+                      }}
                       className={cn(
                         "flex items-center justify-between p-4 bg-[#F9F9F9] rounded-xl border border-black/5 transition-all",
                         item.status === 'completed' && item.analysis ? "cursor-pointer hover:bg-black/[0.02] hover:border-emerald-500/30" : ""
@@ -1449,6 +1507,16 @@ export default function App() {
                         {excelLoading ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
                         下载 Excel 报告
                       </button>
+                      {preparedSkillBundle && (
+                        <button
+                          onClick={handleDownloadSkill}
+                          disabled={skillLoading}
+                          className="flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 border border-blue-100 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all disabled:opacity-50"
+                        >
+                          {skillLoading ? <Loader2 className="animate-spin" size={14} /> : <FileArchive size={14} />}
+                          下载 Skill
+                        </button>
+                      )}
                       <div className="flex items-center gap-2">
                         <span className={cn(
                           "px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border",

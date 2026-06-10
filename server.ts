@@ -3,6 +3,44 @@ import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import path from "path";
 
+// GitHub GET 响应内存缓存：减少重复请求对速率配额的消耗
+// （匿名限额 60 次/小时，一轮分析的 tag 探测 + 翻页就可能耗尽）
+const githubCache = new Map<string, { status: number; data: any; ts: number }>();
+const GITHUB_CACHE_TTL_MS = 10 * 60 * 1000;
+const GITHUB_CACHE_MAX_ENTRIES = 300;
+const GITHUB_CACHE_MAX_VALUE_SIZE = 5 * 1024 * 1024;
+
+function githubCacheGet(key: string) {
+  const hit = githubCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > GITHUB_CACHE_TTL_MS) {
+    githubCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function githubCacheSet(key: string, status: number, data: any) {
+  try {
+    const size = typeof data === 'string' ? data.length : JSON.stringify(data).length;
+    if (size > GITHUB_CACHE_MAX_VALUE_SIZE) return;
+  } catch {
+    return;
+  }
+  if (githubCache.size >= GITHUB_CACHE_MAX_ENTRIES) {
+    const oldest = githubCache.keys().next().value;
+    if (oldest !== undefined) githubCache.delete(oldest);
+  }
+  githubCache.set(key, { status, data, ts: Date.now() });
+}
+
+function rateLimitResetHint(headers: any): string {
+  const reset = headers?.['x-ratelimit-reset'];
+  if (!reset) return '';
+  const minutes = Math.max(1, Math.ceil((parseInt(reset, 10) * 1000 - Date.now()) / 60000));
+  return `配额将在约 ${minutes} 分钟后重置。`;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -13,6 +51,7 @@ async function startServer() {
   // GitHub API Proxy
   app.get("/api/github/*", async (req, res) => {
     let url = "";
+    let cacheKey = "";
     try {
       const githubPath = req.params[0] || "";
       const query = new URLSearchParams(req.query as any).toString();
@@ -35,29 +74,43 @@ async function startServer() {
       } else if (process.env.GITHUB_TOKEN) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
-      
+
+      // 命中缓存则不消耗 GitHub 配额（缓存按认证身份隔离）
+      cacheKey = `${headers['Authorization'] || 'anon'}|${headers['Accept']}|${url}`;
+      const cached = githubCacheGet(cacheKey);
+      if (cached) {
+        console.log(`[cache hit] ${url}`);
+        return res.status(cached.status).json(cached.data);
+      }
+
       const response = await axios.get(url, { headers });
-      
+
+      githubCacheSet(cacheKey, 200, response.data);
       res.json(response.data);
     } catch (error: any) {
       const status = error.response?.status;
       const errorData = error.response?.data;
-      
+
       if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
         console.warn(`GitHub API Rate Limit Exceeded for ${url || req.originalUrl}`);
+        const hasAuth = !!(req.headers['authorization'] || process.env.GITHUB_TOKEN);
         return res.status(403).json({
-          message: 'GitHub API 速率限制已达到。',
+          message: `GitHub API 速率限制已达到。${rateLimitResetHint(error.response?.headers)}`,
           details: errorData,
-          suggestion: 'GitHub 限制了未授权的 API 请求。请稍后再试，或在平台环境变量中配置 GITHUB_TOKEN。'
+          suggestion: hasAuth
+            ? '当前 Token 的配额已用尽，请稍后再试或更换 Token。'
+            : '匿名访问限额仅 60 次/小时。请点击页面右上角设置图标填入 GitHub Token（无需勾选任何权限，限额提升至 5000 次/小时），或在 .env 中配置 GITHUB_TOKEN。'
         });
       }
 
       if (status === 404) {
         console.warn(`GitHub Resource Not Found (404): ${url || req.originalUrl}`);
+        // 404 同样消耗配额，短期缓存避免 tag 变体探测反复打到上游
+        if (cacheKey) githubCacheSet(cacheKey, 404, errorData || { message: 'Not Found' });
       } else {
         console.error('GitHub Proxy Error:', JSON.stringify(errorData || error.message));
       }
-      
+
       res.status(status || 500).json(errorData || { message: error.message });
     }
   });
@@ -86,8 +139,11 @@ async function startServer() {
         'Upgrade-Insecure-Requests': '1'
       };
 
-      // Use token from environment if available
-      if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
+      // Use token from client if provided, otherwise fallback to environment
+      const clientAuth = req.headers['authorization'];
+      if (clientAuth && url.includes('github.com')) {
+        headers['Authorization'] = clientAuth;
+      } else if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
 
@@ -96,7 +152,15 @@ async function startServer() {
     } catch (error: any) {
       const status = error.response?.status;
       console.error(`GitHub Raw Proxy Error (${status}):`, error.message);
-      res.status(status || 500).send(error.message);
+
+      if (status === 403 || status === 429) {
+        return res.status(status).json({
+          message: `GitHub 拒绝了 Diff 请求 (${status})，通常是速率限制。${rateLimitResetHint(error.response?.headers)}`,
+          suggestion: '请点击页面右上角设置图标填入 GitHub Token（无需勾选任何权限），或稍后再试。'
+        });
+      }
+
+      res.status(status || 500).json({ message: error.message });
     }
   });
 
