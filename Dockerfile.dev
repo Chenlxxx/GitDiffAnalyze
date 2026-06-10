@@ -1,0 +1,11 @@
+FROM node:22-bookworm
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# 3000: Express + Vite middleware; 24678: Vite HMR websocket (standalone in middleware mode)
+EXPOSE 3000 24678
+
+CMD ["npm", "run", "dev:docker"]
