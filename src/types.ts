@@ -8,6 +8,50 @@ export interface AIConfig {
   useProxy: boolean;
 }
 
+// ===== 多模型供应商配置（Dify 风格） =====
+
+/** 接口协议：决定请求格式与鉴权方式 */
+export type ModelProtocol = 'openai' | 'anthropic' | 'gemini';
+
+/** 用户配置的一个模型供应商实例 */
+export interface ModelProviderConfig {
+  id: string;
+  /** 对应 providerPresets 中的预置厂商，自定义为 custom-openai / custom-anthropic */
+  presetId: string;
+  displayName: string;
+  protocol: ModelProtocol;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  useProxy: boolean;
+  enabled: boolean;
+  /** 最近一次连通性测试结果 */
+  lastTest?: {
+    ok: boolean;
+    message: string;
+    latencyMs?: number;
+    at: string;
+  };
+}
+
+export interface AppSettings {
+  version: 2;
+  providers: ModelProviderConfig[];
+  activeProviderId: string | null;
+  githubToken: string;
+}
+
+/** ModelProviderConfig -> 旧版 AIConfig，供现有 getAIProvider 路由复用 */
+export function toLegacyAIConfig(p: ModelProviderConfig): AIConfig {
+  return {
+    provider: p.protocol === 'openai' ? 'openai-compatible' : p.protocol,
+    apiKey: p.apiKey,
+    baseUrl: p.baseUrl || undefined,
+    model: p.model,
+    useProxy: p.useProxy
+  };
+}
+
 export interface ChangeLogAnalysis {
   items: {
     title: string;

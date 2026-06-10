@@ -164,6 +164,73 @@ async function startServer() {
     }
   });
 
+  // 模型连通性测试：按协议发一次最小请求，验证 baseUrl / apiKey / model 是否可用
+  app.post("/api/ai/test-connection", async (req, res) => {
+    const { protocol, baseUrl, apiKey, model } = req.body || {};
+    if (!protocol || !apiKey || !model) {
+      return res.status(400).json({ ok: false, message: '缺少必要参数（protocol / apiKey / model）' });
+    }
+    const started = Date.now();
+    try {
+      if (protocol === 'openai') {
+        const base = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+        const url = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
+        await axios.post(url, {
+          model,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1
+        }, {
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else if (protocol === 'anthropic') {
+        const base = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+        const url = base.endsWith('/messages') ? base : `${base}/v1/messages`;
+        await axios.post(url, {
+          model,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'ping' }]
+        }, {
+          headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else if (protocol === 'gemini') {
+        const base = (baseUrl || 'https://generativelanguage.googleapis.com').replace(/\/$/, '');
+        const url = `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        await axios.post(url, {
+          contents: [{ parts: [{ text: 'ping' }] }],
+          generationConfig: { maxOutputTokens: 1 }
+        }, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else {
+        return res.status(400).json({ ok: false, message: `不支持的协议: ${protocol}` });
+      }
+
+      res.json({ ok: true, latencyMs: Date.now() - started, message: '连接成功' });
+    } catch (error: any) {
+      const status = error.response?.status;
+      const detail = error.response?.data;
+      let message = error.message;
+      if (error.code === 'ECONNABORTED') message = '连接超时（15 秒），请检查 Base URL 或网络';
+      else if (status === 401 || status === 403) message = 'API Key 无效或无权限';
+      else if (status === 404) message = '接口或模型不存在，请检查 Base URL 与模型名称';
+      else if (status === 429) message = 'Key 有效，但当前触发限流/配额不足';
+      else if (detail?.error?.message) message = detail.error.message;
+      else if (detail?.message) message = detail.message;
+
+      // 429 说明鉴权与路由都通了，视为连通
+      const reachableButThrottled = status === 429;
+      res.status(reachableButThrottled ? 200 : (status || 500)).json({
+        ok: reachableButThrottled,
+        latencyMs: Date.now() - started,
+        message,
+        httpStatus: status
+      });
+    }
+  });
+
   // AI Analysis Proxy (Server-side execution for security and stability)
   app.post("/api/ai/analyze-changelog", async (req, res) => {
     try {
@@ -214,8 +281,8 @@ async function startServer() {
         const { GoogleGenerativeAI } = await import("@google/generative-ai");
         const genAI = new GoogleGenerativeAI(apiKey);
         
-        // Use gemini-2.0-flash for best performance/speed balance
-        const modelName = "gemini-2.0-flash"; 
+        // Use the user-configured model, falling back to gemini-2.0-flash
+        const modelName = (config && typeof config.model === 'string' && config.model.startsWith('gemini')) ? config.model : "gemini-2.0-flash";
         const model = genAI.getGenerativeModel({ 
           model: modelName, 
           generationConfig: {

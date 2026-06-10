@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Github, 
   ArrowRight, 
@@ -29,7 +29,8 @@ import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, SkillBundle } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
+import { ModelSettings } from './components/ModelSettings';
 import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
@@ -56,31 +57,57 @@ export default function App() {
   const [toVersion, setToVersion] = useState('v5.5');
   const [projectBackground, setProjectBackground] = useState('平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
   
-  // AI Config（与 GitHub Token 一起持久化在 localStorage）
+  // 模型供应商配置（v2：多供应商 + GitHub Token，持久化在 localStorage）
   const SETTINGS_STORAGE_KEY = 'diffanalyze-settings';
-  const loadSavedSettings = (): { aiConfig?: AIConfig; githubToken?: string } => {
+  const loadSettings = (): AppSettings => {
+    const empty: AppSettings = { version: 2, providers: [], activeProviderId: null, githubToken: '' };
     try {
-      return JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
+      const raw = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
+      if (raw.version === 2 && Array.isArray(raw.providers)) {
+        return { ...empty, ...raw };
+      }
+      // v1 -> v2 迁移：旧版单一 aiConfig 转为一个供应商条目
+      if (raw.aiConfig && raw.aiConfig.apiKey) {
+        const legacy = raw.aiConfig;
+        const protocol: ModelProtocol = legacy.provider === 'openai-compatible' ? 'openai' : legacy.provider;
+        const migrated: ModelProviderConfig = {
+          id: 'migrated-v1',
+          presetId: protocol === 'gemini' ? 'gemini' : (protocol === 'anthropic' ? 'custom-anthropic' : 'custom-openai'),
+          displayName: '旧版配置（自动迁移）',
+          protocol,
+          baseUrl: legacy.baseUrl || '',
+          apiKey: legacy.apiKey || '',
+          model: legacy.model || '',
+          useProxy: legacy.useProxy !== false,
+          enabled: true
+        };
+        return { version: 2, providers: [migrated], activeProviderId: migrated.id, githubToken: raw.githubToken || '' };
+      }
+      return { ...empty, githubToken: raw.githubToken || '' };
     } catch {
-      return {};
+      return empty;
     }
   };
-  const [aiConfig, setAiConfig] = useState<AIConfig>(() => loadSavedSettings().aiConfig || {
-    provider: 'openai-compatible',
-    apiKey: '',
-    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen-plus',
-    useProxy: true
-  });
-  const [githubToken, setGithubToken] = useState<string>(() => loadSavedSettings().githubToken || '');
+  const initialSettings = useMemo(loadSettings, []);
+  const [providers, setProviders] = useState<ModelProviderConfig[]>(initialSettings.providers);
+  const [activeProviderId, setActiveProviderId] = useState<string | null>(initialSettings.activeProviderId);
+  const [githubToken, setGithubToken] = useState<string>(initialSettings.githubToken);
   const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     GitHubService.setToken(githubToken);
     try {
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ aiConfig, githubToken }));
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ version: 2, providers, activeProviderId, githubToken }));
     } catch {}
-  }, [aiConfig, githubToken]);
+  }, [providers, activeProviderId, githubToken]);
+
+  const activeProvider = providers.find(p => p.id === activeProviderId) || null;
+  /** 所有分析入口统一取当前激活的供应商；未配置时抛出可操作的错误提示 */
+  const requireAIConfig = (): AIConfig => {
+    if (!activeProvider) throw new Error('尚未配置 AI 模型。请点击右上角设置图标，添加模型供应商并填写 API Key。');
+    if (!activeProvider.apiKey) throw new Error(`模型「${activeProvider.displayName}」未填写 API Key，请在设置中补全。`);
+    return toLegacyAIConfig(activeProvider);
+  };
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);
@@ -318,7 +345,7 @@ export default function App() {
     }
 
       // 2. Analyze Change Log with Selected AI
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
       
       if (!releaseBody || releaseBody.trim().length === 0) {
         throw new Error(`未能找到从 ${actualFromTag} 到 ${actualToTag} 的 Release Note 内容。该项目可能没有在 GitHub Releases 中维护详细日志。建议尝试使用【全量比较 (Diff) 模式】进行分析，它会直接分析代码提交差异。`);
@@ -444,7 +471,7 @@ export default function App() {
         }
       }
 
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
 
       if (strategy.mode === 'multi_batch_full_diff') {
         // 3. Multi-batch analysis logic
@@ -668,7 +695,7 @@ export default function App() {
         .join('\n\n');
       diff = patches || '由于差异提取失败，已降级为基于元数据的概览分析。';
 
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
       const analysis = await provider.analyzeFullDiff(
         diff, 
         background, 
@@ -952,7 +979,7 @@ export default function App() {
       const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber);
       const diff = await GitHubService.getDiff(pr.diff_url);
       
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
       const analysis = await provider.analyzeDiff(diff, pr.title, projectBackground);
       setDiffAnalyses(prev => ({ ...prev, [prNumber]: analysis }));
     } catch (err: any) {
@@ -1123,9 +1150,12 @@ export default function App() {
             >
               <Settings size={20} />
             </button>
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 rounded-full text-xs font-medium border border-emerald-100">
-              <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-              {aiConfig.provider === 'gemini' ? 'Gemini 3.1 Pro' : aiConfig.model} 已就绪
+            <div className={cn(
+              "hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium border",
+              activeProvider ? "bg-emerald-50 text-emerald-700 border-emerald-100" : "bg-amber-50 text-amber-700 border-amber-100"
+            )}>
+              <div className={cn("w-1.5 h-1.5 rounded-full animate-pulse", activeProvider ? "bg-emerald-500" : "bg-amber-500")} />
+              {activeProvider ? `${activeProvider.displayName} · ${activeProvider.model} 已就绪` : '未配置模型，请打开设置'}
             </div>
           </div>
         </div>
@@ -1134,97 +1164,14 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-12">
         {/* Settings Panel */}
         {showSettings && (
-          <div className="mb-12 bg-white rounded-3xl p-8 shadow-sm border border-black/5 animate-in fade-in slide-in-from-top-4">
-            <div className="flex items-center gap-2 mb-6">
-              <Cpu size={20} className="text-emerald-500" />
-              <h2 className="text-xl font-bold">AI 模型配置</h2>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">AI 提供商</label>
-                  <select 
-                    value={aiConfig.provider}
-                    onChange={(e) => {
-                      const newProvider = e.target.value as any;
-                      let newConfig = { ...aiConfig, provider: newProvider };
-                      
-                      if (newProvider === 'anthropic') {
-                        newConfig.baseUrl = 'https://api.nengpa.com/anthropic';
-                        newConfig.model = 'MiniMax-M2.5';
-                        newConfig.apiKey = 'sk-cp-33559ebabc72ac5e103c00ae6baa8dd49bd971c449dd599e7b5f327fc8626b29';
-                      } else if (newProvider === 'openai-compatible') {
-                        newConfig.baseUrl = 'https://api.openai.com/v1';
-                        newConfig.model = 'gpt-4o';
-                      }
-                      
-                      setAiConfig(newConfig);
-                    }}
-                    className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  >
-                  <option value="gemini">Google Gemini</option>
-                  <option value="openai-compatible">OpenAI 兼容 (豆包/Qwen/DeepSeek)</option>
-                  <option value="anthropic">Anthropic (MiniMax-M2.5)</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">API Key</label>
-                <input 
-                  type="password" 
-                  value={aiConfig.apiKey}
-                  onChange={(e) => setAiConfig({...aiConfig, apiKey: e.target.value})}
-                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  placeholder={aiConfig.provider === 'gemini' ? '可选 (默认使用系统 Key)' : '请输入 API Key'}
-                />
-              </div>
-              <div className="space-y-2 flex flex-col justify-end pb-1">
-                <label className="flex items-center gap-2 cursor-pointer group">
-                  <input 
-                    type="checkbox" 
-                    checked={aiConfig.useProxy}
-                    onChange={(e) => setAiConfig({...aiConfig, useProxy: e.target.checked})}
-                    className="w-5 h-5 rounded-lg border-black/10 text-emerald-500 focus:ring-emerald-500/20 transition-all"
-                  />
-                  <span className="text-sm font-bold text-black/60 group-hover:text-black transition-colors">使用代理模式</span>
-                </label>
-                <p className="text-[10px] text-black/30 mt-1">在静态托管环境（如 Cloudflare Pages）下建议关闭此项。</p>
-              </div>
-              {(aiConfig.provider === 'openai-compatible' || aiConfig.provider === 'anthropic') && (
-                <>
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">Base URL</label>
-                    <input 
-                      type="text" 
-                      value={aiConfig.baseUrl}
-                      onChange={(e) => setAiConfig({...aiConfig, baseUrl: e.target.value})}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder={aiConfig.provider === 'anthropic' ? 'https://api.nengpa.com/anthropic' : 'https://api.openai.com/v1'}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">模型名称</label>
-                    <input 
-                      type="text" 
-                      value={aiConfig.model}
-                      onChange={(e) => setAiConfig({...aiConfig, model: e.target.value})}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder={aiConfig.provider === 'anthropic' ? 'MiniMax-M2.5' : 'gpt-4o / qwen-max'}
-                    />
-                  </div>
-                </>
-              )}
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">GitHub Token</label>
-                <input
-                  type="password"
-                  value={githubToken}
-                  onChange={(e) => setGithubToken(e.target.value)}
-                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  placeholder="可选，ghp_ 或 github_pat_ 开头"
-                />
-                <p className="text-[10px] text-black/30 mt-1">未配置时匿名访问 GitHub（仅 60 次/小时，极易触发 403 限流）。配置后提升至 5000 次/小时，Token 无需勾选任何权限。</p>
-              </div>
-            </div>
-          </div>
+          <ModelSettings
+            providers={providers}
+            activeProviderId={activeProviderId}
+            onProvidersChange={setProviders}
+            onActiveChange={setActiveProviderId}
+            githubToken={githubToken}
+            onGithubTokenChange={setGithubToken}
+          />
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
