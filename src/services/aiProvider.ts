@@ -69,7 +69,12 @@ async function streamChatCompletion(
 
 function stripThinking(content: string): string {
   if (content && typeof content === 'string') {
-    return content.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
+    // 推理模型（MiniMax-M 系列、DeepSeek-R1、QwQ 等）会在正文输出思考块，
+    // 其中几乎必然包含花括号，会干扰 JSON 提取，必须先剔除
+    let out = content.replace(/<(think|thought|thinking|reasoning)>[\s\S]*?<\/\1>/gi, '');
+    // 孤立的闭合标签（流式拼接或开头被截断时出现）：丢弃它之前的全部内容
+    out = out.replace(/^[\s\S]*?<\/(think|thought|thinking|reasoning)>/i, '');
+    return out.trim();
   }
   return content;
 }
@@ -359,7 +364,12 @@ function parseJSON(text: string): any {
   if (!text || !String(text).trim()) {
     throw new Error('模型返回了空响应（可能被限流、输入超长被拒或网关异常），请重试或更换模型。');
   }
-  let cleanText = text.trim();
+  // 剔除推理模型的思考块；若剔除后为空，说明思考耗尽了 max_tokens、没输出结果
+  const stripped = stripThinking(text.trim());
+  if (!stripped) {
+    throw new Error('模型只输出了思考过程，没有给出结果（推理类模型的思考可能耗尽了输出长度限制）。请重试、缩小分析范围，或换用非推理模型。');
+  }
+  let cleanText = stripped;
   
   const tryParse = (str: string) => {
     if (!str) return null;
@@ -443,7 +453,7 @@ function parseJSON(text: string): any {
   }
   
   console.error("Failed to parse JSON from AI response. Original text summary:", cleanText.substring(0, 500) + "...");
-  throw new Error("无法解析 AI 返回的 JSON 数据。这通常是因为内容过长或包含非法字符。已尝试自动修复但失败，请尝试缩小分析范围。");
+  throw new Error("无法解析 AI 返回的 JSON 数据。常见原因：输出被长度限制截断（推理类模型如 MiniMax-M / DeepSeek-R1 的思考会占用输出额度）、或模型未按要求输出 JSON。已尝试自动修复但失败，请重试、缩小分析范围或换用非推理模型。");
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 3, initialDelay: number = 2000): Promise<T> {
