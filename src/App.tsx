@@ -1645,15 +1645,15 @@ export default function App() {
                           {item.commitLinks && item.commitLinks.length > 0 && (
                             <div className="mb-4 flex flex-wrap gap-2">
                               {item.commitLinks.map((link, lIdx) => (
-                                <a 
+                                <a
                                   key={lIdx}
-                                  href={link.url}
+                                  href={link?.url || '#'}
                                   target="_blank"
                                   rel="noreferrer"
                                   className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 border border-black/5 rounded text-[10px] font-mono text-black/60 transition-colors"
                                 >
                                   <GitCommit size={10} />
-                                  {link.sha.substring(0, 7)}
+                                  {String(link?.sha || 'commit').substring(0, 7)}
                                 </a>
                               ))}
                             </div>

@@ -223,6 +223,54 @@ function normalizeAIResponse(result: any): any {
     }
   });
 
+  // 7. Sanitize render-facing fields: 模型可能把字符串字段返回成嵌套对象、
+  // 把 commitLinks 返回成字符串数组，直接渲染会让 React 整树崩溃（白屏）
+  const toText = (v: any): string => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+  };
+
+  result.summary = toText(result.summary);
+  (['recommendations', 'breakingChanges', 'compatibilityNotes'] as const).forEach(field => {
+    result[field] = result[field].map((entry: any) => toText(entry)).filter(Boolean);
+  });
+
+  result.items = result.items.map((item: any) => {
+    if (typeof item !== 'object' || item === null) {
+      const text = toText(item);
+      return { title: text, description: text, reason: text, impactLevel: 'Low', riskLevel: 'Low', commitLinks: [] };
+    }
+    let codeExample: { before: string; after: string } | undefined;
+    if (item.codeExample) {
+      codeExample = typeof item.codeExample === 'string'
+        ? { before: '', after: item.codeExample }
+        : { before: toText(item.codeExample.before), after: toText(item.codeExample.after) };
+      if (!codeExample.before && !codeExample.after) codeExample = undefined;
+    }
+    const commitLinks = (Array.isArray(item.commitLinks) ? item.commitLinks : []).map((link: any) => {
+      if (typeof link === 'string') {
+        const sha = (link.match(/[0-9a-f]{7,40}/i) || [''])[0];
+        return { sha: sha || link.slice(0, 12), url: /^https?:\/\//.test(link) ? link : '' };
+      }
+      if (link && typeof link === 'object') {
+        return { sha: toText(link.sha || link.id) || 'commit', url: toText(link.url || link.html_url) };
+      }
+      return null;
+    }).filter((l: any) => l && l.url);
+    return {
+      ...item,
+      title: toText(item.title) || '未知变更',
+      description: toText(item.description),
+      reason: toText(item.reason),
+      compatibilityAnalysis: toText(item.compatibilityAnalysis),
+      sourceSnippet: toText(item.sourceSnippet),
+      codeExample,
+      commitLinks
+    };
+  });
+
   return result;
 }
 
