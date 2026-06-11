@@ -19,6 +19,8 @@ interface ModelSettingsProps {
   onActiveChange: (id: string | null) => void;
   githubToken: string;
   onGithubTokenChange: (token: string) => void;
+  streamingEnabled: boolean;
+  onStreamingChange: (enabled: boolean) => void;
 }
 
 const inputCls = "w-full px-4 py-2.5 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm";
@@ -32,7 +34,8 @@ const PROTOCOL_BADGES: Record<string, string> = {
 
 export function ModelSettings({
   providers, activeProviderId, onProvidersChange, onActiveChange,
-  githubToken, onGithubTokenChange
+  githubToken, onGithubTokenChange,
+  streamingEnabled, onStreamingChange
 }: ModelSettingsProps) {
   const [showAddPicker, setShowAddPicker] = useState(providers.length === 0);
   const [testingIds, setTestingIds] = useState<Set<string>>(new Set());
@@ -280,6 +283,33 @@ export function ModelSettings({
             />
             <p className="text-[10px] text-black/30">
               未配置时匿名访问 GitHub（仅 60 次/小时，极易触发 403 限流）。配置后提升至 5000 次/小时，Token 无需勾选任何权限。
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            <label className={labelCls}>AI 流式输出</label>
+            <button
+              type="button"
+              onClick={() => onStreamingChange(!streamingEnabled)}
+              className={cn(
+                "flex items-center justify-between w-full px-4 py-2.5 rounded-xl border transition-all text-sm",
+                streamingEnabled
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                  : "bg-[#F9F9F9] border-black/5 text-black/50"
+              )}
+            >
+              <span className="font-medium">{streamingEnabled ? '已开启' : '已关闭'}</span>
+              <span className={cn(
+                "relative w-9 h-5 rounded-full transition-colors shrink-0",
+                streamingEnabled ? "bg-emerald-500" : "bg-black/15"
+              )}>
+                <span className={cn(
+                  "absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform",
+                  streamingEnabled && "translate-x-4"
+                )} />
+              </span>
+            </button>
+            <p className="text-[10px] text-black/30">
+              开启后在「处理过程」面板实时显示模型生成内容（changelog / 单次 diff / 聚合阶段）。并行批次阶段仍按批次计数。不支持流式的网关会自动回退。
             </p>
           </div>
         </div>

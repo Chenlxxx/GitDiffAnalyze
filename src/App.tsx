@@ -28,7 +28,7 @@ import {
 import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
-import { getAIProvider } from './services/aiProvider';
+import { getAIProvider, setStreamListener } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
 import { ModelSettings } from './components/ModelSettings';
 import { mapWithConcurrency, splitUnifiedDiffByFile, mergeBatchResultsLocally } from './services/diffUtils';
@@ -109,14 +109,36 @@ export default function App() {
   const [providers, setProviders] = useState<ModelProviderConfig[]>(initialSettings.providers);
   const [activeProviderId, setActiveProviderId] = useState<string | null>(initialSettings.activeProviderId);
   const [githubToken, setGithubToken] = useState<string>(initialSettings.githubToken);
+  const [streamingEnabled, setStreamingEnabled] = useState<boolean>(initialSettings.streamingEnabled !== false);
   const [showSettings, setShowSettings] = useState(false);
 
   useEffect(() => {
     GitHubService.setToken(githubToken);
     try {
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ version: 2, providers, activeProviderId, githubToken }));
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ version: 2, providers, activeProviderId, githubToken, streamingEnabled }));
     } catch {}
-  }, [providers, activeProviderId, githubToken]);
+  }, [providers, activeProviderId, githubToken, streamingEnabled]);
+
+  // AI 流式输出实时预览（仅单路调用阶段：changelog / 单次 full_diff / 聚合）
+  const [streamPreview, setStreamPreview] = useState('');
+  /** 在 fn 执行期间挂载流监听器，把模型实时输出喂给预览区；结束后必定清理 */
+  const runWithStream = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    if (!streamingEnabled) return fn();
+    setStreamPreview('');
+    let lastPaint = 0;
+    setStreamListener(({ full }) => {
+      const now = Date.now();
+      // 节流：快速 token 流下最多约每 80ms 刷新一次，避免高频重渲染卡顿
+      if (now - lastPaint < 80) return;
+      lastPaint = now;
+      setStreamPreview(full.length > 1500 ? '…' + full.slice(-1500) : full);
+    });
+    try {
+      return await fn();
+    } finally {
+      setStreamListener(null);
+    }
+  };
 
   const activeProvider = providers.find(p => p.id === activeProviderId) || null;
   /** 所有分析入口统一取当前激活的供应商；未配置时抛出可操作的错误提示 */
@@ -220,6 +242,7 @@ export default function App() {
     setFullDiffAnalysis(null);
     setDiffAnalyses({});
     setProgressLog([]);
+    setStreamPreview('');
     setStep('analyzing-changelog');
     logStep('release', '获取 Release Notes / Changelog…', 'running');
 
@@ -391,7 +414,7 @@ export default function App() {
 
       logStep('release', `变更日志已获取（${Math.max(1, Math.round(releaseBody.length / 1024))} KB）`, 'done');
       logStep('ai', 'AI 分析变更日志中…', 'running');
-      const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl);
+      const analysis = await runWithStream(() => provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl));
       logStep('ai', 'AI 分析完成', 'done');
       console.log('AI Analysis complete. Raw items count:', analysis.items?.length || 0);
       
@@ -473,6 +496,7 @@ export default function App() {
     if (!repoInfo) throw new Error('Invalid GitHub URL');
 
     setProgressLog([]);
+    setStreamPreview('');
     logStep('tags', `解析版本 tag（${targetFromVersion} → ${targetToVersion}）…`, 'running');
     const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
     logStep('tags', `版本解析完成：${actualFromTag} → ${actualToTag}`, 'done');
@@ -658,13 +682,13 @@ export default function App() {
         logStep('aggregate', 'AI 聚合汇总中…', 'running');
         let finalAnalysis: FullDiffAnalysis;
         try {
-          finalAnalysis = await provider.aggregateBatchResults(
+          finalAnalysis = await runWithStream(() => provider.aggregateBatchResults(
             batchResults,
             background,
             targetFromVersion,
             targetToVersion,
             releaseNotes
-          );
+          ));
           logStep('aggregate', 'AI 聚合完成', 'done');
         } catch (aggErr: any) {
           console.error('AI aggregation failed, falling back to local merge:', aggErr);
@@ -738,16 +762,16 @@ export default function App() {
       logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
       logStep('ai', 'AI 深度分析中…', 'running');
-      const analysis = await provider.analyzeFullDiff(
-        diff, 
-        background, 
-        targetFromVersion, 
-        targetToVersion, 
-        releaseNotes, 
-        commitData.commits, 
+      const analysis = await runWithStream(() => provider.analyzeFullDiff(
+        diff,
+        background,
+        targetFromVersion,
+        targetToVersion,
+        releaseNotes,
+        commitData.commits,
         commitData.files,
         metadata
-      );
+      ));
       logStep('ai', 'AI 深度分析完成', 'done');
 
       // Ensure items is an array before sorting
@@ -803,16 +827,16 @@ export default function App() {
       diff = patches || '由于差异提取失败，已降级为基于元数据的概览分析。';
 
       const provider = getAIProvider(requireAIConfig());
-      const analysis = await provider.analyzeFullDiff(
-        diff, 
-        background, 
-        targetFromVersion, 
-        targetToVersion, 
-        '', 
-        commitData.commits, 
+      const analysis = await runWithStream(() => provider.analyzeFullDiff(
+        diff,
+        background,
+        targetFromVersion,
+        targetToVersion,
+        '',
+        commitData.commits,
         commitData.files,
         metadata
-      );
+      ));
       logStep('ai', 'AI 概览分析完成（降级模式）', 'done');
 
       analysis.analysisMode = metadata.mode;
@@ -1280,6 +1304,8 @@ export default function App() {
             onActiveChange={setActiveProviderId}
             githubToken={githubToken}
             onGithubTokenChange={setGithubToken}
+            streamingEnabled={streamingEnabled}
+            onStreamingChange={setStreamingEnabled}
           />
         )}
 
@@ -1583,6 +1609,15 @@ export default function App() {
                     </div>
                   ))}
                 </div>
+                {loading && streamPreview && (
+                  <div className="mt-2 pt-2 border-t border-black/5">
+                    <div className="flex items-center gap-1.5 text-[10px] text-black/30 mb-1">
+                      <Cpu size={10} className="text-blue-400" />
+                      模型实时输出
+                    </div>
+                    <pre className="text-[10px] leading-relaxed text-black/45 whitespace-pre-wrap break-all max-h-24 overflow-y-auto font-mono bg-black/[0.02] rounded-lg p-2">{streamPreview}</pre>
+                  </div>
+                )}
               </div>
             )}
 

@@ -2,6 +2,78 @@ import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
 import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult, SkillBundle } from "../types";
 
+// ===== 流式输出总线 =====
+// 模块级单监听器：仅在「单路调用」阶段（changelog / 单次 full_diff / 聚合）启用，
+// 并行批次不设监听器，避免 4 路 token 交织。callAI 检测到监听器即走流式传输。
+export type StreamListener = (info: { delta: string; full: string }) => void;
+let activeStreamListener: StreamListener | null = null;
+export function setStreamListener(cb: StreamListener | null) { activeStreamListener = cb; }
+
+/**
+ * 流式消费 OpenAI / Anthropic 协议的 SSE 响应，累积并实时回调 delta，返回完整文本。
+ * useProxy 时打到服务端 /api/ai-proxy-stream 透传端点。
+ */
+async function streamChatCompletion(
+  url: string,
+  data: any,
+  headers: Record<string, string>,
+  useProxy: boolean,
+  onDelta: (delta: string, full: string) => void
+): Promise<string> {
+  const body = { ...data, stream: true };
+  const resp = await fetch(useProxy ? '/api/ai-proxy-stream' : url, {
+    method: 'POST',
+    headers: useProxy ? { 'Content-Type': 'application/json' } : { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(useProxy ? { url, data: body, headers } : body),
+  });
+
+  if (!resp.ok || !resp.body) {
+    let msg = `流式请求失败 (${resp.status})`;
+    try { const j = await resp.json(); msg = j.message || msg; } catch {}
+    throw new Error(msg);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let full = '';
+
+  const handlePayload = (payload: string) => {
+    if (!payload || payload === '[DONE]') return;
+    try {
+      const obj = JSON.parse(payload);
+      // OpenAI 协议
+      const oa = obj.choices?.[0]?.delta?.content;
+      if (typeof oa === 'string' && oa) { full += oa; onDelta(oa, full); return; }
+      // Anthropic 协议
+      if (obj.type === 'content_block_delta' && typeof obj.delta?.text === 'string') {
+        full += obj.delta.text; onDelta(obj.delta.text, full); return;
+      }
+    } catch { /* 忽略非 JSON 的心跳/事件行 */ }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('data:')) handlePayload(trimmed.slice(5).trim());
+    }
+  }
+  if (buffer.trim().startsWith('data:')) handlePayload(buffer.trim().slice(5).trim());
+  return full;
+}
+
+function stripThinking(content: string): string {
+  if (content && typeof content === 'string') {
+    return content.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
+  }
+  return content;
+}
+
 function normalizeAIResponse(result: any): any {
   if (!result) return { items: [], recommendations: [], breakingChanges: [], summary: "" };
 
@@ -465,10 +537,23 @@ export class AnthropicProvider implements AIProvider {
       messages: [{ role: 'user', content: prompt }]
     };
     const headers = { 'x-api-key': this.config.apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
-    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url, 
-      this.config.useProxy ? { url, data, headers } : data, 
+
+    // 有监听器时走流式（Anthropic SSE content_block_delta），失败回退非流式
+    if (activeStreamListener) {
+      const listener = activeStreamListener;
+      try {
+        const full = await streamChatCompletion(url, data, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        if (full && full.trim()) return stripThinking(full);
+        console.warn('Streaming returned empty content, falling back to non-streaming.');
+      } catch (streamErr) {
+        console.warn('Streaming failed, falling back to non-streaming:', streamErr);
+      }
+    }
+
+    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
+      this.config.useProxy ? { url, data, headers } : data,
       { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
-    
+
     const result = response.data;
     if (Array.isArray(result.content)) {
       return result.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
@@ -521,16 +606,27 @@ export class OpenAICompatibleProvider implements AIProvider {
       max_tokens: 8000
     };
     const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
+
+    // 有监听器时走流式：实时回调 token，最终仍返回完整文本供 JSON 解析。
+    // 流式失败或返回空（部分网关不支持 json_object+stream）时回退非流式。
+    if (activeStreamListener) {
+      const listener = activeStreamListener;
+      try {
+        const full = await streamChatCompletion(url, data, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        if (full && full.trim()) return stripThinking(full);
+        console.warn('Streaming returned empty content, falling back to non-streaming.');
+      } catch (streamErr) {
+        console.warn('Streaming failed, falling back to non-streaming:', streamErr);
+      }
+    }
+
     const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
       this.config.useProxy ? { url, data, headers } : data,
       { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
-    
+
     const aiResponse = response.data;
     let content = aiResponse?.choices?.[0]?.message?.content || aiResponse?.choices?.[0]?.text || aiResponse?.text || (typeof aiResponse === 'string' ? aiResponse : null);
-    if (content && typeof content === 'string') {
-      content = content.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
-    }
-    return content;
+    return stripThinking(content);
   }
 
   async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {

@@ -41,6 +41,35 @@ function rateLimitResetHint(headers: any): string {
   return `配额将在约 ${minutes} 分钟后重置。`;
 }
 
+// AI 代理的服务端默认 key 注入：客户端未带鉴权时按目标域名兜底
+function injectAIKey(url: string, headers: any) {
+  const authHeader = headers['Authorization'] || headers['authorization'];
+  const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
+  if (!isAuthEmpty) return;
+  if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
+  } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+  } else if (process.env.OPENAI_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+  } else {
+    console.warn(`AI Proxy: No API key provided by client and no default key found for ${url}`);
+  }
+}
+
+// 把可读流收集为字符串（带上限），用于读取上游错误响应体
+function streamToString(stream: any, maxBytes = 64 * 1024): Promise<string> {
+  return new Promise((resolve) => {
+    let out = '';
+    let len = 0;
+    stream.on('data', (chunk: Buffer) => {
+      if (len < maxBytes) { out += chunk.toString('utf8'); len += chunk.length; }
+    });
+    stream.on('end', () => resolve(out));
+    stream.on('error', () => resolve(out));
+  });
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -388,27 +417,10 @@ async function startServer() {
   app.post("/api/ai-proxy", async (req, res) => {
     try {
       const { url, data, headers } = req.body;
-      
-      // Inject default API keys if missing or empty
-      const authHeader = headers['Authorization'] || headers['authorization'];
-      const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
-      
-      if (isAuthEmpty) {
-        if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
-          console.log('Injected QWEN_API_KEY from environment');
-        } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
-          console.log('Injected OPENAI_API_KEY from environment');
-        } else if (process.env.OPENAI_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
-          console.log('Injected fallback OPENAI_API_KEY from environment');
-        } else {
-          console.warn(`AI Proxy: No API key provided by client and no default key found in environment for ${url}`);
-        }
-      }
 
-      const response = await axios.post(url, data, { 
+      injectAIKey(url, headers);
+
+      const response = await axios.post(url, data, {
         headers,
         timeout: 300000 // 300 seconds timeout for AI generation
       });
@@ -445,10 +457,53 @@ async function startServer() {
         });
       }
       
-      res.status(status || 500).json(errorData || { 
+      res.status(status || 500).json(errorData || {
         message: error.message,
         url: targetUrl
       });
+    }
+  });
+
+  // Streaming proxy: 把上游 AI 的 SSE 流原样透传给浏览器（OpenAI / Anthropic 协议）
+  app.post("/api/ai-proxy-stream", async (req, res) => {
+    const { url, data, headers } = req.body;
+    try {
+      injectAIKey(url, headers);
+
+      const upstream = await axios.post(url, { ...data, stream: true }, {
+        headers,
+        responseType: 'stream',
+        timeout: 300000
+      });
+
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // 禁用反代缓冲，保证逐块下发
+
+      upstream.data.pipe(res);
+      upstream.data.on('error', () => res.end());
+      // 客户端断开时关闭上游，避免空转
+      req.on('close', () => upstream.data.destroy());
+    } catch (error: any) {
+      const status = error.response?.status || 500;
+      let detail = error.message;
+      try {
+        if (error.response?.data && typeof error.response.data.on === 'function') {
+          detail = await streamToString(error.response.data);
+        }
+      } catch {}
+      console.error(`AI Stream Proxy Error (${status}) for ${url}:`, detail);
+      if (!res.headersSent) {
+        const msg = status === 401
+          ? '身份验证失败 (401)。请检查 API Key 是否正确。'
+          : status === 404
+          ? `AI 服务接口未找到 (404)。请检查 Base URL 配置。当前地址: ${url}`
+          : `AI 流式请求失败 (${status})。`;
+        res.status(status).json({ message: msg, details: detail, url });
+      } else {
+        res.end();
+      }
     }
   });
 

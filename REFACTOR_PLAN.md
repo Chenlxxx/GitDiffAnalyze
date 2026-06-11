@@ -49,8 +49,15 @@
 - [x] T4.1 `compat-analyze/` skill：SKILL.md（输入解析→gh api 数据获取→分级分析策略→报告/bundle 输出→可选落地复核）+ references/report-template.md + references/bundle-format.md（与 release-review 互通）
 - [x] T4.2 自测：gh api tag 探测与 compare 命令实测可用（httpcomponents-client rel/v5.4.4...rel/v5.5 = 80 commits/262 files）；实测发现 rel/v 前缀变体并回补到 skill 与平台 githubService.getReleaseByTag；README 增加 Skill 形态章节；已提交
 
+## T5：处理过程可视化 + AI 流式输出（追加需求）
+
+- [x] T5.1 紧凑过程面板：每阶段一行原位更新（tag 解析→概览→diff 切分→批次进度→聚合），失败/降级停在对应行；changelog 模式同样覆盖
+- [x] T5.2 AI 流式输出：服务端 `/api/ai-proxy-stream` SSE 透传（复用 injectAIKey，兼容 OpenAI/Anthropic SSE）；客户端 aiProvider.ts 模块级 setStreamListener，callAI 检测到监听器走流式 fetch、实时回调、最终仍返回完整文本供 parseJSON；流式失败/空回退非流式
+- [x] T5.3 仅单路调用阶段流式（changelog/单次 full_diff/聚合），并行批次保持计数；过程面板加「模型实时输出」预览（80ms 节流，末尾 1500 字）；设置面板加流式开关（streamingEnabled 持久化，默认开）；Gemini 走服务端 SDK 暂不流式（结束时一次性出结果）
+
 ## 进度日志（倒序追加）
 
+- 2026-06-11 04:50 T5 完成。流式经端点错误路径冒烟（无效 key 正确 401）；真实 token 流需有效 Key 人工验证。注意：activeStreamListener 是模块级单例，只在 runWithStream 包裹的单路调用挂载，批次并行不挂；Gemini 不流式是已知取舍。
 - 2026-06-11 02:40 T4 完成并提交。全部任务收尾：仅剩 T2.6 真实耗时实测需人工跑一次（需有效模型 Key）。
 
 - 2026-06-11 02:25 T3 完成并提交。剩 T2.6（真实耗时实测，需模型 Key）与 T4（skill 化）。

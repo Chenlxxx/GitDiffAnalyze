@@ -39,6 +39,8 @@ export interface AppSettings {
   providers: ModelProviderConfig[];
   activeProviderId: string | null;
   githubToken: string;
+  /** 是否启用 AI 流式输出（实时显示模型生成过程），默认开启 */
+  streamingEnabled?: boolean;
 }
 
 /** ModelProviderConfig -> 旧版 AIConfig，供现有 getAIProvider 路由复用 */
