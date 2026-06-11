@@ -32,6 +32,15 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 - 分析完成后，页面将展示风险摘要、核心建议及详细的变更条目。
 - 对于全量 Diff 模式，您可以点击 **“下载 Excel 报告”** 获取可供团队共享的详细文档。
 
+## Skill 形态（无需启动平台）
+
+本仓库自带两个可在 Claude Code / OpenCode 中直接使用的 skill，对应平台的两段式流程：
+
+- **`compat-analyze/`**（第一阶段）：给出仓库地址与版本范围，agent 直接抓取 GitHub 数据并产出中文升级风险报告 `compat-report.md`，可选生成 `analysis-bundle/`。
+- **`release-review/`**（第二阶段）：在使用方仓库中读取 analysis-bundle，结合真实代码调用点对风险项逐条复核，产出 `final-report.md`。
+
+平台 Web 界面与 skill 产出的 bundle 格式互相兼容，可以混合使用（平台分析 → 下载 Skill → 仓库内复核）。
+
 ## 注意事项
 
 - 本工具仅基于提供的文本内容（Diff、Commits、Release Notes）进行静态分析，不执行实际代码。

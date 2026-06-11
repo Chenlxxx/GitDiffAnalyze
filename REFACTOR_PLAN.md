@@ -46,10 +46,12 @@
 
 把平台的分析能力封装成可在 Claude Code 中运行的 skill：`compat-analyze/SKILL.md` + scripts，输入 repo URL + from/to 版本，复用平台的 GitHub 抓取与分析提示词逻辑（脚本化调用），输出中文报告 + analysis-bundle。
 
-- [ ] T4.1 设计 skill 结构并实现
-- [ ] T4.2 在本仓库自测一轮，提交
+- [x] T4.1 `compat-analyze/` skill：SKILL.md（输入解析→gh api 数据获取→分级分析策略→报告/bundle 输出→可选落地复核）+ references/report-template.md + references/bundle-format.md（与 release-review 互通）
+- [x] T4.2 自测：gh api tag 探测与 compare 命令实测可用（httpcomponents-client rel/v5.4.4...rel/v5.5 = 80 commits/262 files）；实测发现 rel/v 前缀变体并回补到 skill 与平台 githubService.getReleaseByTag；README 增加 Skill 形态章节；已提交
 
 ## 进度日志（倒序追加）
+
+- 2026-06-11 02:40 T4 完成并提交。全部任务收尾：仅剩 T2.6 真实耗时实测需人工跑一次（需有效模型 Key）。
 
 - 2026-06-11 02:25 T3 完成并提交。剩 T2.6（真实耗时实测，需模型 Key）与 T4（skill 化）。
 

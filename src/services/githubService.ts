@@ -43,6 +43,7 @@ export class GitHubService {
       tag,                                   // 原始输入的 tag
       tag.startsWith('v') ? tag : `v${tag}`,   // 常见的 v1.0.0 格式
       tag.replace(/^v/, ''),                 // 去掉 v 的纯版本号
+      `rel/${tag.startsWith('v') ? tag : `v${tag}`}`, // Apache 风格: rel/v5.5
       `${repo}-${tag}`,                      // Netty 风格: netty-4.1.133.Final
     ];
     
