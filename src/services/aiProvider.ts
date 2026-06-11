@@ -485,12 +485,84 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
   async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
-    const prompt = `分析批次差异。分组：${groupName}\n版本：${fromVersion}->${toVersion}\n背景：${projectBackground}\nDiff：\n${diff.slice(0, 20000)}`;
+    const prompt = `你是资深软件架构师。分析以下三方库代码变更（${fromVersion} -> ${toVersion}，分组：${groupName}，第 ${batchIndex + 1}/${totalBatches} 批）。
+
+项目背景：${projectBackground}
+${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 2000)}\n` : ''}
+文件级变更证据：
+${diff.slice(0, 20000)}
+
+请识别可能影响使用方的 API 变更、行为变更、配置变更与移除项，输出 JSON：
+{
+  "summary": "本批次中文小结",
+  "items": [{
+    "title": "变更点标题",
+    "description": "变更说明",
+    "riskLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "对使用方的影响与排查建议",
+    "sourceSnippet": "关键 diff 片段（可选）"
+  }],
+  "recommendations": ["建议"]
+}
+只输出 JSON。仅报告证据中真实存在的变更，无实质变更时 items 返回空数组。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }
   async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
-    const prompt = `汇总结项。版本：${fromVersion}->${toVersion}\n结果数：${batchResults.length}`;
+    // 压缩批次结果作为聚合输入，整体控制在 ~60k 字符
+    const perBatchBudget = Math.max(2000, Math.floor(60000 / Math.max(1, batchResults.length)));
+    const evidence = batchResults.map((r, i) => {
+      const slim = {
+        summary: r.summary,
+        recommendations: (r.recommendations || []).slice(0, 10),
+        items: (r.items || []).map(it => ({
+          title: it.title,
+          riskLevel: it.riskLevel,
+          description: (it.description || '').slice(0, 500),
+          compatibilityAnalysis: (it.compatibilityAnalysis || '').slice(0, 400),
+          sourceSnippet: (it.sourceSnippet || '').slice(0, 400)
+        }))
+      };
+      let text = JSON.stringify(slim);
+      if (text.length > perBatchBudget) text = text.slice(0, perBatchBudget) + '…(截断)';
+      return `[批次 ${i + 1}]\n${text}`;
+    }).join('\n\n');
+
+    const prompt = `你是资深软件架构师。以下是 ${fromVersion} -> ${toVersion} 版本间代码差异的 ${batchResults.length} 个批次分析结果，请汇总为最终升级风险报告。
+
+项目背景：${projectBackground}
+${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 4000)}\n` : ''}
+批次分析结果：
+${evidence}
+
+要求：
+1. 合并重复或同类变更点，保留最具体的描述与证据；按风险从高到低排列。
+2. 输出 JSON：
+{
+  "summary": "中文总摘要（150 字内）",
+  "overallRisk": "High | Medium | Low",
+  "recommendations": ["核心建议"],
+  "items": [{
+    "title": "变更点",
+    "description": "说明",
+    "riskLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "影响与排查建议",
+    "sourceSnippet": "关键 diff 片段（可选）"
+  }],
+  "excelRows": [{
+    "version": "${toVersion}",
+    "changepoint": "标题",
+    "chinese": "中文描述",
+    "function": "影响场景",
+    "suggestion": "排查点",
+    "risk": "高/中/低",
+    "test_suggestion": "测试建议",
+    "code_discovery": "涉及类/关键字",
+    "code_fix": "整改建议",
+    "related_commits": ""
+  }]
+}
+3. 严禁编造批次结果中不存在的变更；批次标注分析失败的部分不要臆测。只输出 JSON。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }

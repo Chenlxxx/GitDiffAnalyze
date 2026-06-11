@@ -13,6 +13,8 @@ export const BATCH_ANALYSIS_GROUP_SIZE = Number(import.meta.env.VITE_BATCH_ANALY
 export const BATCH_ANALYSIS_FILE_BATCH_SIZE = Number(import.meta.env.VITE_BATCH_ANALYSIS_FILE_BATCH_SIZE) || 10;
 export const MAX_FILES_FOR_BATCH_ANALYSIS = Number(import.meta.env.VITE_MAX_FILES_FOR_BATCH_ANALYSIS) || 1000;
 export const MAX_BATCHES_PER_ANALYSIS = Number(import.meta.env.VITE_MAX_BATCHES_PER_ANALYSIS) || 100;
+/** AI 批次分析的并行度：太高易触发供应商限流，太低拖慢整体耗时 */
+export const AI_BATCH_CONCURRENCY = Number(import.meta.env.VITE_AI_BATCH_CONCURRENCY) || 4;
 
 /**
  * Determines the best analysis strategy based on the scale of changes.

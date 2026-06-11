@@ -29,9 +29,10 @@ import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
 import { ModelSettings } from './components/ModelSettings';
-import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
+import { mapWithConcurrency, splitUnifiedDiffByFile } from './services/diffUtils';
+import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS, AI_BATCH_CONCURRENCY } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
@@ -122,6 +123,7 @@ export default function App() {
   const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
+  const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number } | null>(null);
 
   // Batch Analysis State
   const [batchItems, setBatchItems] = useState<BatchAnalysisItem[]>([]);
@@ -476,7 +478,6 @@ export default function App() {
       if (strategy.mode === 'multi_batch_full_diff') {
         // 3. Multi-batch analysis logic
         const groups = groupFiles(commitData.files);
-        const batchResults: any[] = [];
 
         // Fetch release notes early for context
         let releaseNotes = '';
@@ -487,80 +488,116 @@ export default function App() {
           console.warn('Failed to fetch release notes:', e);
         }
 
+        // 一次性获取完整 compare diff 并按文件本地切分。
+        // GitHub compare API 不支持按 path 过滤，旧实现对每个缺 patch 的
+        // 文件单独请求时实际都在重复下载完整 diff，是耗时大头之一。
+        let patchMap = new Map<string, string>();
+        if (diff) {
+          patchMap = splitUnifiedDiffByFile(diff);
+        } else {
+          try {
+            const wholeDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+            if (!wholeDiff.error && wholeDiff.diff) {
+              patchMap = splitUnifiedDiffByFile(wholeDiff.diff);
+            }
+          } catch (e) {
+            console.warn('Failed to fetch whole diff for patch map, relying on inline patches:', e);
+          }
+        }
+
+        // 先展开全部批次任务，再受限并行执行（旧实现为完全串行，
+        // 几十个批次 × 每次 30-90 秒即 20 分钟耗时的主因）
+        interface BatchJob { groupName: string; files: any[]; indexInGroup: number; batchesInGroup: number; }
+        const jobs: BatchJob[] = [];
         for (const group of groups) {
           const sortedFiles = sortFilesByPriority(group.files);
-          const batches = [];
           for (let i = 0; i < sortedFiles.length; i += BATCH_ANALYSIS_FILE_BATCH_SIZE) {
-            batches.push(sortedFiles.slice(i, i + BATCH_ANALYSIS_FILE_BATCH_SIZE));
+            jobs.push({
+              groupName: group.name,
+              files: sortedFiles.slice(i, i + BATCH_ANALYSIS_FILE_BATCH_SIZE),
+              indexInGroup: Math.floor(i / BATCH_ANALYSIS_FILE_BATCH_SIZE),
+              batchesInGroup: Math.ceil(sortedFiles.length / BATCH_ANALYSIS_FILE_BATCH_SIZE)
+            });
           }
+        }
+        if (jobs.length > MAX_BATCHES_PER_ANALYSIS) {
+          console.warn(`Batch count ${jobs.length} exceeds MAX_BATCHES_PER_ANALYSIS (${MAX_BATCHES_PER_ANALYSIS}), truncating.`);
+          jobs.length = MAX_BATCHES_PER_ANALYSIS;
+        }
 
-          for (let i = 0; i < batches.length; i++) {
-            if (batchResults.length >= MAX_BATCHES_PER_ANALYSIS) {
-              console.warn(`Reached MAX_BATCHES_PER_ANALYSIS (${MAX_BATCHES_PER_ANALYSIS}), skipping remaining batches.`);
-              break;
+        setBatchProgress({ total: jobs.length, completed: 0 });
+        const failedBatches: string[] = [];
+
+        const batchResults: BatchAnalysisResult[] = await mapWithConcurrency(jobs, AI_BATCH_CONCURRENCY, async (job) => {
+          const batchEvidence: FileEvidence[] = job.files.map((file) => {
+            const patch = file.patch || patchMap.get(file.filename);
+            return {
+              filename: file.filename,
+              group: job.groupName,
+              status: file.status,
+              additions: file.additions,
+              deletions: file.deletions,
+              patch: patch || undefined,
+              patchAvailable: !!patch,
+              diffFetchFailed: !patch,
+              riskHint: getRiskHint(job.groupName),
+              reviewHint: getReviewHint(job.groupName)
+            };
+          });
+
+          // Format evidence as a structured string for the AI
+          const evidenceString = batchEvidence.map(ev => {
+            let str = `[File Evidence]\n`;
+            str += `Path: ${ev.filename}\n`;
+            str += `Group: ${ev.group}\n`;
+            str += `Status: ${ev.status}\n`;
+            str += `Changes: +${ev.additions}/-${ev.deletions}\n`;
+            str += `Risk Hint: ${ev.riskHint}\n`;
+            str += `Review Hint: ${ev.reviewHint}\n`;
+            str += `Patch Available: ${ev.patchAvailable ? 'YES' : 'NO'}\n`;
+            if (ev.diffFetchFailed) {
+              str += `!!! DIFF_FETCH_FAILED: YES (Please analyze based on metadata and commit context)\n`;
             }
-            const batchFiles = batches[i];
-            
-            // Create structured evidence for each file in the batch
-            const batchEvidence: FileEvidence[] = await Promise.all(batchFiles.map(async (file) => {
-              let patch = file.patch;
-              let diffFetchFailed = false;
-              
-              if (!patch) {
-                try {
-                  patch = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-                } catch (e) {
-                  console.warn(`Failed to fetch diff for ${file.filename}:`, e);
-                  diffFetchFailed = true;
-                }
-              }
+            if (ev.patchAvailable && ev.patch) {
+              str += `Patch Content:\n${ev.patch}\n`;
+            }
+            return str;
+          }).join('\n---\n\n');
 
-              return {
-                filename: file.filename,
-                group: group.name,
-                status: file.status,
-                additions: file.additions,
-                deletions: file.deletions,
-                patch: patch || undefined,
-                patchAvailable: !!patch,
-                diffFetchFailed,
-                riskHint: getRiskHint(group.name),
-                reviewHint: getReviewHint(group.name)
+          const run = () => provider.analyzeBatchDiff(
+            evidenceString,
+            background,
+            targetFromVersion,
+            targetToVersion,
+            job.groupName,
+            job.indexInGroup,
+            job.batchesInGroup,
+            releaseNotes,
+            commitData.commits
+          );
+
+          let result: BatchAnalysisResult;
+          try {
+            result = await run();
+          } catch (firstErr) {
+            console.warn(`Batch ${job.groupName}#${job.indexInGroup + 1} failed, retrying once:`, firstErr);
+            try {
+              result = await run();
+            } catch (secondErr: any) {
+              failedBatches.push(`${job.groupName} 第 ${job.indexInGroup + 1} 批`);
+              result = {
+                items: [],
+                summary: `批次分析失败（${job.groupName} 第 ${job.indexInGroup + 1} 批）：${secondErr?.message || secondErr}`,
+                recommendations: []
               };
-            }));
-
-            // Format evidence as a structured string for the AI
-            const evidenceString = batchEvidence.map(ev => {
-              let str = `[File Evidence]\n`;
-              str += `Path: ${ev.filename}\n`;
-              str += `Group: ${ev.group}\n`;
-              str += `Status: ${ev.status}\n`;
-              str += `Changes: +${ev.additions}/-${ev.deletions}\n`;
-              str += `Risk Hint: ${ev.riskHint}\n`;
-              str += `Review Hint: ${ev.reviewHint}\n`;
-              str += `Patch Available: ${ev.patchAvailable ? 'YES' : 'NO'}\n`;
-              if (ev.diffFetchFailed) {
-                str += `!!! DIFF_FETCH_FAILED: YES (Please analyze based on metadata and commit context)\n`;
-              }
-              if (ev.patchAvailable && ev.patch) {
-                str += `Patch Content:\n${ev.patch}\n`;
-              }
-              return str;
-            }).join('\n---\n\n');
-
-            const batchResult = await provider.analyzeBatchDiff(
-              evidenceString,
-              background,
-              targetFromVersion,
-              targetToVersion,
-              group.name,
-              i,
-              batches.length,
-              releaseNotes,
-              commitData.commits
-            );
-            batchResults.push(batchResult);
+            }
           }
+          setBatchProgress(prev => prev ? { ...prev, completed: prev.completed + 1 } : prev);
+          return result;
+        });
+
+        if (failedBatches.length > 0) {
+          metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：${failedBatches.length} 个批次重试后仍失败（${failedBatches.join('、')}），对应文件未纳入分析。`;
         }
 
         // 4. Aggregate results
@@ -601,18 +638,18 @@ export default function App() {
         return finalAnalysis;
       } else if (strategy.mode === 'segmented_full_diff') {
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
-        const diffs = await Promise.all(priorityFiles.map(async (file) => {
-          if (file.patch) {
-            return `File: ${file.filename}\n${file.patch}`;
-          }
-          try {
-            const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-            return `File: ${file.filename}\n${fileDiff}`;
-          } catch (e) {
-            return `File: ${file.filename}\n(Failed to fetch diff)`;
-          }
-        }));
-        diff = diffs.join('\n\n');
+        // 一次性拉取完整 diff 后本地切分（compare API 不支持按 path 过滤）
+        let segPatchMap = new Map<string, string>();
+        try {
+          const segDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+          if (!segDiff.error && segDiff.diff) segPatchMap = splitUnifiedDiffByFile(segDiff.diff);
+        } catch (e) {
+          console.warn('Failed to fetch diff for segmented analysis:', e);
+        }
+        diff = priorityFiles.map(file => {
+          const patch = file.patch || segPatchMap.get(file.filename);
+          return `File: ${file.filename}\n${patch || '(Failed to fetch diff)'}`;
+        }).join('\n\n');
       } else if (strategy.mode === 'partial_full_diff') {
         // partial_full_diff - use available patches
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 5);
@@ -743,6 +780,7 @@ export default function App() {
     setFullDiffAnalysis(null);
     setPreparedSkillBundle(null);
     setDiffAnalyses({});
+    setBatchProgress(null);
     setStep('analyzing-full-diff');
 
     try {
@@ -1430,9 +1468,28 @@ export default function App() {
             )}
 
             {loading && (step === 'analyzing-changelog' || step === 'analyzing-full-diff') && (
-              <div className="space-y-6 animate-pulse">
-                <div className="h-48 bg-white rounded-3xl border border-black/5" />
-                <div className="h-64 bg-white rounded-3xl border border-black/5" />
+              <div className="space-y-6">
+                {step === 'analyzing-full-diff' && batchProgress && batchProgress.total > 0 && (
+                  <div className="bg-white rounded-3xl p-6 border border-black/5 shadow-sm">
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="text-sm font-bold flex items-center gap-2">
+                        <Loader2 className="animate-spin" size={14} />
+                        分批深度分析中（并行 {AI_BATCH_CONCURRENCY} 路）
+                      </span>
+                      <span className="text-xs font-medium text-black/40">{batchProgress.completed} / {batchProgress.total} 批</span>
+                    </div>
+                    <div className="h-2 bg-black/5 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                        style={{ width: `${Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+                <div className="space-y-6 animate-pulse">
+                  <div className="h-48 bg-white rounded-3xl border border-black/5" />
+                  <div className="h-64 bg-white rounded-3xl border border-black/5" />
+                </div>
               </div>
             )}
 

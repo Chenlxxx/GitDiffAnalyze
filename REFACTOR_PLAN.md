@@ -28,11 +28,12 @@
 前提：先读 `src/App.tsx` 的 performFullDiffAnalysis / `src/services/aiProvider.ts` 的 analyzeBatchDiff 确认瓶颈（预判：AI 批次串行 + GitHub 文件 diff 串行拉取）。
 原则：**只改调度并发，不缩减喂给模型的内容**，聚合逻辑不变，保证准确性。
 
-- [ ] T2.1 实测/读码确认耗时分布，记录到下方进度日志
-- [ ] T2.2 AI 批次调用并行化（并发 3，Promise.allSettled，失败批次重试 1 次，保序聚合）
-- [ ] T2.3 GitHub 文件 diff 拉取并行化（并发 5）
-- [ ] T2.4 分析进度 UI（当前第 x/n 批、各批状态）
-- [ ] T2.5 lint + 实测一次全量 diff 记录耗时对比 + 提交
+- [x] T2.1 瓶颈确认：① AI 批次完全串行（MAX_BATCHES=100，主因）；② getFileDiff 带 path 参数无效，每个缺 patch 文件都重复下载完整 diff；③ aggregateBatchResults 提示词没把批次结果传给模型（准确性 bug）
+- [x] T2.2 AI 批次并行化：src/services/diffUtils.ts mapWithConcurrency，并发 AI_BATCH_CONCURRENCY=4（VITE_AI_BATCH_CONCURRENCY 可调），失败重试 1 次，仍失败记入 confidenceNote 不中断整体
+- [x] T2.3 GitHub diff：一次 getCompareDiff + splitUnifiedDiffByFile 本地切分代替逐文件全量下载；multi_batch 与 segmented 模式都已替换
+- [x] T2.4 进度 UI：batchProgress 状态 + 进度条（x/n 批）
+- [x] T2.5 lint 通过；修复 analyzeBatchDiff / aggregateBatchResults 提示词（聚合现在真正携带压缩后的批次结果，~60k 字符预算）；已提交
+- [ ] T2.6 （待实测）跑一次真实大版本 diff 记录耗时对比——需要有效模型 Key，留给人工或下个会话
 
 ## T3：其余界面/体验优化（自行裁量，小步快跑）
 
@@ -46,6 +47,8 @@
 - [ ] T4.2 在本仓库自测一轮，提交
 
 ## 进度日志（倒序追加）
+
+- 2026-06-11 02:10 T2 完成并提交。预期效果：20 个批次场景 串行20×40s≈13min → 4路并行5轮≈3-4min，且省掉 N 次全量 diff 重复下载；聚合准确性同步修复。
 
 - 2026-06-11 01:40 T1 完成并提交。注意：normalizeAIResponse/parseJSON 在 aiProvider.ts 顶部，勿动；OpenAICompatibleProvider.aggregateBatchResults 的 prompt 没把批次结果传给模型（疑似 bug），T2 一并处理。
 - 2026-06-11 01:00 计划创建，T1 开始。
