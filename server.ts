@@ -41,8 +41,16 @@ function rateLimitResetHint(headers: any): string {
   return `配额将在约 ${minutes} 分钟后重置。`;
 }
 
-// AI 代理的服务端默认 key 注入：客户端未带鉴权时按目标域名兜底
+// AI 代理的服务端默认 key 注入：客户端未带鉴权时按目标域名兜底。
+// 部署平台（如 Render）可通过 DEFAULT_AI_API_KEY 提供统一默认 Key。
 function injectAIKey(url: string, headers: any) {
+  // Anthropic 协议用 x-api-key 头（仅当请求本身带了该字段但为空时注入）
+  if ('x-api-key' in headers && !String(headers['x-api-key'] || '').trim()) {
+    const anthropicKey = process.env.ANTHROPIC_API_KEY || process.env.DEFAULT_AI_API_KEY;
+    if (anthropicKey) headers['x-api-key'] = anthropicKey;
+    return;
+  }
+
   const authHeader = headers['Authorization'] || headers['authorization'];
   const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
   if (!isAuthEmpty) return;
@@ -50,6 +58,8 @@ function injectAIKey(url: string, headers: any) {
     headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
   } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
     headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+  } else if (process.env.DEFAULT_AI_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.DEFAULT_AI_API_KEY}`;
   } else if (process.env.OPENAI_API_KEY) {
     headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
   } else {
@@ -193,11 +203,39 @@ async function startServer() {
     }
   });
 
-  // 模型连通性测试：按协议发一次最小请求，验证 baseUrl / apiKey / model 是否可用
+  // 服务端默认模型配置（供部署平台预置，前端启动时拉取；Key 永不下发）
+  app.get("/api/default-config", (_req, res) => {
+    const rawProtocol = (process.env.DEFAULT_AI_PROTOCOL || 'openai').toLowerCase();
+    const protocol = ['openai', 'anthropic', 'gemini'].includes(rawProtocol) ? rawProtocol : 'openai';
+    const hasKey = !!(
+      process.env.DEFAULT_AI_API_KEY ||
+      (protocol === 'gemini' && process.env.GEMINI_API_KEY) ||
+      (protocol === 'anthropic' && process.env.ANTHROPIC_API_KEY) ||
+      (protocol === 'openai' && (process.env.OPENAI_API_KEY || process.env.QWEN_API_KEY))
+    );
+    res.json({
+      hasDefaultProvider: hasKey && !!process.env.DEFAULT_AI_MODEL,
+      protocol,
+      baseUrl: process.env.DEFAULT_AI_BASE_URL || '',
+      model: process.env.DEFAULT_AI_MODEL || '',
+      hasGithubToken: !!process.env.GITHUB_TOKEN
+    });
+  });
+
+  // 模型连通性测试：按协议发一次最小请求，验证 baseUrl / apiKey / model 是否可用。
+  // apiKey 为空时回退服务端默认 Key（平台默认供应商的测试场景）。
   app.post("/api/ai/test-connection", async (req, res) => {
-    const { protocol, baseUrl, apiKey, model } = req.body || {};
+    const { protocol, baseUrl, model } = req.body || {};
+    let { apiKey } = req.body || {};
+    if (!apiKey || !String(apiKey).trim()) {
+      apiKey = process.env.DEFAULT_AI_API_KEY
+        || (protocol === 'gemini' ? process.env.GEMINI_API_KEY
+          : protocol === 'anthropic' ? process.env.ANTHROPIC_API_KEY
+          : (process.env.OPENAI_API_KEY || process.env.QWEN_API_KEY))
+        || '';
+    }
     if (!protocol || !apiKey || !model) {
-      return res.status(400).json({ ok: false, message: '缺少必要参数（protocol / apiKey / model）' });
+      return res.status(400).json({ ok: false, message: '缺少必要参数（protocol / apiKey / model），且服务端未配置默认 Key' });
     }
     const started = Date.now();
     try {
@@ -270,11 +308,11 @@ async function startServer() {
       
       if (!apiKey) {
         if (provider === 'gemini') {
-          apiKey = process.env.GEMINI_API_KEY || null;
+          apiKey = process.env.GEMINI_API_KEY || process.env.DEFAULT_AI_API_KEY || null;
         } else if (provider === 'anthropic') {
-          apiKey = process.env.ANTHROPIC_API_KEY || null;
+          apiKey = process.env.ANTHROPIC_API_KEY || process.env.DEFAULT_AI_API_KEY || null;
         } else {
-          apiKey = process.env.OPEN_API_KEY || process.env.OPENAI_API_KEY || null;
+          apiKey = process.env.OPEN_API_KEY || process.env.OPENAI_API_KEY || process.env.DEFAULT_AI_API_KEY || null;
         }
       }
 

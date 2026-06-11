@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
+import axios from 'axios';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider, setStreamListener } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
@@ -146,9 +147,50 @@ export default function App() {
   /** 所有分析入口统一取当前激活的供应商；未配置时抛出可操作的错误提示 */
   const requireAIConfig = (): AIConfig => {
     if (!activeProvider) throw new Error('尚未配置 AI 模型。请点击右上角设置图标，添加模型供应商并填写 API Key。');
-    if (!activeProvider.apiKey) throw new Error(`模型「${activeProvider.displayName}」未填写 API Key，请在设置中补全。`);
+    // 走代理时允许空 Key：服务端会注入部署平台配置的默认 Key（DEFAULT_AI_API_KEY 等）
+    if (!activeProvider.apiKey && !activeProvider.useProxy) {
+      throw new Error(`模型「${activeProvider.displayName}」未填写 API Key，请在设置中补全（或开启代理模式使用服务端默认 Key）。`);
+    }
     return toLegacyAIConfig(activeProvider);
   };
+
+  // 启动时拉取服务端默认模型配置（部署平台预置），自动注入「平台默认」供应商
+  const PLATFORM_DEFAULT_ID = 'platform-default';
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await axios.get('/api/default-config');
+        if (!data?.hasDefaultProvider) {
+          // 服务端没有默认配置：清掉历史注入的条目
+          setProviders(prev => prev.some(p => p.id === PLATFORM_DEFAULT_ID)
+            ? prev.filter(p => p.id !== PLATFORM_DEFAULT_ID) : prev);
+          return;
+        }
+        const platformProvider: ModelProviderConfig = {
+          id: PLATFORM_DEFAULT_ID,
+          presetId: data.protocol === 'anthropic' ? 'custom-anthropic'
+            : data.protocol === 'gemini' ? 'gemini' : 'custom-openai',
+          displayName: '平台默认（服务端配置）',
+          protocol: data.protocol,
+          baseUrl: data.baseUrl || '',
+          apiKey: '', // Key 留在服务端，请求经代理时自动注入
+          model: data.model,
+          useProxy: true,
+          enabled: true
+        };
+        setProviders(prev => {
+          const idx = prev.findIndex(p => p.id === PLATFORM_DEFAULT_ID);
+          if (idx === -1) return [platformProvider, ...prev];
+          const copy = [...prev];
+          copy[idx] = { ...copy[idx], ...platformProvider };
+          return copy;
+        });
+        setActiveProviderId(prev => prev || PLATFORM_DEFAULT_ID);
+      } catch (e) {
+        console.warn('Failed to fetch server default config:', e);
+      }
+    })();
+  }, []);
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);

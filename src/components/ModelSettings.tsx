@@ -193,9 +193,9 @@ export function ModelSettings({
                     )}
                     <button
                       onClick={() => testConnection(p)}
-                      disabled={testing || !p.apiKey || !p.model}
+                      disabled={testing || !p.model || (!p.apiKey && !p.useProxy)}
                       className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-700 border border-blue-100 rounded-lg text-xs font-bold hover:bg-blue-100 transition-all disabled:opacity-40"
-                      title={!p.apiKey ? '请先填写 API Key' : !p.model ? '请先填写模型名称' : '发送一次最小请求验证配置'}
+                      title={!p.model ? '请先填写模型名称' : (!p.apiKey && !p.useProxy) ? '请先填写 API Key（或开启代理使用服务端默认 Key）' : '发送一次最小请求验证配置'}
                     >
                       {testing ? <Loader2 className="animate-spin" size={13} /> : <Plug size={13} />}
                       测试连接
