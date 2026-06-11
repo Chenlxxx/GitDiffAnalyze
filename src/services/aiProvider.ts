@@ -608,11 +608,14 @@ export class OpenAICompatibleProvider implements AIProvider {
     const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
 
     // 有监听器时走流式：实时回调 token，最终仍返回完整文本供 JSON 解析。
-    // 流式失败或返回空（部分网关不支持 json_object+stream）时回退非流式。
+    // 流式请求不带 response_format——大量网关不支持 json_object+stream 组合，
+    // 会报错或返回空导致静默回退；提示词已强约束 JSON，parseJSON 也能从
+    // markdown 代码块中提取。流式仍失败时回退非流式。
     if (activeStreamListener) {
       const listener = activeStreamListener;
       try {
-        const full = await streamChatCompletion(url, data, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        const { response_format: _omit, ...streamData } = data as any;
+        const full = await streamChatCompletion(url, streamData, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
         if (full && full.trim()) return stripThinking(full);
         console.warn('Streaming returned empty content, falling back to non-streaming.');
       } catch (streamErr) {

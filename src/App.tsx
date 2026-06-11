@@ -122,7 +122,7 @@ export default function App() {
   // AI 流式输出实时预览（仅单路调用阶段：changelog / 单次 full_diff / 聚合）
   const [streamPreview, setStreamPreview] = useState('');
   /** 在 fn 执行期间挂载流监听器，把模型实时输出喂给预览区；结束后必定清理 */
-  const runWithStream = async <T,>(fn: () => Promise<T>): Promise<T> => {
+  const runWithStream = async <T,>(fn: () => Promise<T>, stage?: { id: string; label: string }): Promise<T> => {
     if (!streamingEnabled) return fn();
     setStreamPreview('');
     let lastPaint = 0;
@@ -132,6 +132,8 @@ export default function App() {
       if (now - lastPaint < 80) return;
       lastPaint = now;
       setStreamPreview(full.length > 1500 ? '…' + full.slice(-1500) : full);
+      // 同步把生成字数打到对应阶段的日志行，流式是否在工作一目了然
+      if (stage) logStep(stage.id, `${stage.label}（已生成 ${full.length} 字）`, 'running');
     });
     try {
       return await fn();
@@ -427,7 +429,10 @@ export default function App() {
 
       logStep('release', `变更日志已获取（${Math.max(1, Math.round(releaseBody.length / 1024))} KB）`, 'done');
       logStep('ai', 'AI 分析变更日志中…', 'running');
-      const analysis = await runWithStream(() => provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl));
+      const analysis = await runWithStream(
+        () => provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl),
+        { id: 'ai', label: 'AI 分析变更日志中' }
+      );
       logStep('ai', 'AI 分析完成', 'done');
       console.log('AI Analysis complete. Raw items count:', analysis.items?.length || 0);
       
@@ -710,7 +715,7 @@ export default function App() {
             targetFromVersion,
             targetToVersion,
             releaseNotes
-          ));
+          ), { id: 'aggregate', label: 'AI 聚合汇总中' });
           logStep('aggregate', 'AI 聚合完成', 'done');
         } catch (aggErr: any) {
           console.error('AI aggregation failed, falling back to local merge:', aggErr);
@@ -793,7 +798,7 @@ export default function App() {
         commitData.commits,
         commitData.files,
         metadata
-      ));
+      ), { id: 'ai', label: 'AI 深度分析中' });
       logStep('ai', 'AI 深度分析完成', 'done');
 
       // Ensure items is an array before sorting
@@ -858,7 +863,7 @@ export default function App() {
         commitData.commits,
         commitData.files,
         metadata
-      ));
+      ), { id: 'ai', label: 'AI 概览分析中' });
       logStep('ai', 'AI 概览分析完成（降级模式）', 'done');
 
       analysis.analysisMode = metadata.mode;
