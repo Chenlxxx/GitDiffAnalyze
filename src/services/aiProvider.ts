@@ -9,6 +9,9 @@ export type StreamListener = (info: { delta: string; full: string }) => void;
 let activeStreamListener: StreamListener | null = null;
 export function setStreamListener(cb: StreamListener | null) { activeStreamListener = cb; }
 
+// 输出被 max_tokens 截断时附加在文本末尾的内部标记，parseJSON 据此给出精确报错
+const TRUNCATION_MARKER = '__AI_OUTPUT_TRUNCATED__';
+
 /**
  * 流式消费 OpenAI / Anthropic 协议的 SSE 响应，累积并实时回调 delta，返回完整文本。
  * useProxy 时打到服务端 /api/ai-proxy-stream 透传端点。
@@ -37,15 +40,18 @@ async function streamChatCompletion(
   const decoder = new TextDecoder();
   let buffer = '';
   let full = '';
+  let truncated = false;
 
   const handlePayload = (payload: string) => {
     if (!payload || payload === '[DONE]') return;
     try {
       const obj = JSON.parse(payload);
       // OpenAI 协议
+      if (obj.choices?.[0]?.finish_reason === 'length') truncated = true;
       const oa = obj.choices?.[0]?.delta?.content;
       if (typeof oa === 'string' && oa) { full += oa; onDelta(oa, full); return; }
       // Anthropic 协议
+      if (obj.type === 'message_delta' && obj.delta?.stop_reason === 'max_tokens') truncated = true;
       if (obj.type === 'content_block_delta' && typeof obj.delta?.text === 'string') {
         full += obj.delta.text; onDelta(obj.delta.text, full); return;
       }
@@ -64,7 +70,7 @@ async function streamChatCompletion(
     }
   }
   if (buffer.trim().startsWith('data:')) handlePayload(buffer.trim().slice(5).trim());
-  return full;
+  return truncated && full ? full + TRUNCATION_MARKER : full;
 }
 
 function stripThinking(content: string): string {
@@ -364,10 +370,16 @@ function parseJSON(text: string): any {
   if (!text || !String(text).trim()) {
     throw new Error('模型返回了空响应（可能被限流、输入超长被拒或网关异常），请重试或更换模型。');
   }
+  // 取出截断标记（callAI 在 finish_reason=length 时附加）
+  let wasTruncated = false;
+  if (text.includes(TRUNCATION_MARKER)) {
+    wasTruncated = true;
+    text = text.split(TRUNCATION_MARKER).join('');
+  }
   // 剔除推理模型的思考块；若剔除后为空，说明思考耗尽了 max_tokens、没输出结果
   const stripped = stripThinking(text.trim());
   if (!stripped) {
-    throw new Error('模型只输出了思考过程，没有给出结果（推理类模型的思考可能耗尽了输出长度限制）。请重试、缩小分析范围，或换用非推理模型。');
+    throw new Error('模型只输出了思考过程，没有给出结果（推理类模型的思考耗尽了输出长度限制）。请在设置中调大该供应商的「最大输出 Tokens」（推理模型建议 16000 以上），或换用非推理模型。');
   }
   let cleanText = stripped;
   
@@ -453,7 +465,10 @@ function parseJSON(text: string): any {
   }
   
   console.error("Failed to parse JSON from AI response. Original text summary:", cleanText.substring(0, 500) + "...");
-  throw new Error("无法解析 AI 返回的 JSON 数据。常见原因：输出被长度限制截断（推理类模型如 MiniMax-M / DeepSeek-R1 的思考会占用输出额度）、或模型未按要求输出 JSON。已尝试自动修复但失败，请重试、缩小分析范围或换用非推理模型。");
+  if (wasTruncated) {
+    throw new Error("模型输出在 max_tokens 上限处被截断，JSON 不完整且无法自动修复。请在设置中调大该供应商的「最大输出 Tokens」（推理类模型如 MiniMax-M / DeepSeek-R1 建议 16000 以上），或缩小分析范围。");
+  }
+  throw new Error("无法解析 AI 返回的 JSON 数据。常见原因：模型未按要求输出 JSON、或输出含异常格式。已尝试自动修复但失败，请重试、缩小分析范围或换用其他模型。");
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 3, initialDelay: number = 2000): Promise<T> {
@@ -542,7 +557,7 @@ export class AnthropicProvider implements AIProvider {
     const url = baseUrl.endsWith('/messages') ? baseUrl : `${baseUrl}/v1/messages`;
     const data = {
       model: this.config.model,
-      max_tokens: 8192,
+      max_tokens: this.config.maxTokens || 8192,
       system: "你是一个极其严谨的资深架构师。请直接输出 JSON 结果。",
       messages: [{ role: 'user', content: prompt }]
     };
@@ -566,7 +581,8 @@ export class AnthropicProvider implements AIProvider {
 
     const result = response.data;
     if (Array.isArray(result.content)) {
-      return result.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
+      const joined = result.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
+      return result.stop_reason === 'max_tokens' && joined ? joined + TRUNCATION_MARKER : joined;
     }
     return result.text || result.message || JSON.stringify(result);
   }
@@ -613,7 +629,7 @@ export class OpenAICompatibleProvider implements AIProvider {
       ],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
       temperature: 0.1,
-      max_tokens: 8000
+      max_tokens: this.config.maxTokens || 8000
     };
     const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
 
@@ -639,16 +655,53 @@ export class OpenAICompatibleProvider implements AIProvider {
 
     const aiResponse = response.data;
     let content = aiResponse?.choices?.[0]?.message?.content || aiResponse?.choices?.[0]?.text || aiResponse?.text || (typeof aiResponse === 'string' ? aiResponse : null);
-    return stripThinking(content);
+    content = stripThinking(content);
+    if (content && aiResponse?.choices?.[0]?.finish_reason === 'length') {
+      content += TRUNCATION_MARKER;
+    }
+    return content;
   }
 
   async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {
-    const prompt = `分析以下 GitHub 变更日志。项目背景：${projectBackground}\n${sourceUrl ? `来源：${sourceUrl}\n` : ''}${changeLog}\n请返回 JSON 格式结果。`;
+    const prompt = `你是资深软件架构师。分析以下三方库变更日志，识别对使用方有实质影响的变更条目。
+
+项目背景：${projectBackground}
+${sourceUrl ? `内容来源：${sourceUrl}\n` : ''}变更日志：
+${changeLog}
+
+输出 JSON（不要输出任何其他内容）：
+{
+  "summary": "版本综合摘要（中文，100 字内）",
+  "items": [{
+    "title": "变更标题",
+    "prNumber": 12345,
+    "reason": "变更说明与背景（中文）",
+    "impactLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "对使用方的影响与排查建议",
+    "codeExample": { "before": "旧用法", "after": "新用法" }
+  }]
+}
+要求：逐条覆盖日志中的具体条目，不要宽泛概括；High/Medium 条目必须给出 codeExample；prNumber 没有就省略；仅基于日志内容，严禁编造。`;
     const result = await this.callAI(prompt);
     return { ...parseJSON(result), sourceUrl };
   }
   async analyzeDiff(diff: string, prTitle: string, projectBackground: string): Promise<DiffAnalysis> {
-    const prompt = `分析代码差异。PR：${prTitle}\n背景：${projectBackground}\nDiff：\n${diff.slice(0, 20000)}`;
+    const prompt = `你是资深软件架构师。分析以下 PR 代码差异对使用方的兼容性影响。
+
+PR 标题：${prTitle}
+项目背景：${projectBackground}
+代码差异：
+${diff.slice(0, 20000)}
+
+输出 JSON（不要输出任何其他内容）：
+{
+  "riskLevel": "High | Medium | Low",
+  "breakingChanges": ["破坏性变更（中文）"],
+  "compatibilityNotes": ["兼容性说明"],
+  "recommendations": ["建议"],
+  "codeExample": { "before": "旧用法", "after": "新用法" }
+}
+仅基于差异内容，严禁编造。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }
@@ -724,7 +777,26 @@ ${evidence}
     return parseJSON(result);
   }
   async analyzeFullDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string, commits?: any[], files?: any[], metadata?: { mode?: string, fallbackReason?: string, confidenceNote?: string }): Promise<FullDiffAnalysis> {
-    const prompt = `全量分析。版本：${fromVersion}->${toVersion}\n背景：${projectBackground}\nDiff：\n${diff.slice(0, 50000)}`;
+    const prompt = `你是资深软件架构师。分析三方库 ${fromVersion} -> ${toVersion} 的代码差异，评估升级兼容性风险。
+
+项目背景：${projectBackground}
+${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 3000)}\n` : ''}代码差异：
+${diff.slice(0, 50000)}
+
+输出 JSON（不要输出任何其他内容）：
+{
+  "summary": "中文总摘要（150 字内）",
+  "overallRisk": "High | Medium | Low",
+  "recommendations": ["核心建议，不超过 10 条"],
+  "items": [{
+    "title": "变更点标题",
+    "description": "变更说明（中文）",
+    "riskLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "对使用方的影响与排查建议",
+    "sourceSnippet": "关键 diff 片段（可选）"
+  }]
+}
+要求：按风险从高到低排列；description 与 compatibilityAnalysis 各 120 字内；仅报告差异中真实存在的变更，严禁编造。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }

@@ -6,6 +6,8 @@ export interface AIConfig {
   baseUrl?: string;
   model: string;
   useProxy: boolean;
+  /** 单次调用的最大输出 tokens；推理模型（思考占额度）建议 16000+ */
+  maxTokens?: number;
 }
 
 // ===== 多模型供应商配置（Dify 风格） =====
@@ -25,6 +27,8 @@ export interface ModelProviderConfig {
   model: string;
   useProxy: boolean;
   enabled: boolean;
+  /** 单次调用的最大输出 tokens（可选，默认 8000；推理模型建议 16000+） */
+  maxTokens?: number;
   /** 最近一次连通性测试结果 */
   lastTest?: {
     ok: boolean;
@@ -50,7 +54,8 @@ export function toLegacyAIConfig(p: ModelProviderConfig): AIConfig {
     apiKey: p.apiKey,
     baseUrl: p.baseUrl || undefined,
     model: p.model,
-    useProxy: p.useProxy
+    useProxy: p.useProxy,
+    maxTokens: p.maxTokens
   };
 }
 
