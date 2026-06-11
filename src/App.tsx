@@ -140,6 +140,17 @@ export default function App() {
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
   const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number } | null>(null);
+  // 处理过程可视化：每个阶段一行，按 id 原位更新避免刷屏
+  const [progressLog, setProgressLog] = useState<{ id: string; text: string; status: 'running' | 'done' | 'error' }[]>([]);
+  const logStep = (id: string, text: string, status: 'running' | 'done' | 'error') => {
+    setProgressLog(prev => {
+      const idx = prev.findIndex(e => e.id === id);
+      if (idx === -1) return [...prev, { id, text, status }];
+      const copy = [...prev];
+      copy[idx] = { id, text, status };
+      return copy;
+    });
+  };
 
   // Batch Analysis State
   const [batchItems, setBatchItems] = useState<BatchAnalysisItem[]>([]);
@@ -208,7 +219,9 @@ export default function App() {
     setPreparedSkillBundle(null);
     setFullDiffAnalysis(null);
     setDiffAnalyses({});
+    setProgressLog([]);
     setStep('analyzing-changelog');
+    logStep('release', '获取 Release Notes / Changelog…', 'running');
 
     try {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
@@ -376,7 +389,10 @@ export default function App() {
         releaseBody = releaseBody.substring(0, MAX_CHANGELOG_LENGTH) + "\n\n... (为了保证分析效率，内容已部分截断，请结合原始 Release Note 查看)";
       }
 
+      logStep('release', `变更日志已获取（${Math.max(1, Math.round(releaseBody.length / 1024))} KB）`, 'done');
+      logStep('ai', 'AI 分析变更日志中…', 'running');
       const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl);
+      logStep('ai', 'AI 分析完成', 'done');
       console.log('AI Analysis complete. Raw items count:', analysis.items?.length || 0);
       
       // Store resolved tags in analysis for completeness
@@ -456,7 +472,10 @@ export default function App() {
     const repoInfo = GitHubService.parseRepoUrl(targetRepoUrl);
     if (!repoInfo) throw new Error('Invalid GitHub URL');
 
+    setProgressLog([]);
+    logStep('tags', `解析版本 tag（${targetFromVersion} → ${targetToVersion}）…`, 'running');
     const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
+    logStep('tags', `版本解析完成：${actualFromTag} → ${actualToTag}`, 'done');
 
     if (actualToTag === actualFromTag) {
       throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
@@ -464,8 +483,13 @@ export default function App() {
 
     // 1. Fetch commit data first to determine strategy
     // Only compareCommits failure is allowed to throw
+    logStep('overview', '获取变更概览（commits / 文件列表）…', 'running');
     const commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
     const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
+    const strategyLabel = strategy.mode === 'full_diff' ? '完整 diff 分析'
+      : strategy.mode === 'multi_batch_full_diff' ? '分组分批分析'
+      : '概览分析';
+    logStep('overview', `变更概览：${commitData.commits.length} 个 commit / ${commitData.files.length} 个文件 · 策略：${strategyLabel}`, 'done');
 
     let diff = '';
     let metadata: { mode: DiffAnalysisMode, fallbackReason?: string, confidenceNote?: string } = {
@@ -476,16 +500,19 @@ export default function App() {
     // 2. Fetch diff based on strategy
     try {
       if (strategy.mode === 'full_diff') {
+        logStep('diff', '拉取完整 diff…', 'running');
         const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
         if (diffResult.error) {
           const parsedError = parseGitHubError(diffResult.error);
           console.warn('Full diff failed, falling back to multi-batch analysis:', parsedError.message);
+          logStep('diff', `完整 diff 获取失败，降级为分批分析：${parsedError.message}`, 'error');
           strategy.mode = 'multi_batch_full_diff';
           metadata.mode = 'multi_batch_full_diff';
           metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
           metadata.confidenceNote = '由于无法获取完整差异，已降级为分组分批分析。';
         } else {
           diff = diffResult.diff;
+          logStep('diff', `完整 diff 已获取（${Math.max(1, Math.round((diff?.length || 0) / 1024))} KB）`, 'done');
         }
       }
 
@@ -503,6 +530,7 @@ export default function App() {
         } catch (e) {
           console.warn('Failed to fetch release notes:', e);
         }
+        logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
         // 一次性获取完整 compare diff 并按文件本地切分。
         // GitHub compare API 不支持按 path 过滤，旧实现对每个缺 patch 的
@@ -512,6 +540,7 @@ export default function App() {
           patchMap = splitUnifiedDiffByFile(diff);
         } else {
           try {
+            logStep('patchmap', '拉取完整 diff 并按文件切分…', 'running');
             const wholeDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
             if (!wholeDiff.error && wholeDiff.diff) {
               patchMap = splitUnifiedDiffByFile(wholeDiff.diff);
@@ -519,6 +548,9 @@ export default function App() {
           } catch (e) {
             console.warn('Failed to fetch whole diff for patch map, relying on inline patches:', e);
           }
+          logStep('patchmap', patchMap.size > 0
+            ? `diff 切分完成：${patchMap.size} 个文件补丁`
+            : '完整 diff 不可用，仅使用 API 内联补丁', patchMap.size > 0 ? 'done' : 'error');
         }
 
         // 先展开全部批次任务，再受限并行执行（旧实现为完全串行，
@@ -542,7 +574,9 @@ export default function App() {
         }
 
         setBatchProgress({ total: jobs.length, completed: 0 });
+        logStep('batch', `批次分析：0/${jobs.length}（并行 ${AI_BATCH_CONCURRENCY} 路）`, 'running');
         const failedBatches: string[] = [];
+        let completedBatchCount = 0;
 
         const batchResults: BatchAnalysisResult[] = await mapWithConcurrency(jobs, AI_BATCH_CONCURRENCY, async (job) => {
           const batchEvidence: FileEvidence[] = job.files.map((file) => {
@@ -609,14 +643,19 @@ export default function App() {
             }
           }
           setBatchProgress(prev => prev ? { ...prev, completed: prev.completed + 1 } : prev);
+          completedBatchCount++;
+          logStep('batch', `批次分析：${completedBatchCount}/${jobs.length}（并行 ${AI_BATCH_CONCURRENCY} 路）`, 'running');
           return result;
         });
+
+        logStep('batch', `批次分析完成：${jobs.length} 批${failedBatches.length > 0 ? `，其中 ${failedBatches.length} 批失败` : ''}`, failedBatches.length > 0 ? 'error' : 'done');
 
         if (failedBatches.length > 0) {
           metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：${failedBatches.length} 个批次重试后仍失败（${failedBatches.join('、')}），对应文件未纳入分析。`;
         }
 
         // 4. Aggregate results（AI 聚合失败时本地合并兜底，绝不丢弃批次成果）
+        logStep('aggregate', 'AI 聚合汇总中…', 'running');
         let finalAnalysis: FullDiffAnalysis;
         try {
           finalAnalysis = await provider.aggregateBatchResults(
@@ -626,10 +665,12 @@ export default function App() {
             targetToVersion,
             releaseNotes
           );
+          logStep('aggregate', 'AI 聚合完成', 'done');
         } catch (aggErr: any) {
           console.error('AI aggregation failed, falling back to local merge:', aggErr);
           finalAnalysis = mergeBatchResultsLocally(batchResults, targetFromVersion, targetToVersion);
           metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：AI 聚合阶段失败（${aggErr?.message || aggErr}），结果由各批次直接合并生成。`;
+          logStep('aggregate', 'AI 聚合失败，已用本地合并兜底（批次成果未丢失）', 'error');
         }
 
         // Ensure all required fields are present
@@ -694,7 +735,9 @@ export default function App() {
       } catch (e) {
         console.warn('Failed to fetch release notes:', e);
       }
+      logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
+      logStep('ai', 'AI 深度分析中…', 'running');
       const analysis = await provider.analyzeFullDiff(
         diff, 
         background, 
@@ -705,7 +748,8 @@ export default function App() {
         commitData.files,
         metadata
       );
-      
+      logStep('ai', 'AI 深度分析完成', 'done');
+
       // Ensure items is an array before sorting
       if (!Array.isArray(analysis.items)) analysis.items = [];
       if (!Array.isArray(analysis.recommendations)) analysis.recommendations = [];
@@ -769,7 +813,8 @@ export default function App() {
         commitData.files,
         metadata
       );
-      
+      logStep('ai', 'AI 概览分析完成（降级模式）', 'done');
+
       analysis.analysisMode = metadata.mode;
       analysis.confidenceNote = metadata.confidenceNote;
       analysis.fallbackReason = metadata.fallbackReason;
@@ -1491,7 +1536,7 @@ export default function App() {
               </div>
             )}
 
-            {analysisMode !== 'batch' && !changeLogAnalysis && !fullDiffAnalysis && !loading && (
+            {analysisMode !== 'batch' && !changeLogAnalysis && !fullDiffAnalysis && !loading && progressLog.length === 0 && (
               <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-center space-y-4 bg-white/50 border border-dashed border-black/10 rounded-3xl">
                 <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center text-black/20">
                   <History size={32} />
@@ -1503,29 +1548,48 @@ export default function App() {
               </div>
             )}
 
-            {loading && (step === 'analyzing-changelog' || step === 'analyzing-full-diff') && (
-              <div className="space-y-6">
-                {step === 'analyzing-full-diff' && batchProgress && batchProgress.total > 0 && (
-                  <div className="bg-white rounded-3xl p-6 border border-black/5 shadow-sm">
-                    <div className="flex items-center justify-between mb-3">
-                      <span className="text-sm font-bold flex items-center gap-2">
-                        <Loader2 className="animate-spin" size={14} />
-                        分批深度分析中（并行 {AI_BATCH_CONCURRENCY} 路）
-                      </span>
-                      <span className="text-xs font-medium text-black/40">{batchProgress.completed} / {batchProgress.total} 批</span>
-                    </div>
-                    <div className="h-2 bg-black/5 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-emerald-500 rounded-full transition-all duration-500"
-                        style={{ width: `${Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100)}%` }}
-                      />
-                    </div>
+            {progressLog.length > 0 && !fullDiffAnalysis && !changeLogAnalysis && (
+              <div className="bg-white rounded-2xl p-4 border border-black/5 shadow-sm">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-black/60 flex items-center gap-2">
+                    {loading ? <Loader2 className="animate-spin" size={12} /> : <Info size={12} />}
+                    处理过程
+                  </span>
+                  {batchProgress && batchProgress.total > 0 && (
+                    <span className="text-[10px] font-medium text-black/40">
+                      {batchProgress.completed}/{batchProgress.total} 批 · 并行 {AI_BATCH_CONCURRENCY} 路
+                    </span>
+                  )}
+                </div>
+                {loading && batchProgress && batchProgress.total > 0 && (
+                  <div className="h-1.5 bg-black/5 rounded-full overflow-hidden mb-2">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100)}%` }}
+                    />
                   </div>
                 )}
-                <div className="space-y-6 animate-pulse">
-                  <div className="h-48 bg-white rounded-3xl border border-black/5" />
-                  <div className="h-64 bg-white rounded-3xl border border-black/5" />
+                <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+                  {progressLog.map(e => (
+                    <div key={e.id} className="flex items-start gap-2 text-[11px] leading-relaxed">
+                      {e.status === 'running' ? (
+                        <Loader2 className="animate-spin shrink-0 mt-0.5 text-blue-500" size={11} />
+                      ) : e.status === 'error' ? (
+                        <AlertTriangle className="shrink-0 mt-0.5 text-amber-500" size={11} />
+                      ) : (
+                        <CheckCircle2 className="shrink-0 mt-0.5 text-emerald-500" size={11} />
+                      )}
+                      <span className={cn('text-black/60', e.status === 'error' && 'text-amber-700')}>{e.text}</span>
+                    </div>
+                  ))}
                 </div>
+              </div>
+            )}
+
+            {loading && (step === 'analyzing-changelog' || step === 'analyzing-full-diff') && (
+              <div className="space-y-6 animate-pulse">
+                <div className="h-48 bg-white rounded-3xl border border-black/5" />
+                <div className="h-64 bg-white rounded-3xl border border-black/5" />
               </div>
             )}
 
