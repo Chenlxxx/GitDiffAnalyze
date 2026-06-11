@@ -211,6 +211,7 @@ export default function App() {
 
     let actualToTag = toMatch?.name || cleanTo;
     let actualFromTag = fromMatch?.name || cleanFrom;
+    const availableTags = tags.map(t => t.name);
 
     // SPECIAL CASE: If start and end versions are the same, 
     // auto-detect the previous tag to provide a meaningful delta
@@ -227,7 +228,25 @@ export default function App() {
       }
     }
 
-    return { actualFromTag, actualToTag };
+    return { actualFromTag, actualToTag, fromMatched: !!fromMatch, toMatched: !!toMatch, availableTags };
+  };
+
+  /** 版本 Tag 未找到时的可操作报错：指明缺哪个版本，并列出仓库真实存在的部分 Tag */
+  const buildTagNotFoundError = (
+    availableTags: string[], fromMatched: boolean, toMatched: boolean,
+    aFrom: string, aTo: string, inputFrom: string, inputTo: string
+  ) => {
+    const missing = [
+      !fromMatched ? `起始版本「${inputFrom}」` : null,
+      !toMatched ? `目标版本「${inputTo}」` : null
+    ].filter(Boolean).join(' 和 ') || `版本 ${aFrom} 或 ${aTo}`;
+    const sample = availableTags.slice(0, 15).join('、');
+    return new Error(
+      `在仓库中找不到${missing}对应的 Tag（当前解析为 ${aFrom} → ${aTo}）。\n` +
+      (availableTags.length
+        ? `该仓库存在的部分 Tag：${sample}${availableTags.length > 15 ? ' …' : ''}\n请从中挑选正确的版本号后重试。`
+        : `未能获取该仓库的 Tag 列表，请确认仓库地址正确，或在设置中配置 GitHub Token 后重试。`)
+    );
   };
 
   const handleAnalyze = async () => {
@@ -250,8 +269,8 @@ export default function App() {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-      const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, fromVersion, toVersion);
-      
+      const { actualFromTag, actualToTag, fromMatched, toMatched, availableTags } = await resolveActualTags(repoInfo, fromVersion, toVersion);
+
       if (actualToTag === actualFromTag) {
         throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
       }
@@ -373,13 +392,7 @@ export default function App() {
                 releaseBody = syntheticLog;
               }
             } catch (compareErr: any) {
-            // Log available tags to help user debug
-            try {
-              const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-              console.log("Available tags in this repository:", tags.map(t => t.name));
-            } catch (tagErr) {
-              console.error("Failed to fetch tags for debugging:", tagErr);
-            }
+            if (availableTags.length) console.log("Available tags in this repository:", availableTags);
 
             const status = err.response?.status || compareErr.response?.status;
             const errorData = compareErr.response?.data || err.response?.data;
@@ -388,7 +401,7 @@ export default function App() {
               const suggestion = errorData.suggestion || '请点击右上角设置图标，配置 GitHub Token（无需勾选任何权限）以将限额从 60 次/小时提升至 5000 次/小时。';
               throw new Error(`GitHub API 速率限制已达到。${suggestion}`);
             } else if (status === 404) {
-              throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。这通常是因为：\n1. 版本号输入错误\n2. 该版本在 GitHub 上既不是 Release 也不是 Tag\n3. 仓库地址错误\n\n当前尝试匹配的 Tag 为: ${actualToTag}`);
+              throw buildTagNotFoundError(availableTags, fromMatched, toMatched, actualFromTag, actualToTag, fromVersion, toVersion);
             } else {
               const errorMsg = errorData?.message || err.message || "未知错误";
               throw new Error(`获取发布信息失败: ${errorMsg}`);
@@ -498,7 +511,7 @@ export default function App() {
     setProgressLog([]);
     setStreamPreview('');
     logStep('tags', `解析版本 tag（${targetFromVersion} → ${targetToVersion}）…`, 'running');
-    const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
+    const { actualFromTag, actualToTag, fromMatched, toMatched, availableTags } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
     logStep('tags', `版本解析完成：${actualFromTag} → ${actualToTag}`, 'done');
 
     if (actualToTag === actualFromTag) {
@@ -508,7 +521,16 @@ export default function App() {
     // 1. Fetch commit data first to determine strategy
     // Only compareCommits failure is allowed to throw
     logStep('overview', '获取变更概览（commits / 文件列表）…', 'running');
-    const commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+    let commitData: { commits: any[]; files: any[]; html_url: string };
+    try {
+      commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+    } catch (cmpErr: any) {
+      if (cmpErr.response?.status === 404) {
+        logStep('overview', '变更概览获取失败：版本 Tag 未找到', 'error');
+        throw buildTagNotFoundError(availableTags, fromMatched, toMatched, actualFromTag, actualToTag, targetFromVersion, targetToVersion);
+      }
+      throw cmpErr;
+    }
     const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
     const strategyLabel = strategy.mode === 'full_diff' ? '完整 diff 分析'
       : strategy.mode === 'multi_batch_full_diff' ? '分组分批分析'
