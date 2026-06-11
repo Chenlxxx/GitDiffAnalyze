@@ -36,6 +36,7 @@ import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
+import { formatErrorMessage } from './services/errorUtils';
 import { buildAnalysisBundleFromChangeLog, buildAnalysisBundleFromFullDiff } from './services/skillBundleGenerator';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
@@ -53,10 +54,25 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
-  const [repoUrl, setRepoUrl] = useState('https://github.com/apache/httpcomponents-client');
-  const [fromVersion, setFromVersion] = useState('v5.4.4');
-  const [toVersion, setToVersion] = useState('v5.5');
-  const [projectBackground, setProjectBackground] = useState('平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
+  // 分析输入持久化：刷新页面后保留上次的仓库与版本
+  const INPUT_STORAGE_KEY = 'diffanalyze-last-input';
+  const lastInput = useMemo(() => {
+    try {
+      return JSON.parse(localStorage.getItem(INPUT_STORAGE_KEY) || '{}');
+    } catch {
+      return {};
+    }
+  }, []);
+  const [repoUrl, setRepoUrl] = useState(lastInput.repoUrl || 'https://github.com/apache/httpcomponents-client');
+  const [fromVersion, setFromVersion] = useState(lastInput.fromVersion || 'v5.4.4');
+  const [toVersion, setToVersion] = useState(lastInput.toVersion || 'v5.5');
+  const [projectBackground, setProjectBackground] = useState(lastInput.projectBackground || '平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INPUT_STORAGE_KEY, JSON.stringify({ repoUrl, fromVersion, toVersion, projectBackground }));
+    } catch {}
+  }, [repoUrl, fromVersion, toVersion, projectBackground]);
   
   // 模型供应商配置（v2：多供应商 + GitHub Token，持久化在 localStorage）
   const SETTINGS_STORAGE_KEY = 'diffanalyze-settings';
@@ -425,7 +441,7 @@ export default function App() {
       
     } catch (err: any) {
       console.error(err);
-      setError(err.message || '分析过程中发生错误');
+      setError(formatErrorMessage(err, '分析过程中发生错误'));
     } finally {
       setLoading(false);
     }
@@ -807,7 +823,7 @@ export default function App() {
       }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || '深度分析过程中发生错误');
+      setError(formatErrorMessage(err, '深度分析过程中发生错误'));
     } finally {
       setLoading(false);
     }
@@ -1363,7 +1379,17 @@ export default function App() {
             {error && (
               <div className="bg-red-50 border border-red-100 p-4 rounded-2xl flex gap-3 text-red-700">
                 <AlertTriangle className="shrink-0" size={20} />
-                <p className="text-sm font-medium">{error}</p>
+                <div className="space-y-2 flex-1">
+                  <p className="text-sm font-medium whitespace-pre-wrap">{error}</p>
+                  {/(设置|Token|Key|配置)/.test(error) && (
+                    <button
+                      onClick={() => { setShowSettings(true); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                      className="text-xs font-bold text-red-700 underline hover:no-underline"
+                    >
+                      打开设置
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
