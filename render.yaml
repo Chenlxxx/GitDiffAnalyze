@@ -1,0 +1,31 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# 在 Render 控制台选 New → Blueprint，关联本仓库即可按此文件创建服务。
+# 标记 sync: false 的变量需要在 Render 控制台手动填写（密钥不入库）。
+services:
+  - type: web
+    name: diffanalyze
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # ===== 默认模型供应商（前端无需配置即可使用）=====
+      # 默认 API Key（只存在服务端，绝不下发到浏览器）
+      - key: DEFAULT_AI_API_KEY
+        sync: false
+      # 默认模型名称，如 qwen-plus / deepseek-chat / gpt-4o
+      - key: DEFAULT_AI_MODEL
+        sync: false
+      # 默认 Base URL，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+      - key: DEFAULT_AI_BASE_URL
+        sync: false
+      # 接口协议：openai | anthropic | gemini（绝大多数国内厂商用 openai）
+      - key: DEFAULT_AI_PROTOCOL
+        value: openai
+      # ===== GitHub 访问 =====
+      # 默认 GitHub Token（无需任何权限，限额 60 → 5000 次/小时）
+      - key: GITHUB_TOKEN
+        sync: false

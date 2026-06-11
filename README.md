@@ -32,6 +32,25 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 - 分析完成后，页面将展示风险摘要、核心建议及详细的变更条目。
 - 对于全量 Diff 模式，您可以点击 **“下载 Excel 报告”** 获取可供团队共享的详细文档。
 
+## 部署到 Render
+
+仓库自带 [render.yaml](render.yaml) 蓝图：Render 控制台 → New → Blueprint → 关联本仓库即可。也可手动创建 Web Service：
+
+- **Build Command**: `npm ci && npm run build`
+- **Start Command**: `npm start`
+- **环境变量**：
+
+| 变量 | 说明 | 示例 |
+|---|---|---|
+| `NODE_ENV` | 必须设为 `production` | `production` |
+| `DEFAULT_AI_API_KEY` | 默认模型 API Key（仅存服务端，不下发浏览器） | `sk-xxx` |
+| `DEFAULT_AI_MODEL` | 默认模型名称 | `qwen-plus` |
+| `DEFAULT_AI_BASE_URL` | 默认 Base URL（OpenAI 官方可留空） | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `DEFAULT_AI_PROTOCOL` | 接口协议 `openai` / `anthropic` / `gemini` | `openai` |
+| `GITHUB_TOKEN` | 默认 GitHub Token（无需权限，限额 60→5000/小时） | `ghp_xxx` |
+
+配置齐 `DEFAULT_AI_API_KEY` + `DEFAULT_AI_MODEL` 后，访客打开页面会自动出现已激活的「平台默认（服务端配置）」供应商，无需自行填写 Key 即可分析；访客也仍可在设置中添加自己的 Key 覆盖默认。
+
 ## Skill 形态（无需启动平台）
 
 本仓库自带两个可在 Claude Code / OpenCode 中直接使用的 skill，对应平台的两段式流程：
