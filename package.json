@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "dev:docker": "tsx watch --clear-screen=false server.ts",
     "start": "tsx server.ts",
     "build": "vite build",
     "preview": "vite preview",

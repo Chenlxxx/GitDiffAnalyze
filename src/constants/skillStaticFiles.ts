@@ -21,6 +21,8 @@ description: 使用内置的 analysis-bundle，对当前本地仓库进行三方
 4. \`.opencode/skills/release-review/analysis-bundle/unresolved-questions.json\`
 5. \`.opencode/skills/release-review/analysis-bundle/platform-summary.md\`
 
+\`manifest.json\` 中的 \`analysis_mode\` 标识风险项来源：\`changelog\` 表示基于上游变更日志，\`full_diff\` 系列表示基于上游两个版本间的源码 Diff。\`project_background\` 字段记录了使用方项目的背景描述（模块构成、使用场景、依赖方式）。
+
 ## 主要任务
 将 bundle 中的每条风险项都视为“待验证假设 + 已有证据”，不要视为最终事实。
 
@@ -34,6 +36,8 @@ description: 使用内置的 analysis-bundle，对当前本地仓库进行三方
 
 ## 执行规则
 - 全部输出使用中文。
+- 先阅读 \`manifest.json\` 中的 \`project_background\`，优先验证与背景所述模块、协议、用法直接相关的风险项；但当背景描述与仓库实际代码冲突时，以代码证据为准。
+- 当 \`analysis_mode\` 为 \`full_diff\` 系列时，\`diff-evidence.jsonl\` 中的 \`source_snippet\`（上游变更代码片段）与 \`related_commits\`（上游 commit 链接）是源码级证据，可直接据此搜索当前仓库中对应的 API 调用点。
 - 优先使用当前仓库中的代码证据，而不是项目背景推测。
 - 如果仓库未使用某个被引用的库或 API，要明确说明，并降低该风险项的置信度或级别。
 - 必要时引用简短代码片段、文件路径、类名、方法名作为证据。

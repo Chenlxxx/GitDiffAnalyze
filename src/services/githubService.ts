@@ -16,11 +16,25 @@ export interface GitHubPR {
   diff_url: string;
 }
 
+// 独立实例：统一携带用户配置的 GitHub Token，匿名访问仅 60 次/小时
+const githubAxios = axios.create();
+let githubToken = '';
+githubAxios.interceptors.request.use((config) => {
+  if (githubToken) {
+    config.headers.set('Authorization', `token ${githubToken}`);
+  }
+  return config;
+});
+
 export class GitHubService {
   private static BASE_URL = '/api/github';
 
+  static setToken(token: string) {
+    githubToken = (token || '').trim();
+  }
+
   static async getReleases(owner: string, repo: string): Promise<GitHubRelease[]> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases`);
+    const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases`);
     return response.data;
   }
 
@@ -29,6 +43,7 @@ export class GitHubService {
       tag,                                   // 原始输入的 tag
       tag.startsWith('v') ? tag : `v${tag}`,   // 常见的 v1.0.0 格式
       tag.replace(/^v/, ''),                 // 去掉 v 的纯版本号
+      `rel/${tag.startsWith('v') ? tag : `v${tag}`}`, // Apache 风格: rel/v5.5
       `${repo}-${tag}`,                      // Netty 风格: netty-4.1.133.Final
     ];
     
@@ -44,7 +59,7 @@ export class GitHubService {
 
     for (const t of uniqueTags) {
       try {
-        const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases/tags/${t}`);
+        const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/releases/tags/${t}`);
         if (response.data && response.data.body) {
           return response.data;
         }
@@ -70,7 +85,7 @@ export class GitHubService {
     let allTags: { name: string }[] = [];
     for (let i = 1; i <= pages; i++) {
         try {
-            const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags?per_page=100&page=${i}`);
+            const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/tags?per_page=100&page=${i}`);
             if (response.data && response.data.length > 0) {
                 allTags = [...allTags, ...response.data];
             } else {
@@ -84,14 +99,14 @@ export class GitHubService {
   }
 
   static async compareCommits(owner: string, repo: string, base: string, head: string): Promise<{ commits: any[], files: any[], html_url: string }> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`);
+    const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`);
     return response.data;
   }
 
   static async getCompareDiff(owner: string, repo: string, base: string, head: string): Promise<{ diff: string, error?: any }> {
     // Use GitHub API with diff media type
     try {
-      const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
+      const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
         headers: {
           'Accept': 'application/vnd.github.v3.diff'
         }
@@ -105,7 +120,7 @@ export class GitHubService {
 
   static async getFileDiff(owner: string, repo: string, base: string, head: string, path: string): Promise<string> {
     try {
-      const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
+      const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/compare/${base}...${head}`, {
         headers: {
           'Accept': 'application/vnd.github.v3.diff'
         },
@@ -121,7 +136,7 @@ export class GitHubService {
   }
 
   static async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/contents/${path}?ref=${ref}`);
+    const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/contents/${path}?ref=${ref}`);
     if (response.data.encoding === 'base64') {
       const binaryString = atob(response.data.content.replace(/\n/g, ''));
       const bytes = new Uint8Array(binaryString.length);
@@ -135,7 +150,7 @@ export class GitHubService {
 
   static async getCommitDiff(owner: string, repo: string, sha: string): Promise<string> {
     try {
-      const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/commits/${sha}`, {
+      const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/commits/${sha}`, {
         headers: {
           'Accept': 'application/vnd.github.v3.diff'
         }
@@ -147,7 +162,7 @@ export class GitHubService {
     }
   }
   static async getPullRequest(owner: string, repo: string, prNumber: number): Promise<GitHubPR> {
-    const response = await axios.get(`${this.BASE_URL}/repos/${owner}/${repo}/pulls/${prNumber}`);
+    const response = await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/pulls/${prNumber}`);
     return {
       number: response.data.number,
       title: response.data.title,
@@ -158,7 +173,7 @@ export class GitHubService {
   }
 
   static async getDiff(diffUrl: string): Promise<string> {
-    const response = await axios.get(`/api/github-raw?url=${encodeURIComponent(diffUrl)}`);
+    const response = await githubAxios.get(`/api/github-raw?url=${encodeURIComponent(diffUrl)}`);
     return response.data;
   }
 

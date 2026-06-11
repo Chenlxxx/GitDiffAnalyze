@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Github, 
   ArrowRight, 
@@ -28,13 +28,16 @@ import {
 import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
-import { getAIProvider } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, SkillBundle } from './types';
-import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS } from './services/diffStrategy';
+import { getAIProvider, setStreamListener } from './services/aiProvider';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
+import { ModelSettings } from './components/ModelSettings';
+import { mapWithConcurrency, splitUnifiedDiffByFile, mergeBatchResultsLocally } from './services/diffUtils';
+import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS, AI_BATCH_CONCURRENCY } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
 import { parseGitHubError } from './services/githubErrorUtils';
-import { buildAnalysisBundleFromChangeLog } from './services/skillBundleGenerator';
+import { formatErrorMessage } from './services/errorUtils';
+import { buildAnalysisBundleFromChangeLog, buildAnalysisBundleFromFullDiff } from './services/skillBundleGenerator';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -51,20 +54,101 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
-  const [repoUrl, setRepoUrl] = useState('https://github.com/apache/httpcomponents-client');
-  const [fromVersion, setFromVersion] = useState('v5.4.4');
-  const [toVersion, setToVersion] = useState('v5.5');
-  const [projectBackground, setProjectBackground] = useState('平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
+  // 分析输入持久化：刷新页面后保留上次的仓库与版本
+  const INPUT_STORAGE_KEY = 'diffanalyze-last-input';
+  const lastInput = useMemo(() => {
+    try {
+      return JSON.parse(localStorage.getItem(INPUT_STORAGE_KEY) || '{}');
+    } catch {
+      return {};
+    }
+  }, []);
+  const [repoUrl, setRepoUrl] = useState(lastInput.repoUrl || 'https://github.com/apache/httpcomponents-client');
+  const [fromVersion, setFromVersion] = useState(lastInput.fromVersion || 'v5.4.4');
+  const [toVersion, setToVersion] = useState(lastInput.toVersion || 'v5.5');
+  const [projectBackground, setProjectBackground] = useState(lastInput.projectBackground || '平台背景：MateInfo Integration Platform 是华为内部面向多租户的统一集成中间件，负责 REST/SOAP/FTP 等协议适配、流量治理、凭证管理、审计日志、监控告警、热部署等。平台模块包括 Shared Utilities、FTP Integration、iFlow Engine、Integration Core、REST API、REST Invoke、Security Services、SOAP Services、SOAP Invoke、Integration Auxiliary。');
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INPUT_STORAGE_KEY, JSON.stringify({ repoUrl, fromVersion, toVersion, projectBackground }));
+    } catch {}
+  }, [repoUrl, fromVersion, toVersion, projectBackground]);
   
-  // AI Config
-  const [aiConfig, setAiConfig] = useState<AIConfig>({
-    provider: 'openai-compatible',
-    apiKey: '',
-    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen-plus',
-    useProxy: true
-  });
+  // 模型供应商配置（v2：多供应商 + GitHub Token，持久化在 localStorage）
+  const SETTINGS_STORAGE_KEY = 'diffanalyze-settings';
+  const loadSettings = (): AppSettings => {
+    const empty: AppSettings = { version: 2, providers: [], activeProviderId: null, githubToken: '' };
+    try {
+      const raw = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
+      if (raw.version === 2 && Array.isArray(raw.providers)) {
+        return { ...empty, ...raw };
+      }
+      // v1 -> v2 迁移：旧版单一 aiConfig 转为一个供应商条目
+      if (raw.aiConfig && raw.aiConfig.apiKey) {
+        const legacy = raw.aiConfig;
+        const protocol: ModelProtocol = legacy.provider === 'openai-compatible' ? 'openai' : legacy.provider;
+        const migrated: ModelProviderConfig = {
+          id: 'migrated-v1',
+          presetId: protocol === 'gemini' ? 'gemini' : (protocol === 'anthropic' ? 'custom-anthropic' : 'custom-openai'),
+          displayName: '旧版配置（自动迁移）',
+          protocol,
+          baseUrl: legacy.baseUrl || '',
+          apiKey: legacy.apiKey || '',
+          model: legacy.model || '',
+          useProxy: legacy.useProxy !== false,
+          enabled: true
+        };
+        return { version: 2, providers: [migrated], activeProviderId: migrated.id, githubToken: raw.githubToken || '' };
+      }
+      return { ...empty, githubToken: raw.githubToken || '' };
+    } catch {
+      return empty;
+    }
+  };
+  const initialSettings = useMemo(loadSettings, []);
+  const [providers, setProviders] = useState<ModelProviderConfig[]>(initialSettings.providers);
+  const [activeProviderId, setActiveProviderId] = useState<string | null>(initialSettings.activeProviderId);
+  const [githubToken, setGithubToken] = useState<string>(initialSettings.githubToken);
+  const [streamingEnabled, setStreamingEnabled] = useState<boolean>(initialSettings.streamingEnabled !== false);
   const [showSettings, setShowSettings] = useState(false);
+
+  useEffect(() => {
+    GitHubService.setToken(githubToken);
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ version: 2, providers, activeProviderId, githubToken, streamingEnabled }));
+    } catch {}
+  }, [providers, activeProviderId, githubToken, streamingEnabled]);
+
+  // AI 流式输出实时预览（仅单路调用阶段：changelog / 单次 full_diff / 聚合）
+  const [streamPreview, setStreamPreview] = useState('');
+  /** 在 fn 执行期间挂载流监听器，把模型实时输出喂给预览区；结束后必定清理 */
+  const runWithStream = async <T,>(fn: () => Promise<T>, stage?: { id: string; label: string }): Promise<T> => {
+    if (!streamingEnabled) return fn();
+    setStreamPreview('');
+    let lastPaint = 0;
+    setStreamListener(({ full }) => {
+      const now = Date.now();
+      // 节流：快速 token 流下最多约每 80ms 刷新一次，避免高频重渲染卡顿
+      if (now - lastPaint < 80) return;
+      lastPaint = now;
+      setStreamPreview(full.length > 1500 ? '…' + full.slice(-1500) : full);
+      // 同步把生成字数打到对应阶段的日志行，流式是否在工作一目了然
+      if (stage) logStep(stage.id, `${stage.label}（已生成 ${full.length} 字）`, 'running');
+    });
+    try {
+      return await fn();
+    } finally {
+      setStreamListener(null);
+    }
+  };
+
+  const activeProvider = providers.find(p => p.id === activeProviderId) || null;
+  /** 所有分析入口统一取当前激活的供应商；未配置时抛出可操作的错误提示 */
+  const requireAIConfig = (): AIConfig => {
+    if (!activeProvider) throw new Error('尚未配置 AI 模型。请点击右上角设置图标，添加模型供应商并填写 API Key。');
+    if (!activeProvider.apiKey) throw new Error(`模型「${activeProvider.displayName}」未填写 API Key，请在设置中补全。`);
+    return toLegacyAIConfig(activeProvider);
+  };
 
   const [loading, setLoading] = useState(false);
   const [excelLoading, setExcelLoading] = useState(false);
@@ -79,6 +163,18 @@ export default function App() {
   const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
+  const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number } | null>(null);
+  // 处理过程可视化：每个阶段一行，按 id 原位更新避免刷屏
+  const [progressLog, setProgressLog] = useState<{ id: string; text: string; status: 'running' | 'done' | 'error' }[]>([]);
+  const logStep = (id: string, text: string, status: 'running' | 'done' | 'error') => {
+    setProgressLog(prev => {
+      const idx = prev.findIndex(e => e.id === id);
+      if (idx === -1) return [...prev, { id, text, status }];
+      const copy = [...prev];
+      copy[idx] = { id, text, status };
+      return copy;
+    });
+  };
 
   // Batch Analysis State
   const [batchItems, setBatchItems] = useState<BatchAnalysisItem[]>([]);
@@ -117,6 +213,7 @@ export default function App() {
 
     let actualToTag = toMatch?.name || cleanTo;
     let actualFromTag = fromMatch?.name || cleanFrom;
+    const availableTags = tags.map(t => t.name);
 
     // SPECIAL CASE: If start and end versions are the same, 
     // auto-detect the previous tag to provide a meaningful delta
@@ -133,7 +230,25 @@ export default function App() {
       }
     }
 
-    return { actualFromTag, actualToTag };
+    return { actualFromTag, actualToTag, fromMatched: !!fromMatch, toMatched: !!toMatch, availableTags };
+  };
+
+  /** 版本 Tag 未找到时的可操作报错：指明缺哪个版本，并列出仓库真实存在的部分 Tag */
+  const buildTagNotFoundError = (
+    availableTags: string[], fromMatched: boolean, toMatched: boolean,
+    aFrom: string, aTo: string, inputFrom: string, inputTo: string
+  ) => {
+    const missing = [
+      !fromMatched ? `起始版本「${inputFrom}」` : null,
+      !toMatched ? `目标版本「${inputTo}」` : null
+    ].filter(Boolean).join(' 和 ') || `版本 ${aFrom} 或 ${aTo}`;
+    const sample = availableTags.slice(0, 15).join('、');
+    return new Error(
+      `在仓库中找不到${missing}对应的 Tag（当前解析为 ${aFrom} → ${aTo}）。\n` +
+      (availableTags.length
+        ? `该仓库存在的部分 Tag：${sample}${availableTags.length > 15 ? ' …' : ''}\n请从中挑选正确的版本号后重试。`
+        : `未能获取该仓库的 Tag 列表，请确认仓库地址正确，或在设置中配置 GitHub Token 后重试。`)
+    );
   };
 
   const handleAnalyze = async () => {
@@ -147,14 +262,17 @@ export default function App() {
     setPreparedSkillBundle(null);
     setFullDiffAnalysis(null);
     setDiffAnalyses({});
+    setProgressLog([]);
+    setStreamPreview('');
     setStep('analyzing-changelog');
+    logStep('release', '获取 Release Notes / Changelog…', 'running');
 
     try {
       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
       if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-      const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, fromVersion, toVersion);
-      
+      const { actualFromTag, actualToTag, fromMatched, toMatched, availableTags } = await resolveActualTags(repoInfo, fromVersion, toVersion);
+
       if (actualToTag === actualFromTag) {
         throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
       }
@@ -276,22 +394,16 @@ export default function App() {
                 releaseBody = syntheticLog;
               }
             } catch (compareErr: any) {
-            // Log available tags to help user debug
-            try {
-              const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
-              console.log("Available tags in this repository:", tags.map(t => t.name));
-            } catch (tagErr) {
-              console.error("Failed to fetch tags for debugging:", tagErr);
-            }
+            if (availableTags.length) console.log("Available tags in this repository:", availableTags);
 
             const status = err.response?.status || compareErr.response?.status;
             const errorData = compareErr.response?.data || err.response?.data;
             
-            if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
-              const suggestion = errorData.suggestion || '请在设置中配置 GitHub Token 以提高限制。';
+            if (status === 403 && (errorData?.message?.includes('rate limit') || errorData?.message?.includes('速率限制'))) {
+              const suggestion = errorData.suggestion || '请点击右上角设置图标，配置 GitHub Token（无需勾选任何权限）以将限额从 60 次/小时提升至 5000 次/小时。';
               throw new Error(`GitHub API 速率限制已达到。${suggestion}`);
             } else if (status === 404) {
-              throw new Error(`无法找到版本 "${fromVersion}" 或 "${toVersion}"。这通常是因为：\n1. 版本号输入错误\n2. 该版本在 GitHub 上既不是 Release 也不是 Tag\n3. 仓库地址错误\n\n当前尝试匹配的 Tag 为: ${actualToTag}`);
+              throw buildTagNotFoundError(availableTags, fromMatched, toMatched, actualFromTag, actualToTag, fromVersion, toVersion);
             } else {
               const errorMsg = errorData?.message || err.message || "未知错误";
               throw new Error(`获取发布信息失败: ${errorMsg}`);
@@ -302,7 +414,7 @@ export default function App() {
     }
 
       // 2. Analyze Change Log with Selected AI
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
       
       if (!releaseBody || releaseBody.trim().length === 0) {
         throw new Error(`未能找到从 ${actualFromTag} 到 ${actualToTag} 的 Release Note 内容。该项目可能没有在 GitHub Releases 中维护详细日志。建议尝试使用【全量比较 (Diff) 模式】进行分析，它会直接分析代码提交差异。`);
@@ -315,7 +427,13 @@ export default function App() {
         releaseBody = releaseBody.substring(0, MAX_CHANGELOG_LENGTH) + "\n\n... (为了保证分析效率，内容已部分截断，请结合原始 Release Note 查看)";
       }
 
-      const analysis = await provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl);
+      logStep('release', `变更日志已获取（${Math.max(1, Math.round(releaseBody.length / 1024))} KB）`, 'done');
+      logStep('ai', 'AI 分析变更日志中…', 'running');
+      const analysis = await runWithStream(
+        () => provider.analyzeChangeLog(releaseBody, projectBackground, releaseUrl),
+        { id: 'ai', label: 'AI 分析变更日志中' }
+      );
+      logStep('ai', 'AI 分析完成', 'done');
       console.log('AI Analysis complete. Raw items count:', analysis.items?.length || 0);
       
       // Store resolved tags in analysis for completeness
@@ -380,7 +498,7 @@ export default function App() {
       
     } catch (err: any) {
       console.error(err);
-      setError(err.message || '分析过程中发生错误');
+      setError(formatErrorMessage(err, '分析过程中发生错误'));
     } finally {
       setLoading(false);
     }
@@ -395,7 +513,11 @@ export default function App() {
     const repoInfo = GitHubService.parseRepoUrl(targetRepoUrl);
     if (!repoInfo) throw new Error('Invalid GitHub URL');
 
-    const { actualFromTag, actualToTag } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
+    setProgressLog([]);
+    setStreamPreview('');
+    logStep('tags', `解析版本 tag（${targetFromVersion} → ${targetToVersion}）…`, 'running');
+    const { actualFromTag, actualToTag, fromMatched, toMatched, availableTags } = await resolveActualTags(repoInfo, targetFromVersion, targetToVersion);
+    logStep('tags', `版本解析完成：${actualFromTag} → ${actualToTag}`, 'done');
 
     if (actualToTag === actualFromTag) {
       throw new Error(`起始版本与终止版本相同 (${actualToTag})，且无法自动识别上一个正式版本。请手动输入不同的起始版本（例如前一个版本号）。`);
@@ -403,8 +525,22 @@ export default function App() {
 
     // 1. Fetch commit data first to determine strategy
     // Only compareCommits failure is allowed to throw
-    const commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+    logStep('overview', '获取变更概览（commits / 文件列表）…', 'running');
+    let commitData: { commits: any[]; files: any[]; html_url: string };
+    try {
+      commitData = await GitHubService.compareCommits(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+    } catch (cmpErr: any) {
+      if (cmpErr.response?.status === 404) {
+        logStep('overview', '变更概览获取失败：版本 Tag 未找到', 'error');
+        throw buildTagNotFoundError(availableTags, fromMatched, toMatched, actualFromTag, actualToTag, targetFromVersion, targetToVersion);
+      }
+      throw cmpErr;
+    }
     const strategy = determineDiffStrategy(commitData.commits.length, commitData.files.length);
+    const strategyLabel = strategy.mode === 'full_diff' ? '完整 diff 分析'
+      : strategy.mode === 'multi_batch_full_diff' ? '分组分批分析'
+      : '概览分析';
+    logStep('overview', `变更概览：${commitData.commits.length} 个 commit / ${commitData.files.length} 个文件 · 策略：${strategyLabel}`, 'done');
 
     let diff = '';
     let metadata: { mode: DiffAnalysisMode, fallbackReason?: string, confidenceNote?: string } = {
@@ -415,25 +551,27 @@ export default function App() {
     // 2. Fetch diff based on strategy
     try {
       if (strategy.mode === 'full_diff') {
+        logStep('diff', '拉取完整 diff…', 'running');
         const diffResult = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
         if (diffResult.error) {
           const parsedError = parseGitHubError(diffResult.error);
           console.warn('Full diff failed, falling back to multi-batch analysis:', parsedError.message);
+          logStep('diff', `完整 diff 获取失败，降级为分批分析：${parsedError.message}`, 'error');
           strategy.mode = 'multi_batch_full_diff';
           metadata.mode = 'multi_batch_full_diff';
           metadata.fallbackReason = `获取完整差异失败: ${parsedError.message}`;
           metadata.confidenceNote = '由于无法获取完整差异，已降级为分组分批分析。';
         } else {
           diff = diffResult.diff;
+          logStep('diff', `完整 diff 已获取（${Math.max(1, Math.round((diff?.length || 0) / 1024))} KB）`, 'done');
         }
       }
 
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
 
       if (strategy.mode === 'multi_batch_full_diff') {
         // 3. Multi-batch analysis logic
         const groups = groupFiles(commitData.files);
-        const batchResults: any[] = [];
 
         // Fetch release notes early for context
         let releaseNotes = '';
@@ -443,93 +581,152 @@ export default function App() {
         } catch (e) {
           console.warn('Failed to fetch release notes:', e);
         }
+        logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
-        for (const group of groups) {
-          const sortedFiles = sortFilesByPriority(group.files);
-          const batches = [];
-          for (let i = 0; i < sortedFiles.length; i += BATCH_ANALYSIS_FILE_BATCH_SIZE) {
-            batches.push(sortedFiles.slice(i, i + BATCH_ANALYSIS_FILE_BATCH_SIZE));
-          }
-
-          for (let i = 0; i < batches.length; i++) {
-            if (batchResults.length >= MAX_BATCHES_PER_ANALYSIS) {
-              console.warn(`Reached MAX_BATCHES_PER_ANALYSIS (${MAX_BATCHES_PER_ANALYSIS}), skipping remaining batches.`);
-              break;
+        // 一次性获取完整 compare diff 并按文件本地切分。
+        // GitHub compare API 不支持按 path 过滤，旧实现对每个缺 patch 的
+        // 文件单独请求时实际都在重复下载完整 diff，是耗时大头之一。
+        let patchMap = new Map<string, string>();
+        if (diff) {
+          patchMap = splitUnifiedDiffByFile(diff);
+        } else {
+          try {
+            logStep('patchmap', '拉取完整 diff 并按文件切分…', 'running');
+            const wholeDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+            if (!wholeDiff.error && wholeDiff.diff) {
+              patchMap = splitUnifiedDiffByFile(wholeDiff.diff);
             }
-            const batchFiles = batches[i];
-            
-            // Create structured evidence for each file in the batch
-            const batchEvidence: FileEvidence[] = await Promise.all(batchFiles.map(async (file) => {
-              let patch = file.patch;
-              let diffFetchFailed = false;
-              
-              if (!patch) {
-                try {
-                  patch = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-                } catch (e) {
-                  console.warn(`Failed to fetch diff for ${file.filename}:`, e);
-                  diffFetchFailed = true;
-                }
-              }
-
-              return {
-                filename: file.filename,
-                group: group.name,
-                status: file.status,
-                additions: file.additions,
-                deletions: file.deletions,
-                patch: patch || undefined,
-                patchAvailable: !!patch,
-                diffFetchFailed,
-                riskHint: getRiskHint(group.name),
-                reviewHint: getReviewHint(group.name)
-              };
-            }));
-
-            // Format evidence as a structured string for the AI
-            const evidenceString = batchEvidence.map(ev => {
-              let str = `[File Evidence]\n`;
-              str += `Path: ${ev.filename}\n`;
-              str += `Group: ${ev.group}\n`;
-              str += `Status: ${ev.status}\n`;
-              str += `Changes: +${ev.additions}/-${ev.deletions}\n`;
-              str += `Risk Hint: ${ev.riskHint}\n`;
-              str += `Review Hint: ${ev.reviewHint}\n`;
-              str += `Patch Available: ${ev.patchAvailable ? 'YES' : 'NO'}\n`;
-              if (ev.diffFetchFailed) {
-                str += `!!! DIFF_FETCH_FAILED: YES (Please analyze based on metadata and commit context)\n`;
-              }
-              if (ev.patchAvailable && ev.patch) {
-                str += `Patch Content:\n${ev.patch}\n`;
-              }
-              return str;
-            }).join('\n---\n\n');
-
-            const batchResult = await provider.analyzeBatchDiff(
-              evidenceString,
-              background,
-              targetFromVersion,
-              targetToVersion,
-              group.name,
-              i,
-              batches.length,
-              releaseNotes,
-              commitData.commits
-            );
-            batchResults.push(batchResult);
+          } catch (e) {
+            console.warn('Failed to fetch whole diff for patch map, relying on inline patches:', e);
           }
+          logStep('patchmap', patchMap.size > 0
+            ? `diff 切分完成：${patchMap.size} 个文件补丁`
+            : '完整 diff 不可用，仅使用 API 内联补丁', patchMap.size > 0 ? 'done' : 'error');
         }
 
-        // 4. Aggregate results
-        const finalAnalysis = await provider.aggregateBatchResults(
-          batchResults,
-          background,
-          targetFromVersion,
-          targetToVersion,
-          releaseNotes
-        );
+        // 先展开全部批次任务，再受限并行执行（旧实现为完全串行，
+        // 几十个批次 × 每次 30-90 秒即 20 分钟耗时的主因）
+        interface BatchJob { groupName: string; files: any[]; indexInGroup: number; batchesInGroup: number; }
+        const jobs: BatchJob[] = [];
+        for (const group of groups) {
+          const sortedFiles = sortFilesByPriority(group.files);
+          for (let i = 0; i < sortedFiles.length; i += BATCH_ANALYSIS_FILE_BATCH_SIZE) {
+            jobs.push({
+              groupName: group.name,
+              files: sortedFiles.slice(i, i + BATCH_ANALYSIS_FILE_BATCH_SIZE),
+              indexInGroup: Math.floor(i / BATCH_ANALYSIS_FILE_BATCH_SIZE),
+              batchesInGroup: Math.ceil(sortedFiles.length / BATCH_ANALYSIS_FILE_BATCH_SIZE)
+            });
+          }
+        }
+        if (jobs.length > MAX_BATCHES_PER_ANALYSIS) {
+          console.warn(`Batch count ${jobs.length} exceeds MAX_BATCHES_PER_ANALYSIS (${MAX_BATCHES_PER_ANALYSIS}), truncating.`);
+          jobs.length = MAX_BATCHES_PER_ANALYSIS;
+        }
+
+        setBatchProgress({ total: jobs.length, completed: 0 });
+        logStep('batch', `批次分析：0/${jobs.length}（并行 ${AI_BATCH_CONCURRENCY} 路）`, 'running');
+        const failedBatches: string[] = [];
+        let completedBatchCount = 0;
+
+        const batchResults: BatchAnalysisResult[] = await mapWithConcurrency(jobs, AI_BATCH_CONCURRENCY, async (job) => {
+          const batchEvidence: FileEvidence[] = job.files.map((file) => {
+            const patch = file.patch || patchMap.get(file.filename);
+            return {
+              filename: file.filename,
+              group: job.groupName,
+              status: file.status,
+              additions: file.additions,
+              deletions: file.deletions,
+              patch: patch || undefined,
+              patchAvailable: !!patch,
+              diffFetchFailed: !patch,
+              riskHint: getRiskHint(job.groupName),
+              reviewHint: getReviewHint(job.groupName)
+            };
+          });
+
+          // Format evidence as a structured string for the AI
+          const evidenceString = batchEvidence.map(ev => {
+            let str = `[File Evidence]\n`;
+            str += `Path: ${ev.filename}\n`;
+            str += `Group: ${ev.group}\n`;
+            str += `Status: ${ev.status}\n`;
+            str += `Changes: +${ev.additions}/-${ev.deletions}\n`;
+            str += `Risk Hint: ${ev.riskHint}\n`;
+            str += `Review Hint: ${ev.reviewHint}\n`;
+            str += `Patch Available: ${ev.patchAvailable ? 'YES' : 'NO'}\n`;
+            if (ev.diffFetchFailed) {
+              str += `!!! DIFF_FETCH_FAILED: YES (Please analyze based on metadata and commit context)\n`;
+            }
+            if (ev.patchAvailable && ev.patch) {
+              str += `Patch Content:\n${ev.patch}\n`;
+            }
+            return str;
+          }).join('\n---\n\n');
+
+          const run = () => provider.analyzeBatchDiff(
+            evidenceString,
+            background,
+            targetFromVersion,
+            targetToVersion,
+            job.groupName,
+            job.indexInGroup,
+            job.batchesInGroup,
+            releaseNotes,
+            commitData.commits
+          );
+
+          let result: BatchAnalysisResult;
+          try {
+            result = await run();
+          } catch (firstErr) {
+            console.warn(`Batch ${job.groupName}#${job.indexInGroup + 1} failed, retrying once:`, firstErr);
+            try {
+              result = await run();
+            } catch (secondErr: any) {
+              failedBatches.push(`${job.groupName} 第 ${job.indexInGroup + 1} 批`);
+              result = {
+                items: [],
+                summary: `批次分析失败（${job.groupName} 第 ${job.indexInGroup + 1} 批）：${secondErr?.message || secondErr}`,
+                recommendations: []
+              };
+            }
+          }
+          setBatchProgress(prev => prev ? { ...prev, completed: prev.completed + 1 } : prev);
+          completedBatchCount++;
+          logStep('batch', `批次分析：${completedBatchCount}/${jobs.length}（并行 ${AI_BATCH_CONCURRENCY} 路）`, 'running');
+          return result;
+        });
+
+        logStep('batch', `批次分析完成：${jobs.length} 批${failedBatches.length > 0 ? `，其中 ${failedBatches.length} 批失败` : ''}`, failedBatches.length > 0 ? 'error' : 'done');
+
+        if (failedBatches.length > 0) {
+          metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：${failedBatches.length} 个批次重试后仍失败（${failedBatches.join('、')}），对应文件未纳入分析。`;
+        }
+
+        // 4. Aggregate results（AI 聚合失败时本地合并兜底，绝不丢弃批次成果）
+        logStep('aggregate', 'AI 聚合汇总中…', 'running');
+        let finalAnalysis: FullDiffAnalysis;
+        try {
+          finalAnalysis = await runWithStream(() => provider.aggregateBatchResults(
+            batchResults,
+            background,
+            targetFromVersion,
+            targetToVersion,
+            releaseNotes
+          ), { id: 'aggregate', label: 'AI 聚合汇总中' });
+          logStep('aggregate', 'AI 聚合完成', 'done');
+        } catch (aggErr: any) {
+          console.error('AI aggregation failed, falling back to local merge:', aggErr);
+          finalAnalysis = mergeBatchResultsLocally(batchResults, targetFromVersion, targetToVersion);
+          metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：AI 聚合阶段失败（${aggErr?.message || aggErr}），结果由各批次直接合并生成。`;
+          logStep('aggregate', 'AI 聚合失败，已用本地合并兜底（批次成果未丢失）', 'error');
+        }
 
         // Ensure all required fields are present
+        if (!Array.isArray(finalAnalysis.items)) finalAnalysis.items = [];
+        if (!Array.isArray(finalAnalysis.recommendations)) finalAnalysis.recommendations = [];
         finalAnalysis.analysisMode = 'multi_batch_full_diff';
         finalAnalysis.confidenceNote = metadata.confidenceNote || strategy.confidenceNote;
         finalAnalysis.fallbackReason = metadata.fallbackReason;
@@ -558,18 +755,18 @@ export default function App() {
         return finalAnalysis;
       } else if (strategy.mode === 'segmented_full_diff') {
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF);
-        const diffs = await Promise.all(priorityFiles.map(async (file) => {
-          if (file.patch) {
-            return `File: ${file.filename}\n${file.patch}`;
-          }
-          try {
-            const fileDiff = await GitHubService.getFileDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag, file.filename);
-            return `File: ${file.filename}\n${fileDiff}`;
-          } catch (e) {
-            return `File: ${file.filename}\n(Failed to fetch diff)`;
-          }
-        }));
-        diff = diffs.join('\n\n');
+        // 一次性拉取完整 diff 后本地切分（compare API 不支持按 path 过滤）
+        let segPatchMap = new Map<string, string>();
+        try {
+          const segDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
+          if (!segDiff.error && segDiff.diff) segPatchMap = splitUnifiedDiffByFile(segDiff.diff);
+        } catch (e) {
+          console.warn('Failed to fetch diff for segmented analysis:', e);
+        }
+        diff = priorityFiles.map(file => {
+          const patch = file.patch || segPatchMap.get(file.filename);
+          return `File: ${file.filename}\n${patch || '(Failed to fetch diff)'}`;
+        }).join('\n\n');
       } else if (strategy.mode === 'partial_full_diff') {
         // partial_full_diff - use available patches
         const priorityFiles = sortFilesByPriority(commitData.files).slice(0, 5);
@@ -589,20 +786,24 @@ export default function App() {
       } catch (e) {
         console.warn('Failed to fetch release notes:', e);
       }
+      logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
-      const analysis = await provider.analyzeFullDiff(
-        diff, 
-        background, 
-        targetFromVersion, 
-        targetToVersion, 
-        releaseNotes, 
-        commitData.commits, 
+      logStep('ai', 'AI 深度分析中…', 'running');
+      const analysis = await runWithStream(() => provider.analyzeFullDiff(
+        diff,
+        background,
+        targetFromVersion,
+        targetToVersion,
+        releaseNotes,
+        commitData.commits,
         commitData.files,
         metadata
-      );
-      
+      ), { id: 'ai', label: 'AI 深度分析中' });
+      logStep('ai', 'AI 深度分析完成', 'done');
+
       // Ensure items is an array before sorting
-      if (!analysis.items) analysis.items = [];
+      if (!Array.isArray(analysis.items)) analysis.items = [];
+      if (!Array.isArray(analysis.recommendations)) analysis.recommendations = [];
       
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
       analysis.items.sort((a, b) => {
@@ -652,18 +853,19 @@ export default function App() {
         .join('\n\n');
       diff = patches || '由于差异提取失败，已降级为基于元数据的概览分析。';
 
-      const provider = getAIProvider(aiConfig);
-      const analysis = await provider.analyzeFullDiff(
-        diff, 
-        background, 
-        targetFromVersion, 
-        targetToVersion, 
-        '', 
-        commitData.commits, 
+      const provider = getAIProvider(requireAIConfig());
+      const analysis = await runWithStream(() => provider.analyzeFullDiff(
+        diff,
+        background,
+        targetFromVersion,
+        targetToVersion,
+        '',
+        commitData.commits,
         commitData.files,
         metadata
-      );
-      
+      ), { id: 'ai', label: 'AI 概览分析中' });
+      logStep('ai', 'AI 概览分析完成（降级模式）', 'done');
+
       analysis.analysisMode = metadata.mode;
       analysis.confidenceNote = metadata.confidenceNote;
       analysis.fallbackReason = metadata.fallbackReason;
@@ -698,20 +900,36 @@ export default function App() {
     setError(null);
     setChangeLogAnalysis(null);
     setFullDiffAnalysis(null);
+    setPreparedSkillBundle(null);
     setDiffAnalyses({});
+    setBatchProgress(null);
     setStep('analyzing-full-diff');
 
     try {
       const analysis = await performFullDiffAnalysis(repoUrl, fromVersion, toVersion, projectBackground);
-      
+
       if (analysis.resolvedTags) {
         setResolvedTags(analysis.resolvedTags);
       }
 
       setFullDiffAnalysis(analysis);
+
+      // 预先准备好 Skill Bundle，避免下载时再次调用 AI
+      try {
+        const bundle = buildAnalysisBundleFromFullDiff(
+          analysis,
+          repoUrl,
+          fromVersion,
+          toVersion,
+          projectBackground
+        );
+        setPreparedSkillBundle(bundle);
+      } catch (bundleErr) {
+        console.error('Failed to prepare skill bundle:', bundleErr);
+      }
     } catch (err: any) {
       console.error(err);
-      setError(err.message || '深度分析过程中发生错误');
+      setError(formatErrorMessage(err, '深度分析过程中发生错误'));
     } finally {
       setLoading(false);
     }
@@ -921,7 +1139,7 @@ export default function App() {
       const pr = await GitHubService.getPullRequest(repoInfo.owner, repoInfo.repo, prNumber);
       const diff = await GitHubService.getDiff(pr.diff_url);
       
-      const provider = getAIProvider(aiConfig);
+      const provider = getAIProvider(requireAIConfig());
       const analysis = await provider.analyzeDiff(diff, pr.title, projectBackground);
       setDiffAnalyses(prev => ({ ...prev, [prNumber]: analysis }));
     } catch (err: any) {
@@ -1092,9 +1310,12 @@ export default function App() {
             >
               <Settings size={20} />
             </button>
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-emerald-50 text-emerald-700 rounded-full text-xs font-medium border border-emerald-100">
-              <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" />
-              {aiConfig.provider === 'gemini' ? 'Gemini 3.1 Pro' : aiConfig.model} 已就绪
+            <div className={cn(
+              "hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium border",
+              activeProvider ? "bg-emerald-50 text-emerald-700 border-emerald-100" : "bg-amber-50 text-amber-700 border-amber-100"
+            )}>
+              <div className={cn("w-1.5 h-1.5 rounded-full animate-pulse", activeProvider ? "bg-emerald-500" : "bg-amber-500")} />
+              {activeProvider ? `${activeProvider.displayName} · ${activeProvider.model} 已就绪` : '未配置模型，请打开设置'}
             </div>
           </div>
         </div>
@@ -1103,86 +1324,16 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-12">
         {/* Settings Panel */}
         {showSettings && (
-          <div className="mb-12 bg-white rounded-3xl p-8 shadow-sm border border-black/5 animate-in fade-in slide-in-from-top-4">
-            <div className="flex items-center gap-2 mb-6">
-              <Cpu size={20} className="text-emerald-500" />
-              <h2 className="text-xl font-bold">AI 模型配置</h2>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">AI 提供商</label>
-                  <select 
-                    value={aiConfig.provider}
-                    onChange={(e) => {
-                      const newProvider = e.target.value as any;
-                      let newConfig = { ...aiConfig, provider: newProvider };
-                      
-                      if (newProvider === 'anthropic') {
-                        newConfig.baseUrl = 'https://api.nengpa.com/anthropic';
-                        newConfig.model = 'MiniMax-M2.5';
-                        newConfig.apiKey = 'sk-cp-33559ebabc72ac5e103c00ae6baa8dd49bd971c449dd599e7b5f327fc8626b29';
-                      } else if (newProvider === 'openai-compatible') {
-                        newConfig.baseUrl = 'https://api.openai.com/v1';
-                        newConfig.model = 'gpt-4o';
-                      }
-                      
-                      setAiConfig(newConfig);
-                    }}
-                    className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  >
-                  <option value="gemini">Google Gemini</option>
-                  <option value="openai-compatible">OpenAI 兼容 (豆包/Qwen/DeepSeek)</option>
-                  <option value="anthropic">Anthropic (MiniMax-M2.5)</option>
-                </select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">API Key</label>
-                <input 
-                  type="password" 
-                  value={aiConfig.apiKey}
-                  onChange={(e) => setAiConfig({...aiConfig, apiKey: e.target.value})}
-                  className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                  placeholder={aiConfig.provider === 'gemini' ? '可选 (默认使用系统 Key)' : '请输入 API Key'}
-                />
-              </div>
-              <div className="space-y-2 flex flex-col justify-end pb-1">
-                <label className="flex items-center gap-2 cursor-pointer group">
-                  <input 
-                    type="checkbox" 
-                    checked={aiConfig.useProxy}
-                    onChange={(e) => setAiConfig({...aiConfig, useProxy: e.target.checked})}
-                    className="w-5 h-5 rounded-lg border-black/10 text-emerald-500 focus:ring-emerald-500/20 transition-all"
-                  />
-                  <span className="text-sm font-bold text-black/60 group-hover:text-black transition-colors">使用代理模式</span>
-                </label>
-                <p className="text-[10px] text-black/30 mt-1">在静态托管环境（如 Cloudflare Pages）下建议关闭此项。</p>
-              </div>
-              {(aiConfig.provider === 'openai-compatible' || aiConfig.provider === 'anthropic') && (
-                <>
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">Base URL</label>
-                    <input 
-                      type="text" 
-                      value={aiConfig.baseUrl}
-                      onChange={(e) => setAiConfig({...aiConfig, baseUrl: e.target.value})}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder={aiConfig.provider === 'anthropic' ? 'https://api.nengpa.com/anthropic' : 'https://api.openai.com/v1'}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <label className="text-[11px] uppercase tracking-wider font-bold text-black/40">模型名称</label>
-                    <input 
-                      type="text" 
-                      value={aiConfig.model}
-                      onChange={(e) => setAiConfig({...aiConfig, model: e.target.value})}
-                      className="w-full px-4 py-3 bg-[#F9F9F9] border border-black/5 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all text-sm"
-                      placeholder={aiConfig.provider === 'anthropic' ? 'MiniMax-M2.5' : 'gpt-4o / qwen-max'}
-                    />
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
+          <ModelSettings
+            providers={providers}
+            activeProviderId={activeProviderId}
+            onProvidersChange={setProviders}
+            onActiveChange={setActiveProviderId}
+            githubToken={githubToken}
+            onGithubTokenChange={setGithubToken}
+            streamingEnabled={streamingEnabled}
+            onStreamingChange={setStreamingEnabled}
+          />
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
@@ -1336,7 +1487,17 @@ export default function App() {
             {error && (
               <div className="bg-red-50 border border-red-100 p-4 rounded-2xl flex gap-3 text-red-700">
                 <AlertTriangle className="shrink-0" size={20} />
-                <p className="text-sm font-medium">{error}</p>
+                <div className="space-y-2 flex-1">
+                  <p className="text-sm font-medium whitespace-pre-wrap">{error}</p>
+                  {/(设置|Token|Key|配置)/.test(error) && (
+                    <button
+                      onClick={() => { setShowSettings(true); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                      className="text-xs font-bold text-red-700 underline hover:no-underline"
+                    >
+                      打开设置
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -1365,7 +1526,23 @@ export default function App() {
                   {batchItems.map((item, idx) => (
                     <div 
                       key={idx} 
-                      onClick={() => item.status === 'completed' && item.analysis && setFullDiffAnalysis(item.analysis)}
+                      onClick={() => {
+                        if (item.status !== 'completed' || !item.analysis) return;
+                        setFullDiffAnalysis(item.analysis);
+                        // 切换批量结果时同步重建 Skill Bundle，避免下载到上一个项目的内容
+                        try {
+                          setPreparedSkillBundle(buildAnalysisBundleFromFullDiff(
+                            item.analysis,
+                            item.repoUrl,
+                            item.fromVersion,
+                            item.toVersion,
+                            projectBackground
+                          ));
+                        } catch (bundleErr) {
+                          console.error('Failed to prepare skill bundle:', bundleErr);
+                          setPreparedSkillBundle(null);
+                        }
+                      }}
                       className={cn(
                         "flex items-center justify-between p-4 bg-[#F9F9F9] rounded-xl border border-black/5 transition-all",
                         item.status === 'completed' && item.analysis ? "cursor-pointer hover:bg-black/[0.02] hover:border-emerald-500/30" : ""
@@ -1412,7 +1589,7 @@ export default function App() {
               </div>
             )}
 
-            {analysisMode !== 'batch' && !changeLogAnalysis && !fullDiffAnalysis && !loading && (
+            {analysisMode !== 'batch' && !changeLogAnalysis && !fullDiffAnalysis && !loading && progressLog.length === 0 && (
               <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-center space-y-4 bg-white/50 border border-dashed border-black/10 rounded-3xl">
                 <div className="w-16 h-16 bg-white rounded-2xl shadow-sm flex items-center justify-center text-black/20">
                   <History size={32} />
@@ -1421,6 +1598,53 @@ export default function App() {
                   <h3 className="text-lg font-bold">暂无分析结果</h3>
                   <p className="text-sm text-black/40 max-w-xs mx-auto">配置您的项目详情并点击“开始分析”以启动 AI 驱动的风险评估。</p>
                 </div>
+              </div>
+            )}
+
+            {progressLog.length > 0 && !fullDiffAnalysis && !changeLogAnalysis && (
+              <div className="bg-white rounded-2xl p-4 border border-black/5 shadow-sm">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-black/60 flex items-center gap-2">
+                    {loading ? <Loader2 className="animate-spin" size={12} /> : <Info size={12} />}
+                    处理过程
+                  </span>
+                  {batchProgress && batchProgress.total > 0 && (
+                    <span className="text-[10px] font-medium text-black/40">
+                      {batchProgress.completed}/{batchProgress.total} 批 · 并行 {AI_BATCH_CONCURRENCY} 路
+                    </span>
+                  )}
+                </div>
+                {loading && batchProgress && batchProgress.total > 0 && (
+                  <div className="h-1.5 bg-black/5 rounded-full overflow-hidden mb-2">
+                    <div
+                      className="h-full bg-emerald-500 rounded-full transition-all duration-500"
+                      style={{ width: `${Math.round((batchProgress.completed / Math.max(1, batchProgress.total)) * 100)}%` }}
+                    />
+                  </div>
+                )}
+                <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+                  {progressLog.map(e => (
+                    <div key={e.id} className="flex items-start gap-2 text-[11px] leading-relaxed">
+                      {e.status === 'running' ? (
+                        <Loader2 className="animate-spin shrink-0 mt-0.5 text-blue-500" size={11} />
+                      ) : e.status === 'error' ? (
+                        <AlertTriangle className="shrink-0 mt-0.5 text-amber-500" size={11} />
+                      ) : (
+                        <CheckCircle2 className="shrink-0 mt-0.5 text-emerald-500" size={11} />
+                      )}
+                      <span className={cn('text-black/60', e.status === 'error' && 'text-amber-700')}>{e.text}</span>
+                    </div>
+                  ))}
+                </div>
+                {loading && streamPreview && (
+                  <div className="mt-2 pt-2 border-t border-black/5">
+                    <div className="flex items-center gap-1.5 text-[10px] text-black/30 mb-1">
+                      <Cpu size={10} className="text-blue-400" />
+                      模型实时输出
+                    </div>
+                    <pre className="text-[10px] leading-relaxed text-black/45 whitespace-pre-wrap break-all max-h-24 overflow-y-auto font-mono bg-black/[0.02] rounded-lg p-2">{streamPreview}</pre>
+                  </div>
+                )}
               </div>
             )}
 
@@ -1449,6 +1673,16 @@ export default function App() {
                         {excelLoading ? <Loader2 className="animate-spin" size={14} /> : <Download size={14} />}
                         下载 Excel 报告
                       </button>
+                      {preparedSkillBundle && (
+                        <button
+                          onClick={handleDownloadSkill}
+                          disabled={skillLoading}
+                          className="flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 border border-blue-100 rounded-xl text-xs font-bold hover:bg-blue-100 transition-all disabled:opacity-50"
+                        >
+                          {skillLoading ? <Loader2 className="animate-spin" size={14} /> : <FileArchive size={14} />}
+                          下载 Skill
+                        </button>
+                      )}
                       <div className="flex items-center gap-2">
                         <span className={cn(
                           "px-3 py-1 rounded-full text-[10px] uppercase tracking-wider font-bold border",
@@ -1547,15 +1781,15 @@ export default function App() {
                           {item.commitLinks && item.commitLinks.length > 0 && (
                             <div className="mb-4 flex flex-wrap gap-2">
                               {item.commitLinks.map((link, lIdx) => (
-                                <a 
+                                <a
                                   key={lIdx}
-                                  href={link.url}
+                                  href={link?.url || '#'}
                                   target="_blank"
                                   rel="noreferrer"
                                   className="inline-flex items-center gap-1 px-2 py-1 bg-gray-100 hover:bg-gray-200 border border-black/5 rounded text-[10px] font-mono text-black/60 transition-colors"
                                 >
                                   <GitCommit size={10} />
-                                  {link.sha.substring(0, 7)}
+                                  {String(link?.sha || 'commit').substring(0, 7)}
                                 </a>
                               ))}
                             </div>

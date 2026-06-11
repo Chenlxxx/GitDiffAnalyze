@@ -2,6 +2,78 @@ import { GoogleGenAI, Type } from "@google/genai";
 import axios from "axios";
 import { AIProvider, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, AIConfig, ExcelAnalysis, BatchAnalysisResult, SkillBundle } from "../types";
 
+// ===== 流式输出总线 =====
+// 模块级单监听器：仅在「单路调用」阶段（changelog / 单次 full_diff / 聚合）启用，
+// 并行批次不设监听器，避免 4 路 token 交织。callAI 检测到监听器即走流式传输。
+export type StreamListener = (info: { delta: string; full: string }) => void;
+let activeStreamListener: StreamListener | null = null;
+export function setStreamListener(cb: StreamListener | null) { activeStreamListener = cb; }
+
+/**
+ * 流式消费 OpenAI / Anthropic 协议的 SSE 响应，累积并实时回调 delta，返回完整文本。
+ * useProxy 时打到服务端 /api/ai-proxy-stream 透传端点。
+ */
+async function streamChatCompletion(
+  url: string,
+  data: any,
+  headers: Record<string, string>,
+  useProxy: boolean,
+  onDelta: (delta: string, full: string) => void
+): Promise<string> {
+  const body = { ...data, stream: true };
+  const resp = await fetch(useProxy ? '/api/ai-proxy-stream' : url, {
+    method: 'POST',
+    headers: useProxy ? { 'Content-Type': 'application/json' } : { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(useProxy ? { url, data: body, headers } : body),
+  });
+
+  if (!resp.ok || !resp.body) {
+    let msg = `流式请求失败 (${resp.status})`;
+    try { const j = await resp.json(); msg = j.message || msg; } catch {}
+    throw new Error(msg);
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let full = '';
+
+  const handlePayload = (payload: string) => {
+    if (!payload || payload === '[DONE]') return;
+    try {
+      const obj = JSON.parse(payload);
+      // OpenAI 协议
+      const oa = obj.choices?.[0]?.delta?.content;
+      if (typeof oa === 'string' && oa) { full += oa; onDelta(oa, full); return; }
+      // Anthropic 协议
+      if (obj.type === 'content_block_delta' && typeof obj.delta?.text === 'string') {
+        full += obj.delta.text; onDelta(obj.delta.text, full); return;
+      }
+    } catch { /* 忽略非 JSON 的心跳/事件行 */ }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('data:')) handlePayload(trimmed.slice(5).trim());
+    }
+  }
+  if (buffer.trim().startsWith('data:')) handlePayload(buffer.trim().slice(5).trim());
+  return full;
+}
+
+function stripThinking(content: string): string {
+  if (content && typeof content === 'string') {
+    return content.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
+  }
+  return content;
+}
+
 function normalizeAIResponse(result: any): any {
   if (!result) return { items: [], recommendations: [], breakingChanges: [], summary: "" };
 
@@ -223,11 +295,70 @@ function normalizeAIResponse(result: any): any {
     }
   });
 
+  // 7. Sanitize render-facing fields: 模型可能把字符串字段返回成嵌套对象、
+  // 把 commitLinks 返回成字符串数组，直接渲染会让 React 整树崩溃（白屏）
+  const toText = (v: any): string => {
+    if (v == null) return '';
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+  };
+
+  result.summary = toText(result.summary);
+  (['recommendations', 'breakingChanges', 'compatibilityNotes'] as const).forEach(field => {
+    result[field] = result[field].map((entry: any) => toText(entry)).filter(Boolean);
+  });
+
+  result.items = result.items.map((item: any) => {
+    if (typeof item !== 'object' || item === null) {
+      const text = toText(item);
+      return { title: text, description: text, reason: text, impactLevel: 'Low', riskLevel: 'Low', commitLinks: [] };
+    }
+    let codeExample: { before: string; after: string } | undefined;
+    if (item.codeExample) {
+      codeExample = typeof item.codeExample === 'string'
+        ? { before: '', after: item.codeExample }
+        : { before: toText(item.codeExample.before), after: toText(item.codeExample.after) };
+      if (!codeExample.before && !codeExample.after) codeExample = undefined;
+    }
+    const commitLinks = (Array.isArray(item.commitLinks) ? item.commitLinks : []).map((link: any) => {
+      if (typeof link === 'string') {
+        const sha = (link.match(/[0-9a-f]{7,40}/i) || [''])[0];
+        return { sha: sha || link.slice(0, 12), url: /^https?:\/\//.test(link) ? link : '' };
+      }
+      if (link && typeof link === 'object') {
+        return { sha: toText(link.sha || link.id) || 'commit', url: toText(link.url || link.html_url) };
+      }
+      return null;
+    }).filter((l: any) => l && l.url);
+    return {
+      ...item,
+      title: toText(item.title) || '未知变更',
+      description: toText(item.description),
+      reason: toText(item.reason),
+      compatibilityAnalysis: toText(item.compatibilityAnalysis),
+      sourceSnippet: toText(item.sourceSnippet),
+      codeExample,
+      commitLinks
+    };
+  });
+
   return result;
 }
 
 function parseJSON(text: string): any {
-  if (!text) return {};
+  // 非字符串响应（部分网关把 content 返回成分段数组）先拼接成文本
+  if (text && typeof text !== 'string') {
+    if (Array.isArray(text)) {
+      text = (text as any[]).map(p => typeof p === 'string' ? p : (p?.text ?? '')).join('');
+    } else {
+      text = String(text);
+    }
+  }
+  // 空响应明确报错，而不是返回缺字段的 {}（曾导致下游读 items.length 崩溃）
+  if (!text || !String(text).trim()) {
+    throw new Error('模型返回了空响应（可能被限流、输入超长被拒或网关异常），请重试或更换模型。');
+  }
   let cleanText = text.trim();
   
   const tryParse = (str: string) => {
@@ -406,10 +537,23 @@ export class AnthropicProvider implements AIProvider {
       messages: [{ role: 'user', content: prompt }]
     };
     const headers = { 'x-api-key': this.config.apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
-    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url, 
-      this.config.useProxy ? { url, data, headers } : data, 
+
+    // 有监听器时走流式（Anthropic SSE content_block_delta），失败回退非流式
+    if (activeStreamListener) {
+      const listener = activeStreamListener;
+      try {
+        const full = await streamChatCompletion(url, data, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        if (full && full.trim()) return stripThinking(full);
+        console.warn('Streaming returned empty content, falling back to non-streaming.');
+      } catch (streamErr) {
+        console.warn('Streaming failed, falling back to non-streaming:', streamErr);
+      }
+    }
+
+    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
+      this.config.useProxy ? { url, data, headers } : data,
       { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
-    
+
     const result = response.data;
     if (Array.isArray(result.content)) {
       return result.content.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
@@ -462,16 +606,30 @@ export class OpenAICompatibleProvider implements AIProvider {
       max_tokens: 8000
     };
     const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
+
+    // 有监听器时走流式：实时回调 token，最终仍返回完整文本供 JSON 解析。
+    // 流式请求不带 response_format——大量网关不支持 json_object+stream 组合，
+    // 会报错或返回空导致静默回退；提示词已强约束 JSON，parseJSON 也能从
+    // markdown 代码块中提取。流式仍失败时回退非流式。
+    if (activeStreamListener) {
+      const listener = activeStreamListener;
+      try {
+        const { response_format: _omit, ...streamData } = data as any;
+        const full = await streamChatCompletion(url, streamData, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        if (full && full.trim()) return stripThinking(full);
+        console.warn('Streaming returned empty content, falling back to non-streaming.');
+      } catch (streamErr) {
+        console.warn('Streaming failed, falling back to non-streaming:', streamErr);
+      }
+    }
+
     const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
       this.config.useProxy ? { url, data, headers } : data,
       { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
-    
+
     const aiResponse = response.data;
     let content = aiResponse?.choices?.[0]?.message?.content || aiResponse?.choices?.[0]?.text || aiResponse?.text || (typeof aiResponse === 'string' ? aiResponse : null);
-    if (content && typeof content === 'string') {
-      content = content.replace(/<(thought|thinking)>[\s\S]*?<\/\1>/gi, '').trim();
-    }
-    return content;
+    return stripThinking(content);
   }
 
   async analyzeChangeLog(changeLog: string, projectBackground: string, sourceUrl?: string): Promise<ChangeLogAnalysis> {
@@ -485,12 +643,73 @@ export class OpenAICompatibleProvider implements AIProvider {
     return parseJSON(result);
   }
   async analyzeBatchDiff(diff: string, projectBackground: string, fromVersion: string, toVersion: string, groupName: string, batchIndex: number, totalBatches: number, releaseNotes?: string, commits?: any[]): Promise<BatchAnalysisResult> {
-    const prompt = `分析批次差异。分组：${groupName}\n版本：${fromVersion}->${toVersion}\n背景：${projectBackground}\nDiff：\n${diff.slice(0, 20000)}`;
+    const prompt = `你是资深软件架构师。分析以下三方库代码变更（${fromVersion} -> ${toVersion}，分组：${groupName}，第 ${batchIndex + 1}/${totalBatches} 批）。
+
+项目背景：${projectBackground}
+${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 2000)}\n` : ''}
+文件级变更证据：
+${diff.slice(0, 20000)}
+
+请识别可能影响使用方的 API 变更、行为变更、配置变更与移除项，输出 JSON：
+{
+  "summary": "本批次中文小结",
+  "items": [{
+    "title": "变更点标题",
+    "description": "变更说明",
+    "riskLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "对使用方的影响与排查建议",
+    "sourceSnippet": "关键 diff 片段（可选）"
+  }],
+  "recommendations": ["建议"]
+}
+只输出 JSON。仅报告证据中真实存在的变更，无实质变更时 items 返回空数组。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }
   async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
-    const prompt = `汇总结项。版本：${fromVersion}->${toVersion}\n结果数：${batchResults.length}`;
+    // 压缩批次结果作为聚合输入，整体控制在 ~60k 字符
+    const perBatchBudget = Math.max(2000, Math.floor(60000 / Math.max(1, batchResults.length)));
+    const evidence = batchResults.map((r, i) => {
+      const slim = {
+        summary: r.summary,
+        recommendations: (r.recommendations || []).slice(0, 10),
+        items: (r.items || []).map(it => ({
+          title: it.title,
+          riskLevel: it.riskLevel,
+          description: (it.description || '').slice(0, 500),
+          compatibilityAnalysis: (it.compatibilityAnalysis || '').slice(0, 400),
+          sourceSnippet: (it.sourceSnippet || '').slice(0, 400)
+        }))
+      };
+      let text = JSON.stringify(slim);
+      if (text.length > perBatchBudget) text = text.slice(0, perBatchBudget) + '…(截断)';
+      return `[批次 ${i + 1}]\n${text}`;
+    }).join('\n\n');
+
+    const prompt = `你是资深软件架构师。以下是 ${fromVersion} -> ${toVersion} 版本间代码差异的 ${batchResults.length} 个批次分析结果，请汇总为最终升级风险报告。
+
+项目背景：${projectBackground}
+${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 4000)}\n` : ''}
+批次分析结果：
+${evidence}
+
+要求：
+1. 合并重复或同类变更点，保留最具体的描述与证据；按风险从高到低排列；items 总数不超过 50 条，低风险项可合并概括。
+2. 控制输出长度：description 与 compatibilityAnalysis 各 120 字内，sourceSnippet 只保留最关键的几行（可省略）。
+3. 输出 JSON（不要输出 excelRows 等其他字段）：
+{
+  "summary": "中文总摘要（150 字内）",
+  "overallRisk": "High | Medium | Low",
+  "recommendations": ["核心建议，不超过 10 条"],
+  "items": [{
+    "title": "变更点",
+    "description": "说明",
+    "riskLevel": "High | Medium | Low",
+    "compatibilityAnalysis": "影响与排查建议",
+    "sourceSnippet": "关键 diff 片段（可选）"
+  }]
+}
+4. 严禁编造批次结果中不存在的变更；批次标注分析失败的部分不要臆测。只输出 JSON。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }

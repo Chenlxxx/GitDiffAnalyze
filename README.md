@@ -13,10 +13,11 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 ## 使用指南
 
 ### 1. 配置 AI 模型
-在使用前，请点击页面右上角的 **设置** 图标，配置您的 AI 提供商：
-- **提供商**：选择 Google Gemini 或 OpenAI 兼容接口。
-- **API Key**：填入您的 API 密钥。
-- **Base URL & 模型名称**：如果使用 OpenAI 兼容接口（如通义千问），请填写对应的 API 地址和模型 ID。
+点击页面右上角的 **设置** 图标，打开模型供应商配置中心（Dify 风格）：
+- **添加供应商**：从预置厂商中选择——DeepSeek、通义千问、Kimi、智谱 GLM、豆包（火山方舟）、MiniMax、硅基流动、OpenAI、Anthropic、Google Gemini，或选择"自定义"接入任何 OpenAI / Anthropic 兼容协议的服务（One-API、Ollama、vLLM、第三方中转等）。
+- **填写凭证**：每个供应商独立配置 API Key、Base URL 与模型名称（预置厂商已带默认值，卡片上有获取 Key 的直达链接）。
+- **测试连接**：点击卡片上的"测试连接"按钮发送一次最小请求，验证配置是否可用并显示延迟。
+- **切换模型**：可同时保存多个供应商，单选激活当前使用的那个；配置持久化在浏览器本地。
 
 ### 2. 开始分析
 1. **输入仓库地址**：填写 GitHub 仓库的完整 URL（例如 `https://github.com/apache/httpcomponents-client`）。
@@ -31,8 +32,17 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 - 分析完成后，页面将展示风险摘要、核心建议及详细的变更条目。
 - 对于全量 Diff 模式，您可以点击 **“下载 Excel 报告”** 获取可供团队共享的详细文档。
 
+## Skill 形态（无需启动平台）
+
+本仓库自带两个可在 Claude Code / OpenCode 中直接使用的 skill，对应平台的两段式流程：
+
+- **`compat-analyze/`**（第一阶段）：给出仓库地址与版本范围，agent 直接抓取 GitHub 数据并产出中文升级风险报告 `compat-report.md`，可选生成 `analysis-bundle/`。
+- **`release-review/`**（第二阶段）：在使用方仓库中读取 analysis-bundle，结合真实代码调用点对风险项逐条复核，产出 `final-report.md`。
+
+平台 Web 界面与 skill 产出的 bundle 格式互相兼容，可以混合使用（平台分析 → 下载 Skill → 仓库内复核）。
+
 ## 注意事项
 
 - 本工具仅基于提供的文本内容（Diff、Commits、Release Notes）进行静态分析，不执行实际代码。
 - 建议在分析大型仓库时，尽量缩小版本跨度，以获得更详细的分析结果。
-- 如果遇到 API 速率限制，请尝试在设置中配置您的专属 API Key。
+- 如果遇到 GitHub API 速率限制（403），请在页面右上角设置中配置 GitHub Token（无需勾选任何权限，限额从 60 次/小时提升至 5000 次/小时），或在 `.env` 中配置 `GITHUB_TOKEN` 后重启服务。

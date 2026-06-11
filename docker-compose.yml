@@ -1,0 +1,28 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: diffanalyze-dev
+    # Docker Desktop / 系统重启后自动拉起；手动 stop 后不会复活
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "24678:24678"
+    volumes:
+      # 源码挂载进容器实现热更新
+      - .:/app
+      # 命名卷遮蔽 node_modules，依赖完全隔离在容器内
+      - node_modules:/app/node_modules
+    environment:
+      NODE_ENV: development
+      # Windows bind mount 不传递 inotify 事件，chokidar 全局强制轮询
+      # (Vite 与 tsx watch 内部都使用 chokidar)
+      CHOKIDAR_USEPOLLING: "true"
+      CHOKIDAR_INTERVAL: "300"
+    env_file:
+      - path: .env
+        required: false
+
+volumes:
+  node_modules:

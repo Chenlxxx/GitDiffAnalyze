@@ -3,6 +3,73 @@ import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import path from "path";
 
+// GitHub GET 响应内存缓存：减少重复请求对速率配额的消耗
+// （匿名限额 60 次/小时，一轮分析的 tag 探测 + 翻页就可能耗尽）
+const githubCache = new Map<string, { status: number; data: any; ts: number }>();
+const GITHUB_CACHE_TTL_MS = 10 * 60 * 1000;
+const GITHUB_CACHE_MAX_ENTRIES = 300;
+const GITHUB_CACHE_MAX_VALUE_SIZE = 5 * 1024 * 1024;
+
+function githubCacheGet(key: string) {
+  const hit = githubCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > GITHUB_CACHE_TTL_MS) {
+    githubCache.delete(key);
+    return null;
+  }
+  return hit;
+}
+
+function githubCacheSet(key: string, status: number, data: any) {
+  try {
+    const size = typeof data === 'string' ? data.length : JSON.stringify(data).length;
+    if (size > GITHUB_CACHE_MAX_VALUE_SIZE) return;
+  } catch {
+    return;
+  }
+  if (githubCache.size >= GITHUB_CACHE_MAX_ENTRIES) {
+    const oldest = githubCache.keys().next().value;
+    if (oldest !== undefined) githubCache.delete(oldest);
+  }
+  githubCache.set(key, { status, data, ts: Date.now() });
+}
+
+function rateLimitResetHint(headers: any): string {
+  const reset = headers?.['x-ratelimit-reset'];
+  if (!reset) return '';
+  const minutes = Math.max(1, Math.ceil((parseInt(reset, 10) * 1000 - Date.now()) / 60000));
+  return `配额将在约 ${minutes} 分钟后重置。`;
+}
+
+// AI 代理的服务端默认 key 注入：客户端未带鉴权时按目标域名兜底
+function injectAIKey(url: string, headers: any) {
+  const authHeader = headers['Authorization'] || headers['authorization'];
+  const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
+  if (!isAuthEmpty) return;
+  if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
+  } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+  } else if (process.env.OPENAI_API_KEY) {
+    headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
+  } else {
+    console.warn(`AI Proxy: No API key provided by client and no default key found for ${url}`);
+  }
+}
+
+// 把可读流收集为字符串（带上限），用于读取上游错误响应体
+function streamToString(stream: any, maxBytes = 64 * 1024): Promise<string> {
+  return new Promise((resolve) => {
+    let out = '';
+    let len = 0;
+    stream.on('data', (chunk: Buffer) => {
+      if (len < maxBytes) { out += chunk.toString('utf8'); len += chunk.length; }
+    });
+    stream.on('end', () => resolve(out));
+    stream.on('error', () => resolve(out));
+  });
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -13,6 +80,7 @@ async function startServer() {
   // GitHub API Proxy
   app.get("/api/github/*", async (req, res) => {
     let url = "";
+    let cacheKey = "";
     try {
       const githubPath = req.params[0] || "";
       const query = new URLSearchParams(req.query as any).toString();
@@ -35,29 +103,43 @@ async function startServer() {
       } else if (process.env.GITHUB_TOKEN) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
-      
+
+      // 命中缓存则不消耗 GitHub 配额（缓存按认证身份隔离）
+      cacheKey = `${headers['Authorization'] || 'anon'}|${headers['Accept']}|${url}`;
+      const cached = githubCacheGet(cacheKey);
+      if (cached) {
+        console.log(`[cache hit] ${url}`);
+        return res.status(cached.status).json(cached.data);
+      }
+
       const response = await axios.get(url, { headers });
-      
+
+      githubCacheSet(cacheKey, 200, response.data);
       res.json(response.data);
     } catch (error: any) {
       const status = error.response?.status;
       const errorData = error.response?.data;
-      
+
       if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
         console.warn(`GitHub API Rate Limit Exceeded for ${url || req.originalUrl}`);
+        const hasAuth = !!(req.headers['authorization'] || process.env.GITHUB_TOKEN);
         return res.status(403).json({
-          message: 'GitHub API 速率限制已达到。',
+          message: `GitHub API 速率限制已达到。${rateLimitResetHint(error.response?.headers)}`,
           details: errorData,
-          suggestion: 'GitHub 限制了未授权的 API 请求。请稍后再试，或在平台环境变量中配置 GITHUB_TOKEN。'
+          suggestion: hasAuth
+            ? '当前 Token 的配额已用尽，请稍后再试或更换 Token。'
+            : '匿名访问限额仅 60 次/小时。请点击页面右上角设置图标填入 GitHub Token（无需勾选任何权限，限额提升至 5000 次/小时），或在 .env 中配置 GITHUB_TOKEN。'
         });
       }
 
       if (status === 404) {
         console.warn(`GitHub Resource Not Found (404): ${url || req.originalUrl}`);
+        // 404 同样消耗配额，短期缓存避免 tag 变体探测反复打到上游
+        if (cacheKey) githubCacheSet(cacheKey, 404, errorData || { message: 'Not Found' });
       } else {
         console.error('GitHub Proxy Error:', JSON.stringify(errorData || error.message));
       }
-      
+
       res.status(status || 500).json(errorData || { message: error.message });
     }
   });
@@ -86,8 +168,11 @@ async function startServer() {
         'Upgrade-Insecure-Requests': '1'
       };
 
-      // Use token from environment if available
-      if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
+      // Use token from client if provided, otherwise fallback to environment
+      const clientAuth = req.headers['authorization'];
+      if (clientAuth && url.includes('github.com')) {
+        headers['Authorization'] = clientAuth;
+      } else if (process.env.GITHUB_TOKEN && url.includes('api.github.com')) {
         headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
       }
 
@@ -96,7 +181,82 @@ async function startServer() {
     } catch (error: any) {
       const status = error.response?.status;
       console.error(`GitHub Raw Proxy Error (${status}):`, error.message);
-      res.status(status || 500).send(error.message);
+
+      if (status === 403 || status === 429) {
+        return res.status(status).json({
+          message: `GitHub 拒绝了 Diff 请求 (${status})，通常是速率限制。${rateLimitResetHint(error.response?.headers)}`,
+          suggestion: '请点击页面右上角设置图标填入 GitHub Token（无需勾选任何权限），或稍后再试。'
+        });
+      }
+
+      res.status(status || 500).json({ message: error.message });
+    }
+  });
+
+  // 模型连通性测试：按协议发一次最小请求，验证 baseUrl / apiKey / model 是否可用
+  app.post("/api/ai/test-connection", async (req, res) => {
+    const { protocol, baseUrl, apiKey, model } = req.body || {};
+    if (!protocol || !apiKey || !model) {
+      return res.status(400).json({ ok: false, message: '缺少必要参数（protocol / apiKey / model）' });
+    }
+    const started = Date.now();
+    try {
+      if (protocol === 'openai') {
+        const base = (baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
+        const url = base.endsWith('/chat/completions') ? base : `${base}/chat/completions`;
+        await axios.post(url, {
+          model,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1
+        }, {
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else if (protocol === 'anthropic') {
+        const base = (baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
+        const url = base.endsWith('/messages') ? base : `${base}/v1/messages`;
+        await axios.post(url, {
+          model,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'ping' }]
+        }, {
+          headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else if (protocol === 'gemini') {
+        const base = (baseUrl || 'https://generativelanguage.googleapis.com').replace(/\/$/, '');
+        const url = `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        await axios.post(url, {
+          contents: [{ parts: [{ text: 'ping' }] }],
+          generationConfig: { maxOutputTokens: 1 }
+        }, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 15000
+        });
+      } else {
+        return res.status(400).json({ ok: false, message: `不支持的协议: ${protocol}` });
+      }
+
+      res.json({ ok: true, latencyMs: Date.now() - started, message: '连接成功' });
+    } catch (error: any) {
+      const status = error.response?.status;
+      const detail = error.response?.data;
+      let message = error.message;
+      if (error.code === 'ECONNABORTED') message = '连接超时（15 秒），请检查 Base URL 或网络';
+      else if (status === 401 || status === 403) message = 'API Key 无效或无权限';
+      else if (status === 404) message = '接口或模型不存在，请检查 Base URL 与模型名称';
+      else if (status === 429) message = 'Key 有效，但当前触发限流/配额不足';
+      else if (detail?.error?.message) message = detail.error.message;
+      else if (detail?.message) message = detail.message;
+
+      // 429 说明鉴权与路由都通了，视为连通
+      const reachableButThrottled = status === 429;
+      res.status(reachableButThrottled ? 200 : (status || 500)).json({
+        ok: reachableButThrottled,
+        latencyMs: Date.now() - started,
+        message,
+        httpStatus: status
+      });
     }
   });
 
@@ -150,8 +310,8 @@ async function startServer() {
         const { GoogleGenerativeAI } = await import("@google/generative-ai");
         const genAI = new GoogleGenerativeAI(apiKey);
         
-        // Use gemini-2.0-flash for best performance/speed balance
-        const modelName = "gemini-2.0-flash"; 
+        // Use the user-configured model, falling back to gemini-2.0-flash
+        const modelName = (config && typeof config.model === 'string' && config.model.startsWith('gemini')) ? config.model : "gemini-2.0-flash";
         const model = genAI.getGenerativeModel({ 
           model: modelName, 
           generationConfig: {
@@ -257,27 +417,10 @@ async function startServer() {
   app.post("/api/ai-proxy", async (req, res) => {
     try {
       const { url, data, headers } = req.body;
-      
-      // Inject default API keys if missing or empty
-      const authHeader = headers['Authorization'] || headers['authorization'];
-      const isAuthEmpty = !authHeader || authHeader === 'Bearer ' || authHeader === 'Bearer';
-      
-      if (isAuthEmpty) {
-        if (url.includes('dashscope.aliyuncs.com') && process.env.QWEN_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.QWEN_API_KEY}`;
-          console.log('Injected QWEN_API_KEY from environment');
-        } else if (url.includes('api.openai.com') && process.env.OPENAI_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
-          console.log('Injected OPENAI_API_KEY from environment');
-        } else if (process.env.OPENAI_API_KEY) {
-          headers['Authorization'] = `Bearer ${process.env.OPENAI_API_KEY}`;
-          console.log('Injected fallback OPENAI_API_KEY from environment');
-        } else {
-          console.warn(`AI Proxy: No API key provided by client and no default key found in environment for ${url}`);
-        }
-      }
 
-      const response = await axios.post(url, data, { 
+      injectAIKey(url, headers);
+
+      const response = await axios.post(url, data, {
         headers,
         timeout: 300000 // 300 seconds timeout for AI generation
       });
@@ -314,10 +457,53 @@ async function startServer() {
         });
       }
       
-      res.status(status || 500).json(errorData || { 
+      res.status(status || 500).json(errorData || {
         message: error.message,
         url: targetUrl
       });
+    }
+  });
+
+  // Streaming proxy: 把上游 AI 的 SSE 流原样透传给浏览器（OpenAI / Anthropic 协议）
+  app.post("/api/ai-proxy-stream", async (req, res) => {
+    const { url, data, headers } = req.body;
+    try {
+      injectAIKey(url, headers);
+
+      const upstream = await axios.post(url, { ...data, stream: true }, {
+        headers,
+        responseType: 'stream',
+        timeout: 300000
+      });
+
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no'); // 禁用反代缓冲，保证逐块下发
+
+      upstream.data.pipe(res);
+      upstream.data.on('error', () => res.end());
+      // 客户端断开时关闭上游，避免空转
+      req.on('close', () => upstream.data.destroy());
+    } catch (error: any) {
+      const status = error.response?.status || 500;
+      let detail = error.message;
+      try {
+        if (error.response?.data && typeof error.response.data.on === 'function') {
+          detail = await streamToString(error.response.data);
+        }
+      } catch {}
+      console.error(`AI Stream Proxy Error (${status}) for ${url}:`, detail);
+      if (!res.headersSent) {
+        const msg = status === 401
+          ? '身份验证失败 (401)。请检查 API Key 是否正确。'
+          : status === 404
+          ? `AI 服务接口未找到 (404)。请检查 Base URL 配置。当前地址: ${url}`
+          : `AI 流式请求失败 (${status})。`;
+        res.status(status).json({ message: msg, details: detail, url });
+      } else {
+        res.end();
+      }
     }
   });
 
