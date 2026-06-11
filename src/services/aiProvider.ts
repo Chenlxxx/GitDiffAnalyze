@@ -275,7 +275,18 @@ function normalizeAIResponse(result: any): any {
 }
 
 function parseJSON(text: string): any {
-  if (!text) return {};
+  // 非字符串响应（部分网关把 content 返回成分段数组）先拼接成文本
+  if (text && typeof text !== 'string') {
+    if (Array.isArray(text)) {
+      text = (text as any[]).map(p => typeof p === 'string' ? p : (p?.text ?? '')).join('');
+    } else {
+      text = String(text);
+    }
+  }
+  // 空响应明确报错，而不是返回缺字段的 {}（曾导致下游读 items.length 崩溃）
+  if (!text || !String(text).trim()) {
+    throw new Error('模型返回了空响应（可能被限流、输入超长被拒或网关异常），请重试或更换模型。');
+  }
   let cleanText = text.trim();
   
   const tryParse = (str: string) => {

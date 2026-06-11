@@ -633,6 +633,8 @@ export default function App() {
         }
 
         // Ensure all required fields are present
+        if (!Array.isArray(finalAnalysis.items)) finalAnalysis.items = [];
+        if (!Array.isArray(finalAnalysis.recommendations)) finalAnalysis.recommendations = [];
         finalAnalysis.analysisMode = 'multi_batch_full_diff';
         finalAnalysis.confidenceNote = metadata.confidenceNote || strategy.confidenceNote;
         finalAnalysis.fallbackReason = metadata.fallbackReason;
@@ -705,7 +707,8 @@ export default function App() {
       );
       
       // Ensure items is an array before sorting
-      if (!analysis.items) analysis.items = [];
+      if (!Array.isArray(analysis.items)) analysis.items = [];
+      if (!Array.isArray(analysis.recommendations)) analysis.recommendations = [];
       
       const riskOrder: Record<string, number> = { 'High': 0, 'Medium': 1, 'Low': 2 };
       analysis.items.sort((a, b) => {
