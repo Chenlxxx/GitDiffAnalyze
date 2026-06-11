@@ -584,33 +584,22 @@ ${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 4000)}\n`
 ${evidence}
 
 要求：
-1. 合并重复或同类变更点，保留最具体的描述与证据；按风险从高到低排列。
-2. 输出 JSON：
+1. 合并重复或同类变更点，保留最具体的描述与证据；按风险从高到低排列；items 总数不超过 50 条，低风险项可合并概括。
+2. 控制输出长度：description 与 compatibilityAnalysis 各 120 字内，sourceSnippet 只保留最关键的几行（可省略）。
+3. 输出 JSON（不要输出 excelRows 等其他字段）：
 {
   "summary": "中文总摘要（150 字内）",
   "overallRisk": "High | Medium | Low",
-  "recommendations": ["核心建议"],
+  "recommendations": ["核心建议，不超过 10 条"],
   "items": [{
     "title": "变更点",
     "description": "说明",
     "riskLevel": "High | Medium | Low",
     "compatibilityAnalysis": "影响与排查建议",
     "sourceSnippet": "关键 diff 片段（可选）"
-  }],
-  "excelRows": [{
-    "version": "${toVersion}",
-    "changepoint": "标题",
-    "chinese": "中文描述",
-    "function": "影响场景",
-    "suggestion": "排查点",
-    "risk": "高/中/低",
-    "test_suggestion": "测试建议",
-    "code_discovery": "涉及类/关键字",
-    "code_fix": "整改建议",
-    "related_commits": ""
   }]
 }
-3. 严禁编造批次结果中不存在的变更；批次标注分析失败的部分不要臆测。只输出 JSON。`;
+4. 严禁编造批次结果中不存在的变更；批次标注分析失败的部分不要臆测。只输出 JSON。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }

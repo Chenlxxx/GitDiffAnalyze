@@ -31,7 +31,7 @@ import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService
 import { getAIProvider } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
 import { ModelSettings } from './components/ModelSettings';
-import { mapWithConcurrency, splitUnifiedDiffByFile } from './services/diffUtils';
+import { mapWithConcurrency, splitUnifiedDiffByFile, mergeBatchResultsLocally } from './services/diffUtils';
 import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS, AI_BATCH_CONCURRENCY } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
 import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping';
@@ -616,14 +616,21 @@ export default function App() {
           metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：${failedBatches.length} 个批次重试后仍失败（${failedBatches.join('、')}），对应文件未纳入分析。`;
         }
 
-        // 4. Aggregate results
-        const finalAnalysis = await provider.aggregateBatchResults(
-          batchResults,
-          background,
-          targetFromVersion,
-          targetToVersion,
-          releaseNotes
-        );
+        // 4. Aggregate results（AI 聚合失败时本地合并兜底，绝不丢弃批次成果）
+        let finalAnalysis: FullDiffAnalysis;
+        try {
+          finalAnalysis = await provider.aggregateBatchResults(
+            batchResults,
+            background,
+            targetFromVersion,
+            targetToVersion,
+            releaseNotes
+          );
+        } catch (aggErr: any) {
+          console.error('AI aggregation failed, falling back to local merge:', aggErr);
+          finalAnalysis = mergeBatchResultsLocally(batchResults, targetFromVersion, targetToVersion);
+          metadata.confidenceNote = `${metadata.confidenceNote || strategy.confidenceNote} 注意：AI 聚合阶段失败（${aggErr?.message || aggErr}），结果由各批次直接合并生成。`;
+        }
 
         // Ensure all required fields are present
         finalAnalysis.analysisMode = 'multi_batch_full_diff';
