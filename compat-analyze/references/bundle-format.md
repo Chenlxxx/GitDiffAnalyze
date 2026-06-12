@@ -1,7 +1,9 @@
 # analysis-bundle 格式（与 release-review skill 兼容）
 
-在 `analysis-bundle/` 目录下生成以下 5 个文件。使用方把整个目录放进自己仓库的
-`.opencode/skills/release-review/analysis-bundle/`，即可用 release-review skill 做第二阶段落地复核。
+在 `analysis-bundle/` 目录下生成以下 5 个文件。使用方把整个目录放进 release-review skill 的
+`analysis-bundle/` 子目录（与该 skill 的 SKILL.md 同级，例如 Claude Code 的
+`.claude/skills/release-review/analysis-bundle/` 或 OpenCode 的
+`.opencode/skills/release-review/analysis-bundle/`），即可做第二阶段落地复核。
 
 ## 1. manifest.json
 ```json

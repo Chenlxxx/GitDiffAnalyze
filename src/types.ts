@@ -97,6 +97,7 @@ export interface FullDiffAnalysis {
     title: string;
     description: string;
     riskLevel: 'High' | 'Medium' | 'Low';
+    affectedApis?: string[];
     compatibilityAnalysis?: string;
     sourceSnippet?: string;
     commitLinks?: {

@@ -178,6 +178,39 @@ async function startServer() {
     }
   });
 
+  // GitHub POST proxy（仅用于 releases/generate-notes 等只读式 POST，自动从 PR 生成变更日志）
+  app.post("/api/github/*", async (req, res) => {
+    let url = "";
+    try {
+      const githubPath = req.params[0] || "";
+      url = `https://api.github.com/${githubPath}`;
+      const clientAuth = req.headers['authorization'];
+      const headers: any = {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'Mozilla/5.0 (compatible; CompatAnalyzer/1.0)',
+        'Content-Type': 'application/json'
+      };
+      if (clientAuth) headers['Authorization'] = clientAuth;
+      else if (process.env.GITHUB_TOKEN) headers['Authorization'] = `token ${process.env.GITHUB_TOKEN}`;
+
+      const response = await axios.post(url, req.body, { headers });
+      res.json(response.data);
+    } catch (error: any) {
+      const status = error.response?.status;
+      const errorData = error.response?.data;
+      if (status === 403 && errorData?.message?.includes('rate limit exceeded')) {
+        return res.status(403).json({
+          message: `GitHub API 速率限制已达到。${rateLimitResetHint(error.response?.headers)}`,
+          details: errorData
+        });
+      }
+      if (status !== 404 && status !== 422) {
+        console.error('GitHub POST Proxy Error:', JSON.stringify(errorData || error.message));
+      }
+      res.status(status || 500).json(errorData || { message: error.message });
+    }
+  });
+
   // Proxy for raw diffs (different domain)
   app.get("/api/github-raw", async (req, res) => {
     try {

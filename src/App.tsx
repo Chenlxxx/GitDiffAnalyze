@@ -415,12 +415,36 @@ export default function App() {
           throw new Error('Release body too short or release not found, trying files');
         }
       } catch (err: any) {
-        // Fallback 1: Try to find a changelog file in the repo (e.g., RELEASE_NOTES.txt)
+        // Fallback 1: GitHub 自动从两个 tag 间的 PR 生成变更日志——覆盖面最广，
+        // 多数没有维护 CHANGELOG/Release 的仓库都能产出（需要 GitHub Token）
         try {
-          const files = ['RELEASE_NOTES.txt', 'CHANGELOG.md', 'CHANGES.txt', 'RELEASENOTES.md', 'CHANGELOG.txt', 'notes/RELEASE_NOTES.txt'];
+          logStep('release', '尝试从 PR 自动生成变更日志…', 'running');
+          const generated = await GitHubService.generateReleaseNotes(repoInfo.owner, repoInfo.repo, actualToTag, actualFromTag);
+          if (generated && generated.body.length > (releaseBody?.length || 0)) {
+            releaseBody = generated.body;
+            // 指向 compare 对比页（始终有效），而非可能不存在的 release 页
+            releaseUrl = `https://github.com/${repoInfo.owner}/${repoInfo.repo}/compare/${actualFromTag}...${actualToTag}`;
+            console.log('Using GitHub auto-generated release notes.');
+          }
+        } catch (genErr) {
+          console.warn('generate-notes fallback failed:', genErr);
+        }
+
+        // Fallback 2: 仓库内变更日志文件（仅当上面内容仍不充分时）
+        try {
+          const files = [
+            'CHANGELOG.md', 'CHANGELOG.txt', 'CHANGELOG', 'CHANGELOG.rst', 'CHANGELOG.adoc',
+            'CHANGES.md', 'CHANGES.txt', 'CHANGES', 'CHANGES.rst',
+            'CHANGES/CHANGELOG.md',
+            'RELEASE_NOTES.txt', 'RELEASE_NOTES.md', 'RELEASENOTES.md', 'RELEASENOTES.txt', 'RELEASE-NOTES.txt',
+            'HISTORY.md', 'HISTORY.txt', 'NEWS.md', 'NEWS.txt', 'NEWS',
+            'notes/RELEASE_NOTES.txt', 'docs/CHANGELOG.md', 'docs/changelog.md', 'doc/CHANGELOG.md',
+            'changelog.md', 'changes.md'
+          ];
           let fileContent = '';
           let foundFile = '';
-          for (const file of files) {
+          // generate-notes 已给出充分内容时跳过文件搜索，省去无谓的 API 调用
+          for (const file of (releaseBody && releaseBody.length >= 400 ? [] : files)) {
             try {
               fileContent = await GitHubService.getFileContent(repoInfo.owner, repoInfo.repo, file, actualToTag);
               if (fileContent && fileContent.length > 500) {
@@ -1864,7 +1888,21 @@ export default function App() {
                           <p className="text-sm text-black/60 mb-4 leading-relaxed whitespace-pre-wrap">
                             {item.description}
                           </p>
-                          
+
+                          {/* Affected APIs */}
+                          {Array.isArray((item as any).affectedApis) && (item as any).affectedApis.length > 0 && (
+                            <div className="mb-4">
+                              <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest mb-1.5">受影响 API</div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {(item as any).affectedApis.map((api: string, aIdx: number) => (
+                                  <span key={aIdx} className="px-2 py-0.5 bg-violet-50 border border-violet-100 rounded text-[11px] font-mono text-violet-800 break-all">
+                                    {api}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
                           {/* Commit Links */}
                           {item.commitLinks && item.commitLinks.length > 0 && (
                             <div className="mb-4 flex flex-wrap gap-2">

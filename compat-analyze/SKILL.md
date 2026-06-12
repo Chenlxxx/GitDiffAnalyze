@@ -18,7 +18,12 @@ description: 分析 GitHub 三方库两个版本之间的破坏性变更与兼�
 
 1. **解析 tag**：用户输入的版本号未必等于 tag 名。按顺序探测直到命中：原值 → 加 `v` 前缀 → 去 `v` 前缀 → `rel/v{version}`（Apache HttpComponents 风格）→ `{repo}-{version}`（Netty 风格）。验证命令：
    `gh api repos/{owner}/{repo}/git/ref/tags/{tag}`（404 即不存在）。全部不中时列出 `gh api repos/{owner}/{repo}/tags --paginate -q '.[].name'` 模糊匹配。
-2. **Release Notes**：`gh api repos/{owner}/{repo}/releases/tags/{toTag}` 取 body；为空则找仓库内 CHANGELOG.md / RELEASE_NOTES 等文件中对应版本的小节。
+2. **Release Notes**（按可靠性依次尝试，拿到充分内容即止）：
+   a. `gh api repos/{owner}/{repo}/releases/tags/{toTag}` 取 release body；
+   b. 为空或过短时，用 GitHub 自动生成变更日志（覆盖面最广，几乎任何有 PR 的仓库都能产出）：
+      `gh api --method POST repos/{owner}/{repo}/releases/generate-notes -f tag_name={toTag} -f previous_tag_name={fromTag}` 取返回的 `body`；
+   c. 仍不足时找仓库内 CHANGELOG.md / CHANGES / RELEASE_NOTES / HISTORY / NEWS（含 docs/ 目录、多种扩展名）中对应版本的小节；
+   d. 都没有则从 commits 合成（取 commit message 首行列表）。
 3. **变更概览**：`gh api repos/{owner}/{repo}/compare/{fromTag}...{toTag}` 取 commits 数与 files 列表（注意 files 最多返回 300 个）。
 4. **完整 diff**：`gh api repos/{owner}/{repo}/compare/{fromTag}...{toTag} -H "Accept: application/vnd.github.v3.diff"` 一次性取回，落盘为临时文件后按 `diff --git` 切分按需阅读。**不要**逐文件请求 diff——compare API 不支持按 path 过滤。
 
@@ -43,7 +48,15 @@ description: 分析 GitHub 三方库两个版本之间的破坏性变更与兼�
 
 ## 第四步（可选）：本仓库落地复核
 
-若当前工作目录是该库的使用方仓库，分析完成后主动继续：搜索仓库中对受影响 API 的实际调用点，逐项确认/降级/排除风险，把结论合并进报告的"本仓库命中情况"一节。这相当于平台的 release-review 第二阶段。
+若当前工作目录是该库的使用方仓库，分析完成后主动继续做**多层调用链路追踪**（这相当于平台的 release-review 第二阶段）：
+
+对每条高/中风险项：
+1. **定位直接使用点**：搜索对受影响 API（类/接口/方法/字段/配置项名）的直接引用——import、new、方法调用、继承、实现、注解、配置文件中的类名。
+2. **向上追踪调用链**：继续追踪谁调用了这些直接使用点——包装类、适配器、门面、工具类、基类，一层层向上直到业务入口（Controller / Service 公开方法 / 定时任务 / 消息消费者 / 对外接口），画出「上游变更 API → 本仓库封装层 → 业务入口」的完整链路。
+3. **覆盖间接/隐式使用**：反射、SPI、依赖注入(Spring)、AOP、动态代理、配置驱动实例化、序列化框架——这些纯文本搜索易漏。
+4. **识别运行时故障面**：判断编译期暴露还是仅运行时暴露，以及触发场景。
+
+把结论合并进报告的"本仓库命中情况"一节，对每条命中项给出完整调用链与受影响业务入口；未命中项明确降级/排除。
 
 ## 注意事项
 
