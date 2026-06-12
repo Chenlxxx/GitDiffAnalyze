@@ -23,7 +23,8 @@ import {
   FileUp,
   FileArchive,
   FileSpreadsheet,
-  Trash2
+  Trash2,
+  BarChart3
 } from 'lucide-react';
 import * as ExcelJS from 'exceljs';
 import JSZip from 'jszip';
@@ -32,6 +33,7 @@ import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService
 import { getAIProvider, setStreamListener } from './services/aiProvider';
 import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
 import { ModelSettings } from './components/ModelSettings';
+import { AdminStats } from './components/AdminStats';
 import { mapWithConcurrency, splitUnifiedDiffByFile, mergeBatchResultsLocally } from './services/diffUtils';
 import { determineDiffStrategy, BATCH_ANALYSIS_FILE_BATCH_SIZE, DiffAnalysisMode, MAX_BATCHES_PER_ANALYSIS, AI_BATCH_CONCURRENCY } from './services/diffStrategy';
 import { sortFilesByPriority, MAX_PRIORITY_FILES_FOR_SEGMENTED_DIFF } from './services/filePriority';
@@ -112,6 +114,7 @@ export default function App() {
   const [githubToken, setGithubToken] = useState<string>(initialSettings.githubToken);
   const [streamingEnabled, setStreamingEnabled] = useState<boolean>(initialSettings.streamingEnabled !== false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
 
   useEffect(() => {
     GitHubService.setToken(githubToken);
@@ -206,6 +209,18 @@ export default function App() {
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
   const [batchProgress, setBatchProgress] = useState<{ total: number; completed: number } | null>(null);
+  /** 分析完成后上报统计（失败静默，不影响主流程） */
+  const recordAnalysis = (targetRepoUrl: string, fromV: string, toV: string, mode: string) => {
+    const info = GitHubService.parseRepoUrl(targetRepoUrl);
+    axios.post('/api/stats/record', {
+      repo: info ? `${info.owner}/${info.repo}` : targetRepoUrl,
+      repoUrl: targetRepoUrl,
+      fromVersion: fromV,
+      toVersion: toV,
+      mode
+    }).catch(() => {});
+  };
+
   // 处理过程可视化：每个阶段一行，按 id 原位更新避免刷屏
   const [progressLog, setProgressLog] = useState<{ id: string; text: string; status: 'running' | 'done' | 'error' }[]>([]);
   const logStep = (id: string, text: string, status: 'running' | 'done' | 'error') => {
@@ -297,6 +312,12 @@ export default function App() {
     if (analysisMode === 'full-diff') {
       return handleFullDiffAnalyze();
     }
+
+    // 捕获本次分析的输入快照：分析期间输入框可能被修改
+    const analyzedRepoUrl = repoUrl;
+    const analyzedFromVersion = fromVersion;
+    const analyzedToVersion = toVersion;
+    const analyzedBackground = projectBackground;
 
     setLoading(true);
     setError(null);
@@ -524,20 +545,23 @@ export default function App() {
 
       setChangeLogAnalysis(analysis);
 
-      // 预先准备好 Skill Bundle，避免下载时再次调用 AI
+      // 预先准备好 Skill Bundle，避免下载时再次调用 AI。
+      // 必须用本次分析启动时捕获的输入值——分析耗时数分钟，期间用户可能
+      // 已把输入框改成下一个库，用实时 state 会导致 bundle 串成别的三方件
       try {
         const bundle = buildAnalysisBundleFromChangeLog(
           analysis,
-          repoUrl,
-          fromVersion,
-          toVersion,
-          projectBackground
+          analyzedRepoUrl,
+          analyzedFromVersion,
+          analyzedToVersion,
+          analyzedBackground
         );
         setPreparedSkillBundle(bundle);
       } catch (bundleErr) {
         console.error('Failed to prepare skill bundle:', bundleErr);
       }
-      
+
+      recordAnalysis(analyzedRepoUrl, analyzedFromVersion, analyzedToVersion, 'changelog');
     } catch (err: any) {
       console.error(err);
       setError(formatErrorMessage(err, '分析过程中发生错误'));
@@ -940,6 +964,12 @@ export default function App() {
   const handleFullDiffAnalyze = async () => {
     setLoading(true);
     setError(null);
+    // 捕获本次分析的输入快照：分析期间输入框可能被修改
+    const analyzedRepoUrl = repoUrl;
+    const analyzedFromVersion = fromVersion;
+    const analyzedToVersion = toVersion;
+    const analyzedBackground = projectBackground;
+
     setChangeLogAnalysis(null);
     setFullDiffAnalysis(null);
     setPreparedSkillBundle(null);
@@ -948,7 +978,7 @@ export default function App() {
     setStep('analyzing-full-diff');
 
     try {
-      const analysis = await performFullDiffAnalysis(repoUrl, fromVersion, toVersion, projectBackground);
+      const analysis = await performFullDiffAnalysis(analyzedRepoUrl, analyzedFromVersion, analyzedToVersion, analyzedBackground);
 
       if (analysis.resolvedTags) {
         setResolvedTags(analysis.resolvedTags);
@@ -956,19 +986,21 @@ export default function App() {
 
       setFullDiffAnalysis(analysis);
 
-      // 预先准备好 Skill Bundle，避免下载时再次调用 AI
+      // 预先准备好 Skill Bundle（用分析启动时捕获的输入快照，防串台）
       try {
         const bundle = buildAnalysisBundleFromFullDiff(
           analysis,
-          repoUrl,
-          fromVersion,
-          toVersion,
-          projectBackground
+          analyzedRepoUrl,
+          analyzedFromVersion,
+          analyzedToVersion,
+          analyzedBackground
         );
         setPreparedSkillBundle(bundle);
       } catch (bundleErr) {
         console.error('Failed to prepare skill bundle:', bundleErr);
       }
+
+      recordAnalysis(analyzedRepoUrl, analyzedFromVersion, analyzedToVersion, analysis.analysisMode || 'full_diff');
     } catch (err: any) {
       console.error(err);
       setError(formatErrorMessage(err, '深度分析过程中发生错误'));
@@ -1027,8 +1059,8 @@ export default function App() {
       const url = window.URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      const repoInfo = GitHubService.parseRepoUrl(repoUrl);
-      const repoName = repoInfo ? repoInfo.repo : 'repo';
+      // 文件名取自 bundle 自身的 manifest，而非当前输入框（输入框可能已换成别的库）
+      const repoName = bundle.manifest?.component || 'repo';
       a.download = `${repoName}_release_review_skill.zip`;
       a.click();
       window.URL.revokeObjectURL(url);
@@ -1270,6 +1302,7 @@ export default function App() {
           projectBackground
         );
         items[i] = { ...items[i], status: 'completed', analysis };
+        recordAnalysis(items[i].repoUrl, items[i].fromVersion, items[i].toVersion, 'batch');
       } catch (err: any) {
         console.error(`Error processing ${items[i].repoUrl}:`, err);
         items[i] = { ...items[i], status: 'failed', error: err.message || '分析失败' };
@@ -1343,7 +1376,17 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-4">
-            <button 
+            <button
+              onClick={() => setShowAdmin(!showAdmin)}
+              title="使用统计"
+              className={cn(
+                "p-2 rounded-xl transition-all",
+                showAdmin ? "bg-black text-white" : "bg-black/5 text-black/40 hover:bg-black/10"
+              )}
+            >
+              <BarChart3 size={20} />
+            </button>
+            <button
               onClick={() => setShowSettings(!showSettings)}
               className={cn(
                 "p-2 rounded-xl transition-all",
@@ -1377,6 +1420,9 @@ export default function App() {
             onStreamingChange={setStreamingEnabled}
           />
         )}
+
+        {/* Admin Stats Panel */}
+        {showAdmin && <AdminStats />}
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
           

@@ -2,6 +2,30 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import axios from "axios";
 import path from "path";
+import fs from "fs";
+
+// ===== 分析统计（SQLite 持久化，data/stats.db）=====
+let statsDb: any = null;
+async function getStatsDb() {
+  if (statsDb) return statsDb;
+  const Database = (await import("better-sqlite3")).default;
+  const dataDir = path.join(process.cwd(), "data");
+  fs.mkdirSync(dataDir, { recursive: true });
+  statsDb = new Database(path.join(dataDir, "stats.db"));
+  statsDb.exec(`
+    CREATE TABLE IF NOT EXISTS analysis_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo TEXT NOT NULL,
+      repo_url TEXT,
+      from_version TEXT,
+      to_version TEXT,
+      mode TEXT,
+      created_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_analysis_repo ON analysis_log(repo);
+  `);
+  return statsDb;
+}
 
 // GitHub GET 响应内存缓存：减少重复请求对速率配额的消耗
 // （匿名限额 60 次/小时，一轮分析的 tag 探测 + 翻页就可能耗尽）
@@ -200,6 +224,50 @@ async function startServer() {
       }
 
       res.status(status || 500).json({ message: error.message });
+    }
+  });
+
+  // ===== 分析统计 =====
+  app.post("/api/stats/record", async (req, res) => {
+    try {
+      const { repo, repoUrl, fromVersion, toVersion, mode } = req.body || {};
+      if (!repo || typeof repo !== 'string') {
+        return res.status(400).json({ message: 'repo is required' });
+      }
+      const db = await getStatsDb();
+      db.prepare(
+        'INSERT INTO analysis_log (repo, repo_url, from_version, to_version, mode) VALUES (?, ?, ?, ?, ?)'
+      ).run(String(repo).slice(0, 200), String(repoUrl || '').slice(0, 500),
+        String(fromVersion || '').slice(0, 100), String(toVersion || '').slice(0, 100),
+        String(mode || '').slice(0, 50));
+      res.json({ ok: true });
+    } catch (error: any) {
+      console.error('Stats record error:', error.message);
+      res.status(500).json({ message: error.message });
+    }
+  });
+
+  app.get("/api/stats/summary", async (_req, res) => {
+    try {
+      const db = await getStatsDb();
+      const totals = db.prepare(
+        'SELECT COUNT(*) AS totalAnalyses, COUNT(DISTINCT repo) AS distinctRepos FROM analysis_log'
+      ).get();
+      const topRepos = db.prepare(`
+        SELECT repo, repo_url AS repoUrl, COUNT(*) AS count, MAX(created_at) AS lastAt
+        FROM analysis_log GROUP BY repo ORDER BY count DESC, lastAt DESC LIMIT 50
+      `).all();
+      const recent = db.prepare(`
+        SELECT repo, from_version AS fromVersion, to_version AS toVersion, mode, created_at AS at
+        FROM analysis_log ORDER BY id DESC LIMIT 20
+      `).all();
+      const byMode = db.prepare(
+        'SELECT mode, COUNT(*) AS count FROM analysis_log GROUP BY mode ORDER BY count DESC'
+      ).all();
+      res.json({ ...totals, topRepos, recent, byMode });
+    } catch (error: any) {
+      console.error('Stats summary error:', error.message);
+      res.status(500).json({ message: error.message });
     }
   });
 
