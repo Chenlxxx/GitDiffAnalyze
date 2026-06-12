@@ -6,7 +6,7 @@ export interface AIConfig {
   baseUrl?: string;
   model: string;
   useProxy: boolean;
-  /** 单次调用的最大输出 tokens；推理模型（思考占额度）建议 16000+ */
+  /** 单次调用的最大输出 tokens；不设则自动探测模型最大能力 */
   maxTokens?: number;
 }
 
@@ -27,7 +27,7 @@ export interface ModelProviderConfig {
   model: string;
   useProxy: boolean;
   enabled: boolean;
-  /** 单次调用的最大输出 tokens（可选，默认 8000；推理模型建议 16000+） */
+  /** 单次调用的最大输出 tokens（可选；不设则自动探测模型最大能力） */
   maxTokens?: number;
   /** 最近一次连通性测试结果 */
   lastTest?: {

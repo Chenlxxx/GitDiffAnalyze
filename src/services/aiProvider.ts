@@ -12,6 +12,32 @@ export function setStreamListener(cb: StreamListener | null) { activeStreamListe
 // 输出被 max_tokens 截断时附加在文本末尾的内部标记，parseJSON 据此给出精确报错
 const TRUNCATION_MARKER = '__AI_OUTPUT_TRUNCATED__';
 
+// ===== max_tokens 自动探测 =====
+// 各模型最大输出上限差异巨大（DeepSeek 8k / gpt-4o 16k / MiniMax-M3 40k+），
+// 且超限请求大多直接报 400。策略：从高档位开始请求，被拒自动降档，
+// 探测结果按「接口地址+模型」缓存，后续调用直达正确档位，用户零配置。
+const MAX_TOKENS_LADDER = [64000, 32000, 16000, 8192, 4096];
+const maxTokensCache = new Map<string, number>();
+
+function maxTokensLadderFor(cacheKey: string, override?: number): number[] {
+  if (override) return [override];
+  const known = maxTokensCache.get(cacheKey);
+  if (known) {
+    const idx = MAX_TOKENS_LADDER.indexOf(known);
+    if (idx >= 0) return MAX_TOKENS_LADDER.slice(idx);
+  }
+  return MAX_TOKENS_LADDER;
+}
+
+/** 判断错误是否为 max_tokens 超过模型上限（应降档重试） */
+function isMaxTokensRejection(err: any): boolean {
+  const status = err?.response?.status ?? err?.status;
+  if (status !== 400) return false;
+  let body = '';
+  try { body = JSON.stringify(err?.response?.data ?? err?.message ?? ''); } catch { body = String(err?.message || ''); }
+  return /max_?tokens|max_?completion|output.?tokens|too large|maximum|invalid.?parameter/i.test(body);
+}
+
 /**
  * 流式消费 OpenAI / Anthropic 协议的 SSE 响应，累积并实时回调 delta，返回完整文本。
  * useProxy 时打到服务端 /api/ai-proxy-stream 透传端点。
@@ -379,7 +405,7 @@ function parseJSON(text: string): any {
   // 剔除推理模型的思考块；若剔除后为空，说明思考耗尽了 max_tokens、没输出结果
   const stripped = stripThinking(text.trim());
   if (!stripped) {
-    throw new Error('模型只输出了思考过程，没有给出结果（推理类模型的思考耗尽了输出长度限制）。请在设置中调大该供应商的「最大输出 Tokens」（推理模型建议 16000 以上），或换用非推理模型。');
+    throw new Error('模型只输出了思考过程，没有给出结果（思考耗尽了该模型的输出长度上限）。请缩小分析范围，或换用非推理模型。');
   }
   let cleanText = stripped;
   
@@ -466,7 +492,7 @@ function parseJSON(text: string): any {
   
   console.error("Failed to parse JSON from AI response. Original text summary:", cleanText.substring(0, 500) + "...");
   if (wasTruncated) {
-    throw new Error("模型输出在 max_tokens 上限处被截断，JSON 不完整且无法自动修复。请在设置中调大该供应商的「最大输出 Tokens」（推理类模型如 MiniMax-M / DeepSeek-R1 建议 16000 以上），或缩小分析范围。");
+    throw new Error("模型输出达到了该模型的输出长度上限被截断，JSON 不完整且无法自动修复。请缩小分析范围（如减小版本跨度），或换用输出上限更大的模型。");
   }
   throw new Error("无法解析 AI 返回的 JSON 数据。常见原因：模型未按要求输出 JSON、或输出含异常格式。已尝试自动修复但失败，请重试、缩小分析范围或换用其他模型。");
 }
@@ -555,29 +581,49 @@ export class AnthropicProvider implements AIProvider {
   private async callAI(prompt: string): Promise<string> {
     const baseUrl = (this.config.baseUrl || 'https://api.anthropic.com').replace(/\/$/, '');
     const url = baseUrl.endsWith('/messages') ? baseUrl : `${baseUrl}/v1/messages`;
-    const data = {
+    const headers = { 'x-api-key': this.config.apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
+    const cacheKey = `${url}|${this.config.model}`;
+    const ladder = maxTokensLadderFor(cacheKey, this.config.maxTokens);
+    const buildData = (maxTokens: number) => ({
       model: this.config.model,
-      max_tokens: this.config.maxTokens || 8192,
+      max_tokens: maxTokens,
       system: "你是一个极其严谨的资深架构师。请直接输出 JSON 结果。",
       messages: [{ role: 'user', content: prompt }]
-    };
-    const headers = { 'x-api-key': this.config.apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
+    });
 
     // 有监听器时走流式（Anthropic SSE content_block_delta），失败回退非流式
     if (activeStreamListener) {
       const listener = activeStreamListener;
       try {
-        const full = await streamChatCompletion(url, data, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
-        if (full && full.trim()) return stripThinking(full);
+        const full = await streamChatCompletion(url, buildData(ladder[0]), headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
+        if (full && full.trim()) {
+          maxTokensCache.set(cacheKey, ladder[0]);
+          return stripThinking(full);
+        }
         console.warn('Streaming returned empty content, falling back to non-streaming.');
       } catch (streamErr) {
         console.warn('Streaming failed, falling back to non-streaming:', streamErr);
       }
     }
 
-    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
-      this.config.useProxy ? { url, data, headers } : data,
-      { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
+    // 非流式：从高档位开始，max_tokens 超限被拒则自动降档重试
+    let response: any = null;
+    for (let i = 0; i < ladder.length; i++) {
+      const data = buildData(ladder[i]);
+      try {
+        response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
+          this.config.useProxy ? { url, data, headers } : data,
+          { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
+        maxTokensCache.set(cacheKey, ladder[i]);
+        break;
+      } catch (err: any) {
+        if (i < ladder.length - 1 && isMaxTokensRejection(err)) {
+          console.warn(`max_tokens=${ladder[i]} rejected by model, retrying with ${ladder[i + 1]}`);
+          continue;
+        }
+        throw err;
+      }
+    }
 
     const result = response.data;
     if (Array.isArray(result.content)) {
@@ -621,7 +667,10 @@ export class OpenAICompatibleProvider implements AIProvider {
   private async callAI(prompt: string, jsonMode: boolean = true): Promise<string> {
     const baseUrl = (this.config.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
     const url = baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`;
-    const data = {
+    const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
+    const cacheKey = `${url}|${this.config.model}`;
+    const ladder = maxTokensLadderFor(cacheKey, this.config.maxTokens);
+    const buildData = (maxTokens: number) => ({
       model: this.config.model,
       messages: [
         { role: 'system', content: "你是一个极其严谨的资深架构师。请直接输出最终的 JSON 结果。" },
@@ -629,29 +678,47 @@ export class OpenAICompatibleProvider implements AIProvider {
       ],
       response_format: jsonMode ? { type: 'json_object' } : undefined,
       temperature: 0.1,
-      max_tokens: this.config.maxTokens || 8000
-    };
-    const headers = { 'Authorization': `Bearer ${this.config.apiKey}`, 'Content-Type': 'application/json' };
+      max_tokens: maxTokens
+    });
 
     // 有监听器时走流式：实时回调 token，最终仍返回完整文本供 JSON 解析。
     // 流式请求不带 response_format——大量网关不支持 json_object+stream 组合，
     // 会报错或返回空导致静默回退；提示词已强约束 JSON，parseJSON 也能从
-    // markdown 代码块中提取。流式仍失败时回退非流式。
+    // markdown 代码块中提取。流式失败（含 max_tokens 超限）回退非流式，
+    // 由非流式分支完成档位探测，下次流式直接用缓存档位。
     if (activeStreamListener) {
       const listener = activeStreamListener;
       try {
-        const { response_format: _omit, ...streamData } = data as any;
+        const { response_format: _omit, ...streamData } = buildData(ladder[0]) as any;
         const full = await streamChatCompletion(url, streamData, headers, this.config.useProxy, (delta, acc) => listener({ delta, full: acc }));
-        if (full && full.trim()) return stripThinking(full);
+        if (full && full.trim()) {
+          maxTokensCache.set(cacheKey, ladder[0]);
+          return stripThinking(full);
+        }
         console.warn('Streaming returned empty content, falling back to non-streaming.');
       } catch (streamErr) {
         console.warn('Streaming failed, falling back to non-streaming:', streamErr);
       }
     }
 
-    const response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
-      this.config.useProxy ? { url, data, headers } : data,
-      { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
+    // 非流式：从高档位开始，max_tokens 超限被拒则自动降档重试
+    let response: any = null;
+    for (let i = 0; i < ladder.length; i++) {
+      const data = buildData(ladder[i]);
+      try {
+        response = await axios.post(this.config.useProxy ? '/api/ai-proxy' : url,
+          this.config.useProxy ? { url, data, headers } : data,
+          { headers: this.config.useProxy ? {} : headers, timeout: 310000 });
+        maxTokensCache.set(cacheKey, ladder[i]);
+        break;
+      } catch (err: any) {
+        if (i < ladder.length - 1 && isMaxTokensRejection(err)) {
+          console.warn(`max_tokens=${ladder[i]} rejected by model, retrying with ${ladder[i + 1]}`);
+          continue;
+        }
+        throw err;
+      }
+    }
 
     const aiResponse = response.data;
     let content = aiResponse?.choices?.[0]?.message?.content || aiResponse?.choices?.[0]?.text || aiResponse?.text || (typeof aiResponse === 'string' ? aiResponse : null);

@@ -255,21 +255,6 @@ export function ModelSettings({
                       </datalist>
                     )}
                   </div>
-                  <div className="space-y-1.5">
-                    <label className={labelCls}>最大输出 Tokens</label>
-                    <input
-                      type="number"
-                      min={1000}
-                      step={1000}
-                      value={p.maxTokens ?? ''}
-                      onChange={(e) => updateProvider(p.id, { maxTokens: e.target.value ? Number(e.target.value) : undefined })}
-                      className={inputCls}
-                      placeholder="默认 8000"
-                    />
-                    <p className="text-[10px] text-black/30">
-                      推理模型（MiniMax-M / DeepSeek-R1 等）思考会占用输出额度，建议 16000 以上。
-                    </p>
-                  </div>
                 </div>
                 {preset?.description && (
                   <p className="text-[10px] text-black/30 mt-3">{preset.description}</p>
