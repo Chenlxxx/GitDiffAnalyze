@@ -38,6 +38,17 @@ export class GitHubService {
     return response.data;
   }
 
+  /** 单个 tag 是否存在（git/ref/tags/{tag}）。用于快速解析版本，避免列举全部 tag */
+  static async tagExists(owner: string, repo: string, tag: string): Promise<boolean> {
+    try {
+      // tag 可能含 '/'（如 rel/v5.5），保留为路径分隔符，不要 encode
+      await githubAxios.get(`${this.BASE_URL}/repos/${owner}/${repo}/git/ref/tags/${tag}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * 调用 GitHub 自动生成变更日志（从两个 tag 之间的已合并 PR 汇总）。
    * 几乎任何有 PR 流程的仓库都能产出，是没有维护 CHANGELOG/Release 的强力兜底。

@@ -240,6 +240,26 @@ export default function App() {
   const resolveActualTags = async (repoInfo: { owner: string; repo: string }, fromV: string, toV: string) => {
     const cleanTo = GitHubService.parseTagFromUrl(toV);
     const cleanFrom = GitHubService.parseTagFromUrl(fromV);
+
+    // 快速路径：并行探测候选 tag 名，命中即用，避免顺序翻 10 页列举全部 tag。
+    // 仅当两端都直接命中且不相同时走快速路径；否则回退到完整列举 + 模糊匹配。
+    const tagCandidates = (v: string) => {
+      const base = v.trim();
+      const withV = base.startsWith('v') ? base : `v${base}`;
+      const noV = base.replace(/^v/i, '');
+      return [...new Set([base, withV, noV, `rel/${withV}`, `rel/${base}`, `${repoInfo.repo}-${base}`])].filter(Boolean);
+    };
+    const probeTag = async (v: string): Promise<string | null> => {
+      const cands = tagCandidates(v);
+      const hits = await Promise.all(cands.map(async c => (await GitHubService.tagExists(repoInfo.owner, repoInfo.repo, c)) ? c : null));
+      return hits.find(Boolean) || null;
+    };
+    const [probedFrom, probedTo] = await Promise.all([probeTag(cleanFrom), probeTag(cleanTo)]);
+    if (probedFrom && probedTo && probedFrom !== probedTo) {
+      return { actualFromTag: probedFrom, actualToTag: probedTo, fromMatched: true, toMatched: true, availableTags: [] as string[] };
+    }
+
+    // 慢速回退：列举全部 tag 做模糊匹配（处理别名、同版本求上一个 tag 等情况）
     const tags = await GitHubService.getTags(repoInfo.owner, repoInfo.repo);
 
     const findMatch = (version: string) => {
@@ -663,36 +683,24 @@ export default function App() {
         // 3. Multi-batch analysis logic
         const groups = groupFiles(commitData.files);
 
-        // Fetch release notes early for context
-        let releaseNotes = '';
-        try {
-          const releaseData = await GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag);
-          releaseNotes = releaseData?.body || '';
-        } catch (e) {
-          console.warn('Failed to fetch release notes:', e);
-        }
+        // 并行获取 Release Notes 与完整 compare diff（两者相互独立，串行是无谓的等待）。
+        // GitHub compare API 不支持按 path 过滤，故一次性取回完整 diff 再本地按文件切分。
+        logStep('notes', '并行获取 Release Notes 与完整 diff…', 'running');
+        const [releaseData, wholeDiff] = await Promise.all([
+          GitHubService.getReleaseByTag(repoInfo.owner, repoInfo.repo, actualToTag).catch(() => null),
+          diff
+            ? Promise.resolve({ diff, error: undefined as any })
+            : GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag).catch(() => ({ diff: '', error: true }))
+        ]);
+        const releaseNotes = releaseData?.body || '';
         logStep('notes', releaseNotes ? 'Release Notes 已获取' : '未找到 Release Notes（不影响分析）', 'done');
 
-        // 一次性获取完整 compare diff 并按文件本地切分。
-        // GitHub compare API 不支持按 path 过滤，旧实现对每个缺 patch 的
-        // 文件单独请求时实际都在重复下载完整 diff，是耗时大头之一。
         let patchMap = new Map<string, string>();
-        if (diff) {
-          patchMap = splitUnifiedDiffByFile(diff);
-        } else {
-          try {
-            logStep('patchmap', '拉取完整 diff 并按文件切分…', 'running');
-            const wholeDiff = await GitHubService.getCompareDiff(repoInfo.owner, repoInfo.repo, actualFromTag, actualToTag);
-            if (!wholeDiff.error && wholeDiff.diff) {
-              patchMap = splitUnifiedDiffByFile(wholeDiff.diff);
-            }
-          } catch (e) {
-            console.warn('Failed to fetch whole diff for patch map, relying on inline patches:', e);
-          }
-          logStep('patchmap', patchMap.size > 0
-            ? `diff 切分完成：${patchMap.size} 个文件补丁`
-            : '完整 diff 不可用，仅使用 API 内联补丁', patchMap.size > 0 ? 'done' : 'error');
-        }
+        const wholeDiffText = (wholeDiff && !(wholeDiff as any).error && wholeDiff.diff) ? wholeDiff.diff : '';
+        if (wholeDiffText) patchMap = splitUnifiedDiffByFile(wholeDiffText);
+        logStep('patchmap', patchMap.size > 0
+          ? `diff 切分完成：${patchMap.size} 个文件补丁`
+          : '完整 diff 不可用，仅使用 API 内联补丁', patchMap.size > 0 ? 'done' : 'error');
 
         // 先展开全部批次任务，再受限并行执行（旧实现为完全串行，
         // 几十个批次 × 每次 30-90 秒即 20 分钟耗时的主因）
