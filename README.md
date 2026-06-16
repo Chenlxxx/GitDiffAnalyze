@@ -53,12 +53,23 @@ CompatAnalyzer 是一款基于 AI 的 GitHub 库变更分析工具，旨在帮�
 
 ## Skill 形态（无需启动平台）
 
-本仓库自带两个可在 Claude Code / OpenCode 中直接使用的 skill，对应平台的两段式流程：
+整个平台的分析能力被封装成了一个**端到端、自包含**的 skill —— [`compat-analyze/`](compat-analyze/)。在 Claude Code / OpenCode 等任意支持 skill 的框架中，不启动 Web 服务即可完成全流程。
 
-- **`compat-analyze/`**（第一阶段）：给出仓库地址与版本范围，agent 直接抓取 GitHub 数据并产出中文升级风险报告 `compat-report.md`，可选生成 `analysis-bundle/`。
-- **`release-review/`**（第二阶段）：在使用方仓库中读取 analysis-bundle，结合真实代码调用点对风险项逐条复核，产出 `final-report.md`。
+### 安装
+把 `compat-analyze/` 整个目录拷贝到你的 agent 的 skills 目录下：
+- Claude Code：`.claude/skills/compat-analyze/`
+- OpenCode：`.opencode/skills/compat-analyze/`
+- 其他框架：放到该框架识别 skill 的目录即可。
 
-平台 Web 界面与 skill 产出的 bundle 格式互相兼容，可以混合使用（平台分析 → 下载 Skill → 仓库内复核）。
+skill 内全部使用相对路径，不依赖任何固定绝对路径。
+
+### 使用
+- **只评估上游库**：在任意目录对 agent 说「分析 \<repo\> 从 \<vA\> 升到 \<vB\> 有什么兼容性风险」。agent 会取数 → 分级 Diff 分析 → 产出 `compat-report.md`（可选 `analysis-bundle/` 与 Word）。
+- **评估对你项目的影响**：在你的代码仓库目录里运行同一 skill，它会在上游分析后继续做**多层调用链路追踪**（上游变更 API → 你仓库的封装层 → 业务入口），把命中情况写进报告。
+
+结构：精简的 `SKILL.md` 编排 + 按需加载的 `references/`（分级策略与定级准则、调用链追踪方法、报告模板、bundle 格式）+ `scripts/export_docx.py`（Word 导出）。
+
+> 另有轻量的 [`release-review/`](release-review/) skill，专门用于消费 **Web 平台「下载 Skill」按钮导出的 analysis-bundle**——平台在线分析后，把 bundle 带到使用方仓库做第二阶段复核。它与 compat-analyze 的 bundle 格式互通。
 
 ## 注意事项
 
