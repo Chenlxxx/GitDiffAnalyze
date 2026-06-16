@@ -1,65 +1,47 @@
 ---
 name: compat-analyze
-description: 分析 GitHub 三方库两个版本之间的破坏性变更与兼容性升级风险，输出中文风险报告，并可生成与 release-review 兼容的 analysis-bundle。适用于用户给出"某个库从版本 A 升到版本 B 有什么风险"类问题，或要求对依赖升级做兼容性评估的场景。
+description: 评估 GitHub 三方库从版本 A 升级到版本 B 的破坏性变更与兼容性风险，端到端完成数据获取、分级 Diff 分析、（可选）在使用方代码仓库中追踪受影响 API 的多层调用链路，输出中文风险报告（可选 Word 与 analysis-bundle）。当用户问“某个库从 X 升到 Y 有什么风险/要改什么”、要对依赖升级做兼容性评估、或要在自己的代码仓库里复核某次升级影响时使用。
 ---
 
-本 skill 把 CompatAnalyzer 平台的两段式分析流程封装为 agent 工作流：你（agent）自己承担平台中"调用大模型分析"的角色，数据获取用 GitHub API 完成。
+本 skill 是 CompatAnalyzer 平台的完整能力封装：无需启动任何 Web 服务，agent 自己用 GitHub API 取数、用大模型分析、（在使用方仓库中时）结合真实代码做落地复核。
 
-## 输入
+## 何时用哪一段
+- **只评估上游库本身**（用户没有给出使用方代码，或只想知道某库 A→B 改了什么）：执行第 1–3 步。
+- **评估对“我的项目”的影响**（当前工作目录就是使用该库的代码仓库）：执行第 1–4 步，第 4 步是核心价值。
 
-需要三个必备信息，缺失时一次性向用户问清（不要分多轮）：
-1. 仓库地址（如 `https://github.com/apache/httpcomponents-client`）
-2. 起始版本（from）与目标版本（to）
-3. 可选：项目背景（使用方项目如何使用该库——模块、协议、调用方式）。若当前工作目录本身是使用方仓库，可自行扫描 `pom.xml` / `build.gradle` / `package.json` 等确认依赖与用法，代替询问。
+开始前需要：仓库地址、起始版本(from)、目标版本(to)。缺失时一次性问清。项目背景可选——若当前目录是使用方仓库，直接扫描 `pom.xml` / `build.gradle` / `package.json` / `go.mod` 等确认依赖与用法，不必询问。
 
-## 第一步：数据获取
+## 第 1 步：取数（GitHub）
+优先 `gh api`（自带认证、不易限流）；无 gh 时用 `curl -H "Authorization: Bearer $GITHUB_TOKEN"`。
+匿名限额仅 60 次/小时且 404 也计数，务必配置 token。
 
-优先用 `gh api`（自带认证，不易触发限流）；没有 gh 时用 curl + `$GITHUB_TOKEN`。
+1. **解析 tag**：用户输入的版本号未必等于 tag 名。并行探测候选直到命中：原值、`v{x}`、去 `v`、`rel/v{x}`（Apache 风格）、`{repo}-{x}`（Netty 风格）。验证：`gh api repos/{owner}/{repo}/git/ref/tags/{tag}`（404=不存在）。全落空再 `gh api repos/{owner}/{repo}/tags --paginate -q '.[].name'` 模糊匹配。
+2. **变更概览**：`gh api repos/{owner}/{repo}/compare/{from}...{to}` 取 `commits` 数与 `files` 列表（files 最多 300）。据此决定分析策略（见下）。
+3. **完整 diff**：`gh api repos/{owner}/{repo}/compare/{from}...{to} -H "Accept: application/vnd.github.v3.diff"` 一次取回，落盘临时文件后按 `diff --git` 切分按需读。**不要**逐文件请求（compare API 不支持 path 过滤，逐文件实为重复下载全量）。
+4. **变更日志**（用于补充语义，可与 diff 并行取）：依次尝试直到拿到充分内容——
+   a. `gh api repos/{owner}/{repo}/releases/tags/{to}` 的 `body`；
+   b. 自动从 PR 生成（覆盖面最广）：`gh api --method POST repos/{owner}/{repo}/releases/generate-notes -f tag_name={to} -f previous_tag_name={from}` 的 `body`；
+   c. 仓库内 CHANGELOG / CHANGES / RELEASE_NOTES / HISTORY / NEWS（含 docs/、多扩展名）对应版本小节；
+   d. 都没有则从 commit message 首行合成。
 
-1. **解析 tag**：用户输入的版本号未必等于 tag 名。按顺序探测直到命中：原值 → 加 `v` 前缀 → 去 `v` 前缀 → `rel/v{version}`（Apache HttpComponents 风格）→ `{repo}-{version}`（Netty 风格）。验证命令：
-   `gh api repos/{owner}/{repo}/git/ref/tags/{tag}`（404 即不存在）。全部不中时列出 `gh api repos/{owner}/{repo}/tags --paginate -q '.[].name'` 模糊匹配。
-2. **Release Notes**（按可靠性依次尝试，拿到充分内容即止）：
-   a. `gh api repos/{owner}/{repo}/releases/tags/{toTag}` 取 release body；
-   b. 为空或过短时，用 GitHub 自动生成变更日志（覆盖面最广，几乎任何有 PR 的仓库都能产出）：
-      `gh api --method POST repos/{owner}/{repo}/releases/generate-notes -f tag_name={toTag} -f previous_tag_name={fromTag}` 取返回的 `body`；
-   c. 仍不足时找仓库内 CHANGELOG.md / CHANGES / RELEASE_NOTES / HISTORY / NEWS（含 docs/ 目录、多种扩展名）中对应版本的小节；
-   d. 都没有则从 commits 合成（取 commit message 首行列表）。
-3. **变更概览**：`gh api repos/{owner}/{repo}/compare/{fromTag}...{toTag}` 取 commits 数与 files 列表（注意 files 最多返回 300 个）。
-4. **完整 diff**：`gh api repos/{owner}/{repo}/compare/{fromTag}...{toTag} -H "Accept: application/vnd.github.v3.diff"` 一次性取回，落盘为临时文件后按 `diff --git` 切分按需阅读。**不要**逐文件请求 diff——compare API 不支持按 path 过滤。
+## 第 2 步：分级分析策略
+详细规则、风险定级准则与质量要求见 `references/analysis-playbook.md`——**开始分析前先读它**。要点：
+- ≤50 文件：通读完整 diff 逐项分析。
+- 50–1000 文件：按目录/功能分组并按优先级排序（核心源码 > 接口/协议/配置 > 构建 > 测试 > 文档），高优先级精读、低优先级扫文件名。
+- >1000 文件或 diff 拉取失败：基于 commits + 变更日志做概览，报告中明确标注“未做源码级验证”。
 
-## 第二步：分级分析策略（对齐平台逻辑）
+## 第 3 步：输出上游风险报告
+在当前目录生成 `compat-report.md`，结构见 `references/report-template.md`。全文中文，风险项按等级降序，每项附证据（diff 片段 / commit / 变更日志原文），严禁脱离证据臆测。
+如用户要 analysis-bundle（供平台的 release-review skill 或他人复核），按 `references/bundle-format.md` 生成 `analysis-bundle/`。
 
-- **≤50 个文件**：通读完整 diff 逐项分析。
-- **50~1000 个文件**：按目录/功能分组，组内按优先级排序（核心源码 > 接口/协议/配置 > 构建脚本 > 测试 > 文档），优先精读高优先级文件的 diff，测试与文档只扫文件名。
-- **>1000 个文件或 diff 拉取失败**：降级为基于 commits 列表 + Release Notes 的概览分析，并在报告中明确标注"未做源码级验证"。
+## 第 4 步（可选，核心价值）：使用方仓库落地复核
+当前目录是使用该库的代码仓库时，把第 3 步的每条风险项当作“待验证假设”，在真实代码里做**多层调用链路追踪**确认/降级/推翻。完整方法见 `references/call-chain-tracing.md`——**做复核前先读它**。结论合并进报告的「本仓库命中情况」一节，对命中项给出「上游变更 API → 本仓库封装层 → 业务入口」的完整调用链。
 
-风险定级准则：
-- **High**：公开 API 删除/签名变更/语义变更、默认行为变化、配置项删除或默认值变化、序列化/协议格式变化、依赖的最低运行环境提升（如 JDK 版本）
-- **Medium**：API 标记废弃、新增的严格校验、性能特征明显变化、内部类变更但常被反射/继承使用
-- **Low**：新增功能、纯内部重构、文档与测试变更
-
-每个风险项必须附证据（diff 片段、commit、或 Release Note 原文），严禁脱离证据臆测。
-
-## 第三步：输出
-
-在当前目录生成 `compat-report.md`（结构见 `references/report-template.md`），全文中文，风险项按等级降序。
-
-如果用户要求生成 skill 包 / analysis-bundle（供使用方仓库用 release-review 复核），按 `references/bundle-format.md` 在 `analysis-bundle/` 目录生成 5 个文件；其中每个风险项标记 `confidence: upstream-high / repo-unverified`，`manifest.json` 写入 `project_background`。
-
-## 第四步（可选）：本仓库落地复核
-
-若当前工作目录是该库的使用方仓库，分析完成后主动继续做**多层调用链路追踪**（这相当于平台的 release-review 第二阶段）：
-
-对每条高/中风险项：
-1. **定位直接使用点**：搜索对受影响 API（类/接口/方法/字段/配置项名）的直接引用——import、new、方法调用、继承、实现、注解、配置文件中的类名。
-2. **向上追踪调用链**：继续追踪谁调用了这些直接使用点——包装类、适配器、门面、工具类、基类，一层层向上直到业务入口（Controller / Service 公开方法 / 定时任务 / 消息消费者 / 对外接口），画出「上游变更 API → 本仓库封装层 → 业务入口」的完整链路。
-3. **覆盖间接/隐式使用**：反射、SPI、依赖注入(Spring)、AOP、动态代理、配置驱动实例化、序列化框架——这些纯文本搜索易漏。
-4. **识别运行时故障面**：判断编译期暴露还是仅运行时暴露，以及触发场景。
-
-把结论合并进报告的"本仓库命中情况"一节，对每条命中项给出完整调用链与受影响业务入口；未命中项明确降级/排除。
+## 可选：Word 导出
+报告生成后如需 Word：`python scripts/export_docx.py compat-report.md compat-report.docx`（需要 `python-docx`）。
 
 ## 注意事项
-
-- GitHub 匿名 API 限额 60 次/小时；探测 tag 的 404 同样计入配额，命中后立即停止探测。
-- diff 超过 20 万行时不要全文读入上下文，按文件分块、优先级裁剪。
-- 输出里的版本号一律用解析后的真实 tag 名，避免用户输入的别名造成歧义。
+- 输出里的版本号一律用解析后的真实 tag 名，避免别名歧义。
+- diff 超大时不要全文塞进上下文，按文件分块、按优先级裁剪。
+- 仓库未使用某个被引用的 API → 明确说明并降级/排除该风险，不要硬凑。
+- 无法仅凭证据证明的内容 → 放入「待人工确认问题」，不要猜。
