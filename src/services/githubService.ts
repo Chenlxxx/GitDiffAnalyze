@@ -38,6 +38,26 @@ export class GitHubService {
     return response.data;
   }
 
+  /**
+   * 调用 GitHub 自动生成变更日志（从两个 tag 之间的已合并 PR 汇总）。
+   * 几乎任何有 PR 流程的仓库都能产出，是没有维护 CHANGELOG/Release 的强力兜底。
+   * 需要 token（匿名会 403）；失败返回 null 由上层继续走其他兜底。
+   */
+  static async generateReleaseNotes(owner: string, repo: string, tag: string, previousTag?: string): Promise<{ name: string; body: string } | null> {
+    try {
+      const payload: any = { tag_name: tag };
+      if (previousTag) payload.previous_tag_name = previousTag;
+      const response = await githubAxios.post(`${this.BASE_URL}/repos/${owner}/${repo}/releases/generate-notes`, payload);
+      if (response.data && response.data.body && response.data.body.trim().length > 50) {
+        return { name: response.data.name || '', body: response.data.body };
+      }
+      return null;
+    } catch (e: any) {
+      console.warn(`generate-notes failed for ${tag}:`, e.response?.status || e.message);
+      return null;
+    }
+  }
+
   static async getReleaseByTag(owner: string, repo: string, tag: string): Promise<GitHubRelease | null> {
     const attempts = [
       tag,                                   // 原始输入的 tag

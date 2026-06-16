@@ -368,6 +368,14 @@ function normalizeAIResponse(result: any): any {
       }
       return null;
     }).filter((l: any) => l && l.url);
+    // affectedApis 规范成字符串数组（模型可能返回字符串或对象数组）
+    let affectedApis: string[] | undefined;
+    const rawApis = item.affectedApis || item.affected_apis || item.apis;
+    if (Array.isArray(rawApis)) {
+      affectedApis = rawApis.map((a: any) => toText(a)).filter(Boolean);
+    } else if (typeof rawApis === 'string' && rawApis.trim()) {
+      affectedApis = rawApis.split(/[,，;；\n]/).map(s => s.trim()).filter(Boolean);
+    }
     return {
       ...item,
       title: toText(item.title) || '未知变更',
@@ -375,6 +383,7 @@ function normalizeAIResponse(result: any): any {
       reason: toText(item.reason),
       compatibilityAnalysis: toText(item.compatibilityAnalysis),
       sourceSnippet: toText(item.sourceSnippet),
+      affectedApis,
       codeExample,
       commitLinks
     };
@@ -780,15 +789,17 @@ ${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 2000)}\n`
 文件级变更证据：
 ${diff.slice(0, 20000)}
 
-请识别可能影响使用方的 API 变更、行为变更、配置变更与移除项，输出 JSON：
+请识别可能影响使用方的 API 变更、行为变更、配置变更与移除项。对每一项尽量写充分、具体，不要只写一句话。输出 JSON：
 {
   "summary": "本批次中文小结",
   "items": [{
     "title": "变更点标题",
-    "description": "变更说明",
+    "description": "详细变更说明：改了什么、为什么改；点名受影响的类/接口/方法/字段/配置项的具体名称",
     "riskLevel": "High | Medium | Low",
-    "compatibilityAnalysis": "对使用方的影响与排查建议",
-    "sourceSnippet": "关键 diff 片段（可选）"
+    "affectedApis": ["受影响的公开 API 全名，如 com.foo.Bar#method(类型)"],
+    "compatibilityAnalysis": "对使用方的影响：调用方在什么场景会受影响、运行时/编译期如何表现、如何排查",
+    "migration": "具体迁移/整改步骤（如有）",
+    "sourceSnippet": "关键 diff 片段（保留能说明问题的几行）"
   }],
   "recommendations": ["建议"]
 }
@@ -797,18 +808,20 @@ ${diff.slice(0, 20000)}
     return parseJSON(result);
   }
   async aggregateBatchResults(batchResults: BatchAnalysisResult[], projectBackground: string, fromVersion: string, toVersion: string, releaseNotes?: string): Promise<FullDiffAnalysis> {
-    // 压缩批次结果作为聚合输入，整体控制在 ~60k 字符
-    const perBatchBudget = Math.max(2000, Math.floor(60000 / Math.max(1, batchResults.length)));
+    // 压缩批次结果作为聚合输入，整体控制在 ~90k 字符（尽量保留细节）
+    const perBatchBudget = Math.max(2500, Math.floor(90000 / Math.max(1, batchResults.length)));
     const evidence = batchResults.map((r, i) => {
       const slim = {
         summary: r.summary,
         recommendations: (r.recommendations || []).slice(0, 10),
-        items: (r.items || []).map(it => ({
+        items: (r.items || []).map((it: any) => ({
           title: it.title,
           riskLevel: it.riskLevel,
-          description: (it.description || '').slice(0, 500),
-          compatibilityAnalysis: (it.compatibilityAnalysis || '').slice(0, 400),
-          sourceSnippet: (it.sourceSnippet || '').slice(0, 400)
+          description: (it.description || '').slice(0, 900),
+          affectedApis: it.affectedApis,
+          compatibilityAnalysis: (it.compatibilityAnalysis || '').slice(0, 700),
+          migration: (it.migration || '').slice(0, 400),
+          sourceSnippet: (it.sourceSnippet || '').slice(0, 500)
         }))
       };
       let text = JSON.stringify(slim);
@@ -816,7 +829,7 @@ ${diff.slice(0, 20000)}
       return `[批次 ${i + 1}]\n${text}`;
     }).join('\n\n');
 
-    const prompt = `你是资深软件架构师。以下是 ${fromVersion} -> ${toVersion} 版本间代码差异的 ${batchResults.length} 个批次分析结果，请汇总为最终升级风险报告。
+    const prompt = `你是资深软件架构师。以下是 ${fromVersion} -> ${toVersion} 版本间代码差异的 ${batchResults.length} 个批次分析结果，请汇总为一份**详尽、可执行**的最终升级风险报告。
 
 项目背景：${projectBackground}
 ${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 4000)}\n` : ''}
@@ -824,19 +837,21 @@ ${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 4000)}\n`
 ${evidence}
 
 要求：
-1. 合并重复或同类变更点，保留最具体的描述与证据；按风险从高到低排列；items 总数不超过 50 条，低风险项可合并概括。
-2. 控制输出长度：description 与 compatibilityAnalysis 各 120 字内，sourceSnippet 只保留最关键的几行（可省略）。
+1. 合并重复或同类变更点，保留并融合各批次中最具体的描述、受影响 API 与证据；按风险从高到低排列。不要为了精简而丢失关键技术细节。
+2. 每一项都要写充分：description 说清改了什么、影响什么；compatibilityAnalysis 说清使用方在何种调用场景会受影响、运行时/编译期如何表现、如何排查；High/Medium 项尽量给出 before/after 代码示例。不要用一句话敷衍。
 3. 输出 JSON（不要输出 excelRows 等其他字段）：
 {
-  "summary": "中文总摘要（150 字内）",
+  "summary": "中文总摘要（说明本次升级的整体性质与主要风险，150-300 字）",
   "overallRisk": "High | Medium | Low",
-  "recommendations": ["核心建议，不超过 10 条"],
+  "recommendations": ["核心建议，按优先级排列"],
   "items": [{
-    "title": "变更点",
-    "description": "说明",
+    "title": "变更点标题",
+    "description": "详细变更说明，点名受影响的类/接口/方法/配置项具体名称",
     "riskLevel": "High | Medium | Low",
-    "compatibilityAnalysis": "影响与排查建议",
-    "sourceSnippet": "关键 diff 片段（可选）"
+    "affectedApis": ["受影响的公开 API 全名"],
+    "compatibilityAnalysis": "对使用方的影响、排查方式与迁移建议",
+    "codeExample": { "before": "旧用法", "after": "新用法" },
+    "sourceSnippet": "关键 diff 片段"
   }]
 }
 4. 严禁编造批次结果中不存在的变更；批次标注分析失败的部分不要臆测。只输出 JSON。`;
@@ -850,20 +865,22 @@ ${evidence}
 ${releaseNotes ? `发布日志（节选）：\n${releaseNotes.slice(0, 3000)}\n` : ''}代码差异：
 ${diff.slice(0, 50000)}
 
-输出 JSON（不要输出任何其他内容）：
+逐项分析时要写充分、具体，不要一句话敷衍。输出 JSON（不要输出任何其他内容）：
 {
-  "summary": "中文总摘要（150 字内）",
+  "summary": "中文总摘要（说明升级整体性质与主要风险，150-300 字）",
   "overallRisk": "High | Medium | Low",
-  "recommendations": ["核心建议，不超过 10 条"],
+  "recommendations": ["核心建议，按优先级排列"],
   "items": [{
     "title": "变更点标题",
-    "description": "变更说明（中文）",
+    "description": "详细变更说明：改了什么、为什么改；点名受影响的类/接口/方法/字段/配置项具体名称",
     "riskLevel": "High | Medium | Low",
-    "compatibilityAnalysis": "对使用方的影响与排查建议",
-    "sourceSnippet": "关键 diff 片段（可选）"
+    "affectedApis": ["受影响的公开 API 全名"],
+    "compatibilityAnalysis": "对使用方的影响：何种调用场景受影响、运行时/编译期如何表现、如何排查与迁移",
+    "codeExample": { "before": "旧用法", "after": "新用法" },
+    "sourceSnippet": "关键 diff 片段"
   }]
 }
-要求：按风险从高到低排列；description 与 compatibilityAnalysis 各 120 字内；仅报告差异中真实存在的变更，严禁编造。`;
+要求：按风险从高到低排列；High/Medium 项尽量给出 before/after 代码示例；仅报告差异中真实存在的变更，严禁编造。`;
     const result = await this.callAI(prompt);
     return parseJSON(result);
   }
