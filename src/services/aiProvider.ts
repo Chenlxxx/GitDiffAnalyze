@@ -16,7 +16,9 @@ const TRUNCATION_MARKER = '__AI_OUTPUT_TRUNCATED__';
 // 各模型最大输出上限差异巨大（DeepSeek 8k / gpt-4o 16k / MiniMax-M3 40k+），
 // 且超限请求大多直接报 400。策略：从高档位开始请求，被拒自动降档，
 // 探测结果按「接口地址+模型」缓存，后续调用直达正确档位，用户零配置。
-const MAX_TOKENS_LADDER = [64000, 32000, 16000, 8192, 4096];
+// 上限定在 16000：足够覆盖本项目的 JSON 输出，又避免从过高档位反复降档的探测浪费
+// （多数网关在 16000 直接接受或仅降一档）。如确需更大输出，可在供应商配置 maxTokens 覆盖。
+const MAX_TOKENS_LADDER = [16000, 8192, 4096];
 const maxTokensCache = new Map<string, number>();
 
 function maxTokensLadderFor(cacheKey: string, override?: number): number[] {
