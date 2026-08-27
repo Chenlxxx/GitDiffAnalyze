@@ -31,7 +31,7 @@ import JSZip from 'jszip';
 import axios from 'axios';
 import { GitHubService, GitHubRelease, GitHubPR } from './services/githubService';
 import { getAIProvider, setStreamListener } from './services/aiProvider';
-import { AIConfig, ChangeLogAnalysis, DiffAnalysis, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
+import { AIConfig, ChangeLogAnalysis, DiffAnalysis, ExternalEvidence, FullDiffAnalysis, BatchAnalysisItem, BatchAnalysisResult, SkillBundle, AppSettings, ModelProtocol, ModelProviderConfig, toLegacyAIConfig } from './types';
 import { ModelSettings } from './components/ModelSettings';
 import { AdminStats } from './components/AdminStats';
 import { mapWithConcurrency, splitUnifiedDiffByFile, mergeBatchResultsLocally } from './services/diffUtils';
@@ -41,6 +41,7 @@ import { groupFiles, getRiskHint, getReviewHint } from './services/fileGrouping'
 import { parseGitHubError } from './services/githubErrorUtils';
 import { formatErrorMessage } from './services/errorUtils';
 import { buildAnalysisBundleFromChangeLog, buildAnalysisBundleFromFullDiff } from './services/skillBundleGenerator';
+import { collectExternalEvidenceForBundle } from './services/externalEvidenceService';
 import { FileEvidence } from './types';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -206,6 +207,7 @@ export default function App() {
   const [changeLogAnalysis, setChangeLogAnalysis] = useState<ChangeLogAnalysis | null>(null);
   const [preparedSkillBundle, setPreparedSkillBundle] = useState<SkillBundle | null>(null);
   const [fullDiffAnalysis, setFullDiffAnalysis] = useState<FullDiffAnalysis | null>(null);
+  const [externalEvidenceRecords, setExternalEvidenceRecords] = useState<ExternalEvidence[]>([]);
   const [resolvedTags, setResolvedTags] = useState<{ from: string; to: string }>({ from: '', to: '' });
   const [diffAnalyses, setDiffAnalyses] = useState<Record<number, DiffAnalysis>>({});
   const [analyzingPrs, setAnalyzingPrs] = useState<Set<number>>(new Set());
@@ -220,6 +222,147 @@ export default function App() {
       toVersion: toV,
       mode
     }).catch(() => {});
+  };
+
+  const collectExternalEvidence = async (
+    bundle: SkillBundle,
+    targetRepoUrl: string,
+    targetFromVersion: string,
+    targetToVersion: string
+  ) => {
+    logStep('external-evidence', '联网采集外部踩坑证据…', 'running');
+    try {
+      const evidence = await collectExternalEvidenceForBundle(
+        bundle,
+        targetRepoUrl,
+        targetFromVersion,
+        targetToVersion,
+        githubToken
+      );
+      setExternalEvidenceRecords(evidence);
+      logStep(
+        'external-evidence',
+        evidence.length > 0 ? `外部证据采集完成：${evidence.length} 条` : '未发现可用外部证据，继续生成基础 bundle',
+        'done'
+      );
+      return evidence;
+    } catch (e) {
+      console.warn('External evidence collection failed:', e);
+      setExternalEvidenceRecords([]);
+      logStep('external-evidence', '外部证据采集失败，已降级为基础 bundle', 'error');
+      return [];
+    }
+  };
+
+  const highValueExternalEvidence = (riskId: string, limit = 5, records: ExternalEvidence[] = externalEvidenceRecords) => {
+    return records
+      .filter(ev => ev.risk_id === riskId)
+      .filter(ev => ev.reference_only || ev.confidence >= 0.65 || ['official', 'maintainer', 'security'].includes(ev.trust_level))
+      .sort((a, b) => {
+        if (!!a.reference_only !== !!b.reference_only) return a.reference_only ? 1 : -1;
+        return (b.confidence || 0) - (a.confidence || 0);
+      })
+      .slice(0, limit);
+  };
+
+  const evidenceSourceLabel = (ev: ExternalEvidence) => {
+    if (ev.source_type === 'github_issue') return 'GitHub Issue';
+    if (ev.source_type === 'github_pr') return 'GitHub PR';
+    if (ev.source_type === 'stackoverflow') return 'Stack Overflow';
+    if (ev.source_type === 'osv') return 'OSV 漏洞库';
+    if (ev.source_type === 'web_search') return '网页参考';
+    return '外部证据';
+  };
+
+  const renderExternalEvidencePanel = (riskId: string) => {
+    const items = highValueExternalEvidence(riskId, 8);
+    if (items.length === 0) return null;
+    return (
+      <div className="mt-4 p-4 bg-sky-50/40 rounded-xl border border-sky-100/70">
+        <div className="text-[10px] font-bold text-sky-700 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+          <ExternalLink size={12} />
+          别人踩坑 / 公开参考
+        </div>
+        <div className="space-y-2">
+          {items.map((ev, evIdx) => (
+            <a
+              key={`${ev.source_url}-${evIdx}`}
+              href={ev.source_url}
+              target="_blank"
+              rel="noreferrer"
+              className="block rounded-lg border border-sky-100 bg-white/70 px-3 py-2 hover:bg-white hover:border-sky-200 transition-colors"
+            >
+              <div className="flex items-center justify-between gap-3 mb-1">
+                <span className="text-[10px] font-bold text-sky-700">
+                  {evidenceSourceLabel(ev)}
+                  {ev.reference_only ? ' · 仅供人工参考' : ` · ${ev.trust_level} · ${Math.round((ev.confidence || 0) * 100)}%`}
+                </span>
+                <ExternalLink size={11} className="text-sky-500 shrink-0" />
+              </div>
+              <div className="text-xs font-semibold text-black/75 line-clamp-2">{ev.title}</div>
+              {ev.matched_terms?.length > 0 && (
+                <div className="mt-1 text-[10px] text-black/40 truncate">
+                  匹配：{ev.matched_terms.slice(0, 6).join(', ')}
+                </div>
+              )}
+            </a>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const tokenSet = (...values: unknown[]) => {
+    const text = values.map(v => {
+      if (v == null) return '';
+      if (Array.isArray(v)) return v.join(' ');
+      if (typeof v === 'object') {
+        try { return JSON.stringify(v); } catch { return String(v); }
+      }
+      return String(v);
+    }).join(' ').toLowerCase();
+    const stop = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'http', 'https', 'class', 'method', 'config', 'change', 'fixed', 'added', 'removed']);
+    return new Set((text.match(/[a-z0-9_.$#/-]{4,}/g) || []).filter(t => !stop.has(t) && !/^\d+$/.test(t)));
+  };
+
+  const enrichCommitLinksForItems = (
+    analysis: FullDiffAnalysis,
+    commits: any[],
+    repoInfo: { owner: string; repo: string }
+  ): FullDiffAnalysis => {
+    if (!Array.isArray(analysis.items) || !Array.isArray(commits) || commits.length === 0) return analysis;
+    const commitCandidates = commits.map(commit => {
+      const sha = String(commit.sha || '');
+      const url = commit.html_url || `https://github.com/${repoInfo.owner}/${repoInfo.repo}/commit/${sha}`;
+      const message = String(commit.commit?.message || commit.message || '');
+      return { sha, url, message, terms: tokenSet(message, sha) };
+    }).filter(c => c.sha && c.url);
+
+    analysis.items = analysis.items.map(item => {
+      if (item.commitLinks && item.commitLinks.length > 0) return item;
+      const itemTerms = tokenSet(item.title, item.description, item.compatibilityAnalysis, item.sourceSnippet, (item as any).affectedApis);
+      if (itemTerms.size === 0) return item;
+
+      const ranked = commitCandidates.map(commit => {
+        let score = 0;
+        for (const term of itemTerms) {
+          if (commit.terms.has(term) || commit.message.toLowerCase().includes(term)) score++;
+        }
+        return { commit, score };
+      }).filter(entry => entry.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
+
+      if (ranked.length === 0) return item;
+      return {
+        ...item,
+        commitLinks: ranked.map(entry => ({
+          sha: entry.commit.sha,
+          url: entry.commit.url
+        }))
+      };
+    });
+    return analysis;
   };
 
   // 处理过程可视化：每个阶段一行，按 id 原位更新避免刷屏
@@ -345,6 +488,7 @@ export default function App() {
     setChangeLogAnalysis(null);
     setPreparedSkillBundle(null);
     setFullDiffAnalysis(null);
+    setExternalEvidenceRecords([]);
     setDiffAnalyses({});
     setProgressLog([]);
     setStreamPreview('');
@@ -594,12 +738,21 @@ export default function App() {
       // 必须用本次分析启动时捕获的输入值——分析耗时数分钟，期间用户可能
       // 已把输入框改成下一个库，用实时 state 会导致 bundle 串成别的三方件
       try {
-        const bundle = buildAnalysisBundleFromChangeLog(
+        const baseBundle = buildAnalysisBundleFromChangeLog(
           analysis,
           analyzedRepoUrl,
           analyzedFromVersion,
           analyzedToVersion,
           analyzedBackground
+        );
+        const externalEvidence = await collectExternalEvidence(baseBundle, analyzedRepoUrl, analyzedFromVersion, analyzedToVersion);
+        const bundle = buildAnalysisBundleFromChangeLog(
+          analysis,
+          analyzedRepoUrl,
+          analyzedFromVersion,
+          analyzedToVersion,
+          analyzedBackground,
+          externalEvidence
         );
         setPreparedSkillBundle(bundle);
       } catch (bundleErr) {
@@ -833,6 +986,7 @@ export default function App() {
         finalAnalysis.repoUrl = targetRepoUrl;
         finalAnalysis.fromVersion = targetFromVersion;
         finalAnalysis.toVersion = targetToVersion;
+        finalAnalysis = enrichCommitLinksForItems(finalAnalysis, commitData.commits, repoInfo);
 
         // Fallback for excelRows if AI failed to provide it
         if ((!finalAnalysis.excelRows || finalAnalysis.excelRows.length === 0) && finalAnalysis.items.length > 0) {
@@ -919,6 +1073,7 @@ export default function App() {
       analysis.repoUrl = targetRepoUrl;
       analysis.fromVersion = targetFromVersion;
       analysis.toVersion = targetToVersion;
+      enrichCommitLinksForItems(analysis, commitData.commits, repoInfo);
       
       // Fallback for excelRows if AI failed to provide it
       if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
@@ -972,6 +1127,7 @@ export default function App() {
       analysis.repoUrl = targetRepoUrl;
       analysis.fromVersion = targetFromVersion;
       analysis.toVersion = targetToVersion;
+      enrichCommitLinksForItems(analysis, commitData.commits, repoInfo);
       
       // Fallback for excelRows if AI failed to provide it
       if ((!analysis.excelRows || analysis.excelRows.length === 0) && analysis.items.length > 0) {
@@ -1006,6 +1162,7 @@ export default function App() {
     setChangeLogAnalysis(null);
     setFullDiffAnalysis(null);
     setPreparedSkillBundle(null);
+    setExternalEvidenceRecords([]);
     setDiffAnalyses({});
     setBatchProgress(null);
     setStep('analyzing-full-diff');
@@ -1021,12 +1178,21 @@ export default function App() {
 
       // 预先准备好 Skill Bundle（用分析启动时捕获的输入快照，防串台）
       try {
-        const bundle = buildAnalysisBundleFromFullDiff(
+        const baseBundle = buildAnalysisBundleFromFullDiff(
           analysis,
           analyzedRepoUrl,
           analyzedFromVersion,
           analyzedToVersion,
           analyzedBackground
+        );
+        const externalEvidence = await collectExternalEvidence(baseBundle, analyzedRepoUrl, analyzedFromVersion, analyzedToVersion);
+        const bundle = buildAnalysisBundleFromFullDiff(
+          analysis,
+          analyzedRepoUrl,
+          analyzedFromVersion,
+          analyzedToVersion,
+          analyzedBackground,
+          externalEvidence
         );
         setPreparedSkillBundle(bundle);
       } catch (bundleErr) {
@@ -1086,6 +1252,7 @@ export default function App() {
       zip.file('analysis-bundle/manifest.json', JSON.stringify(bundle.manifest, null, 2));
       zip.file('analysis-bundle/file-risk.json', JSON.stringify(bundle.fileRisk, null, 2));
       zip.file('analysis-bundle/diff-evidence.jsonl', bundle.diffEvidence);
+      zip.file('analysis-bundle/external-evidence.jsonl', bundle.externalEvidence || '');
       zip.file('analysis-bundle/unresolved-questions.json', JSON.stringify(bundle.unresolvedQuestions, null, 2));
       zip.file('analysis-bundle/platform-summary.md', bundle.platformSummary);
 
@@ -1106,7 +1273,12 @@ export default function App() {
     }
   };
 
-  const generateExcelBuffer = async (analysis: FullDiffAnalysis | ChangeLogAnalysis, targetRepoUrl: string, targetFromVersion: string, targetToVersion: string) => {
+  const generateExcelBuffer = async (
+    analysis: FullDiffAnalysis | ChangeLogAnalysis,
+    targetRepoUrl: string,
+    targetFromVersion: string,
+    targetToVersion: string
+  ) => {
     if (!analysis.excelRows || analysis.excelRows.length === 0) {
       throw new Error('分析数据为空，无法生成 Excel。');
     }
@@ -1648,17 +1820,26 @@ export default function App() {
                   {batchItems.map((item, idx) => (
                     <div 
                       key={idx} 
-                      onClick={() => {
+                      onClick={async () => {
                         if (item.status !== 'completed' || !item.analysis) return;
                         setFullDiffAnalysis(item.analysis);
                         // 切换批量结果时同步重建 Skill Bundle，避免下载到上一个项目的内容
                         try {
-                          setPreparedSkillBundle(buildAnalysisBundleFromFullDiff(
+                          const baseBundle = buildAnalysisBundleFromFullDiff(
                             item.analysis,
                             item.repoUrl,
                             item.fromVersion,
                             item.toVersion,
                             projectBackground
+                          );
+                          const externalEvidence = await collectExternalEvidence(baseBundle, item.repoUrl, item.fromVersion, item.toVersion);
+                          setPreparedSkillBundle(buildAnalysisBundleFromFullDiff(
+                            item.analysis,
+                            item.repoUrl,
+                            item.fromVersion,
+                            item.toVersion,
+                            projectBackground,
+                            externalEvidence
                           ));
                         } catch (bundleErr) {
                           console.error('Failed to prepare skill bundle:', bundleErr);
@@ -1881,7 +2062,9 @@ export default function App() {
                   </div>
 
                   <div className="grid gap-4">
-                    {fullDiffAnalysis.items.map((item, i) => (
+                    {fullDiffAnalysis.items.map((item, i) => {
+                      const riskId = `diff-${(i + 1).toString().padStart(3, '0')}`;
+                      return (
                       <div key={i} className="bg-white rounded-2xl border border-black/5 shadow-sm transition-all hover:shadow-md overflow-hidden">
                         <div className="p-6">
                           <div className="flex items-start justify-between gap-4 mb-3">
@@ -1915,7 +2098,9 @@ export default function App() {
 
                           {/* Commit Links */}
                           {item.commitLinks && item.commitLinks.length > 0 && (
-                            <div className="mb-4 flex flex-wrap gap-2">
+                            <div className="mb-4">
+                              <div className="text-[10px] font-bold text-black/30 uppercase tracking-widest mb-1.5">相关 Commit</div>
+                              <div className="flex flex-wrap gap-2">
                               {item.commitLinks.map((link, lIdx) => (
                                 <a
                                   key={lIdx}
@@ -1928,8 +2113,11 @@ export default function App() {
                                   {String(link?.sha || 'commit').substring(0, 7)}
                                 </a>
                               ))}
+                              </div>
                             </div>
                           )}
+
+                          {renderExternalEvidencePanel(riskId)}
 
                           {/* Source Snippet for Credibility */}
                           {item.sourceSnippet && (
@@ -1982,7 +2170,8 @@ export default function App() {
                           )}
                         </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </section>
               </div>
@@ -2071,6 +2260,7 @@ export default function App() {
                   <div className="grid gap-4">
                     {changeLogAnalysis.items.map((item, idx) => {
                       const repoInfo = GitHubService.parseRepoUrl(repoUrl);
+                      const riskId = `chg-${(idx + 1).toString().padStart(3, '0')}`;
                       const prUrl = item.prNumber && repoInfo 
                         ? `https://github.com/${repoInfo.owner}/${repoInfo.repo}/pull/${item.prNumber}`
                         : null;
@@ -2131,6 +2321,8 @@ export default function App() {
                                     )}
                                   </div>
                                 )}
+
+                                {renderExternalEvidencePanel(riskId)}
                               </div>
                               
                               {item.prNumber && (item.impactLevel === 'High' || item.impactLevel === 'Medium') && (

@@ -170,10 +170,51 @@ export interface FileEvidence {
   reviewHint: string;
 }
 
+export type ExternalEvidenceSourceType =
+  | 'github_issue'
+  | 'github_pr'
+  | 'stackoverflow'
+  | 'osv'
+  | 'package_registry'
+  | 'official'
+  | 'web_search'
+  | 'web';
+
+export type ExternalEvidenceTrustLevel =
+  | 'official'
+  | 'maintainer'
+  | 'community-confirmed'
+  | 'security'
+  | 'registry'
+  | 'weak';
+
+export interface ExternalEvidence {
+  risk_id: string;
+  source_type: ExternalEvidenceSourceType;
+  source_url: string;
+  title: string;
+  matched_terms: string[];
+  evidence_summary: string;
+  signal: string;
+  trust_level: ExternalEvidenceTrustLevel;
+  confidence: number;
+  score: number;
+  reference_only?: boolean;
+  extracted_terms?: string[];
+  failure_signatures?: string[];
+  affected_symbols?: {
+    name: string;
+    kind?: string;
+    search_variants?: string[];
+  }[];
+  published_at?: string | null;
+}
+
 export interface SkillBundle {
   manifest: any;
   fileRisk: any;
   diffEvidence: string;
+  externalEvidence?: string;
   unresolvedQuestions: any;
   platformSummary: string;
 }

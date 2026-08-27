@@ -74,7 +74,7 @@ def load_json(path: Path, fallback: Any) -> Any:
         return fallback
 
 
-def load_bundle(bundle: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def load_bundle(bundle: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     manifest = load_json(bundle / "manifest.json", {})
     risks = load_json(bundle / "file-risk.json", [])
     evidence: Dict[str, Dict[str, Any]] = {}
@@ -88,7 +88,20 @@ def load_bundle(bundle: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dic
                 evidence[str(item.get("id", ""))] = item
             except Exception:
                 continue
-    return manifest, risks if isinstance(risks, list) else [], evidence
+    external: Dict[str, List[Dict[str, Any]]] = {}
+    ext_path = bundle / "external-evidence.jsonl"
+    if ext_path.exists():
+        for line in ext_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                item = json.loads(line)
+                risk_id = str(item.get("risk_id", ""))
+                if risk_id:
+                    external.setdefault(risk_id, []).append(item)
+            except Exception:
+                continue
+    return manifest, risks if isinstance(risks, list) else [], evidence, external
 
 
 def walk_files(root: Path) -> Iterable[Path]:
@@ -179,7 +192,7 @@ def component_terms(manifest: Dict[str, Any]) -> List[str]:
     return clean_terms(expanded, 30)
 
 
-def terms_for_risk(risk: Dict[str, Any], evidence: Dict[str, Dict[str, Any]]) -> List[str]:
+def terms_for_risk(risk: Dict[str, Any], evidence: Dict[str, Dict[str, Any]], external: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     raw: List[Any] = []
     for key in ("affectedApis", "code_investigation_guide", "local_search_terms", "failure_signatures"):
         val = risk.get(key)
@@ -195,7 +208,34 @@ def terms_for_risk(risk: Dict[str, Any], evidence: Dict[str, Dict[str, Any]]) ->
         raw.extend(val if isinstance(val, list) else [val])
     raw.extend(terms_from_text(ev.get("source_snippet") or ev.get("hypothesis") or ""))
     raw.extend(terms_from_text(risk.get("source_file")))
+    for ext in external.get(str(risk.get("id", "")), []):
+        if ext.get("reference_only"):
+            continue
+        for key in ("matched_terms", "extracted_terms", "failure_signatures"):
+            val = ext.get(key)
+            raw.extend(val if isinstance(val, list) else [val])
+        for sym in ext.get("affected_symbols") or []:
+            if isinstance(sym, dict):
+                raw.append(sym.get("name"))
     return clean_terms(raw, 80)
+
+
+def trusted_external_evidence(external: Dict[str, List[Dict[str, Any]]], risk_id: str) -> List[Dict[str, Any]]:
+    items = []
+    for item in external.get(str(risk_id), []):
+        trust = str(item.get("trust_level", ""))
+        confidence = float(item.get("confidence") or 0)
+        if trust in {"official", "maintainer", "security"} or confidence >= 0.7:
+            items.append({
+                "source_type": item.get("source_type"),
+                "trust_level": trust,
+                "confidence": confidence,
+                "title": item.get("title"),
+                "source_url": item.get("source_url"),
+                "matched_terms": item.get("matched_terms") or [],
+                "signal": item.get("signal")
+            })
+    return sorted(items, key=lambda x: x.get("confidence", 0), reverse=True)[:8]
 
 
 def scan_usage(root: Path, terms: List[str]) -> List[Dict[str, Any]]:
@@ -353,6 +393,10 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
             lines.append("- 诊断命中：")
             for hit in item["diagnostic_hits"][:10]:
                 lines.append(f"  - {hit['term']} -> {hit['source']}:{hit['line']} {hit['snippet']}")
+        if item.get("external_evidence"):
+            lines.append("- 高可信外部证据：")
+            for ext in item["external_evidence"][:5]:
+                lines.append(f"  - [{ext.get('trust_level')} {ext.get('confidence')}] {ext.get('title')} {ext.get('source_url')}")
     lines.extend(["", "## 四、ClaudeCode 复核要求", "基于 final-report.json 继续追踪 confirmed/likely 项的 wrapper、adapter、service、controller/job/consumer 调用链，并把误报项降级或推翻。"])
     out.write_text("\n".join(lines), encoding="utf-8")
 
@@ -369,7 +413,7 @@ def main() -> int:
 
     root = Path(args.repo_root).resolve()
     bundle = Path(args.bundle).resolve()
-    manifest, risks, evidence = load_bundle(bundle)
+    manifest, risks, evidence, external = load_bundle(bundle)
     project = detect_project(root)
     vue_hits = scan_vue_patterns(root)
     diagnostics = read_diagnostics(args.diagnostics, root, args.check_command, args.check_timeout)
@@ -377,7 +421,7 @@ def main() -> int:
 
     reviews = []
     for risk in risks:
-        terms = terms_for_risk(risk, evidence)
+        terms = terms_for_risk(risk, evidence, external)
         usage = scan_usage(root, terms)
         dep_hits = scan_manifests(root, terms + component_terms(manifest))
         diag_hits = scan_diagnostics(diagnostics, terms + component_terms(manifest))
@@ -395,7 +439,7 @@ def main() -> int:
             reason = "bundle 缺少稳定搜索词，需要人工从上游证据反推。"
         else:
             reason = "组件存在但未发现直接使用点，暂降级。"
-        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "status": status, "reason": reason})
+        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "external_evidence": trusted_external_evidence(external, str(risk.get("id", ""))), "status": status, "reason": reason})
 
     out = Path(args.out).resolve()
     write_outputs(out, manifest, project, vue_hits, diagnostics, reviews)

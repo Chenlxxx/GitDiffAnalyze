@@ -1,4 +1,4 @@
-import { ChangeLogAnalysis, FullDiffAnalysis, SkillBundle } from '../types';
+import { ChangeLogAnalysis, ExternalEvidence, FullDiffAnalysis, SkillBundle } from '../types';
 
 const TERM_NOISE = new Set([
   'a', 'an', 'and', 'are', 'as', 'be', 'by', 'for', 'from', 'if', 'in', 'is', 'it', 'of', 'on', 'or', 'the', 'to',
@@ -143,6 +143,51 @@ function inferEcosystem(...inputs: unknown[]): string {
   return 'unknown';
 }
 
+function externalEvidenceLines(externalEvidence: ExternalEvidence[] = []): string {
+  return externalEvidence.map(item => JSON.stringify(item)).join('\n');
+}
+
+function evidenceForRisk(externalEvidence: ExternalEvidence[], riskId: string): ExternalEvidence[] {
+  return externalEvidence.filter(item => item.risk_id === riskId);
+}
+
+function evidenceSourceSummary(externalEvidence: ExternalEvidence[]) {
+  return {
+    total: externalEvidence.length,
+    github: externalEvidence.filter(e => e.source_type === 'github_issue' || e.source_type === 'github_pr').length,
+    stackoverflow: externalEvidence.filter(e => e.source_type === 'stackoverflow').length,
+    osv: externalEvidence.filter(e => e.source_type === 'osv').length,
+    web_reference: externalEvidence.filter(e => e.reference_only).length,
+    official_or_maintainer: externalEvidence.filter(e => ['official', 'maintainer', 'security'].includes(e.trust_level)).length
+  };
+}
+
+function evidenceSearchTerms(evidence: ExternalEvidence[]): string[] {
+  const values: unknown[] = [];
+  for (const item of evidence.filter(e => !e.reference_only)) {
+    values.push(item.matched_terms, item.extracted_terms);
+    values.push(...(item.affected_symbols || []).map(s => s.name));
+  }
+  return uniqueClean(values, 60);
+}
+
+function evidenceFailureSignatures(evidence: ExternalEvidence[]): string[] {
+  return uniqueClean(evidence.filter(e => !e.reference_only).flatMap(item => item.failure_signatures || []), 20);
+}
+
+function evidenceUrls(evidence: ExternalEvidence[]): string[] {
+  return uniqueClean(evidence.map(item => item.source_url), 20);
+}
+
+function mergeTerms(...values: unknown[]): string[] {
+  const flattened: unknown[] = [];
+  for (const value of values) {
+    if (Array.isArray(value)) flattened.push(...value);
+    else flattened.push(value);
+  }
+  return uniqueClean(flattened, 80);
+}
+
 /**
  * 基于 ChangeLog 分析结果，通过纯代码逻辑构建 Skill Bundle。
  * 不涉及大模型调用，确保导出速度。
@@ -152,7 +197,8 @@ export function buildAnalysisBundleFromChangeLog(
   repoUrl: string,
   fromVersion: string,
   toVersion: string,
-  projectBackground: string
+  projectBackground: string,
+  externalEvidence: ExternalEvidence[] = []
 ): SkillBundle {
   const repoParts = repoUrl.split('/');
   const repoName = repoParts[repoParts.length - 1] || 'unknown-repo';
@@ -181,6 +227,8 @@ export function buildAnalysisBundleFromChangeLog(
     high_risk_count: highRiskCount,
     medium_risk_count: mediumRiskCount,
     low_risk_count: lowRiskCount,
+    external_evidence_count: externalEvidence.length,
+    external_evidence_sources: evidenceSourceSummary(externalEvidence),
     confidence: "upstream-high / repo-unverified",
     limitations: ["基于 ChangeLog 分析生成，未进行源码级验证"],
     project_background: projectBackground || ""
@@ -190,6 +238,9 @@ export function buildAnalysisBundleFromChangeLog(
   const fileRisk = rows.map((row, index) => {
     const id = `chg-${(index + 1).toString().padStart(3, '0')}`;
     const item = analysis.items?.[index];
+    const riskEvidence = evidenceForRisk(externalEvidence, id);
+    const externalTerms = evidenceSearchTerms(riskEvidence);
+    const externalFailures = evidenceFailureSignatures(riskEvidence);
     const affectedApis = extractSearchTerms(
       (item as any)?.affectedApis,
       row.code_discovery,
@@ -200,7 +251,7 @@ export function buildAnalysisBundleFromChangeLog(
       item?.compatibilityAnalysis,
       item?.codeExample
     );
-    const localSearchTerms = extractSearchTerms(
+    const localSearchTerms = mergeTerms(extractSearchTerms(
       affectedApis,
       row.code_discovery,
       row.code_fix,
@@ -208,7 +259,7 @@ export function buildAnalysisBundleFromChangeLog(
       item?.reason,
       item?.compatibilityAnalysis,
       item?.codeExample
-    );
+    ), externalTerms, externalFailures);
     const riskText = [row.changepoint, row.chinese, row.function, item?.reason, item?.compatibilityAnalysis].join('\n');
     return {
       id,
@@ -218,16 +269,17 @@ export function buildAnalysisBundleFromChangeLog(
       severity: row.risk === '高' ? 'high' : (row.risk === '中' ? 'medium' : 'low'),
       risk_type: inferRiskType(riskText),
       trigger_condition: row.function || item?.compatibilityAnalysis || row.chinese,
-      failure_signatures: extractSearchTerms(row.test_suggestion).slice(0, 10),
+      failure_signatures: mergeTerms(extractSearchTerms(row.test_suggestion).slice(0, 10), externalFailures).slice(0, 15),
       affectedApis,
-      affected_symbols: affectedSymbols(affectedApis.length ? affectedApis : localSearchTerms),
+      affected_symbols: affectedSymbols(mergeTerms(affectedApis.length ? affectedApis : localSearchTerms, externalTerms)),
       source_file: null,
       source_url: sourceUrl(repoUrl, fromVersion, toVersion),
       local_search_terms: localSearchTerms,
+      external_evidence_urls: evidenceUrls(riskEvidence),
       functional_purpose: row.function,
       triage_advice: row.suggestion ? [row.suggestion] : [],
       test_advice: row.test_suggestion ? [row.test_suggestion] : [],
-      code_investigation_guide: uniqueClean([...(row.code_discovery ? [row.code_discovery] : []), ...affectedApis], 20),
+      code_investigation_guide: uniqueClean([...(row.code_discovery ? [row.code_discovery] : []), ...affectedApis, ...externalTerms], 20),
       code_remediation_guide: row.code_fix ? [row.code_fix] : [],
       confidence: "high"
     };
@@ -238,6 +290,9 @@ export function buildAnalysisBundleFromChangeLog(
   const diffEvidenceLines = (analysis.items || []).map((item, index) => {
     const id = `chg-${(index + 1).toString().padStart(3, '0')}`;
     const row = rows[index];
+    const riskEvidence = evidenceForRisk(externalEvidence, id);
+    const externalTerms = evidenceSearchTerms(riskEvidence);
+    const externalFailures = evidenceFailureSignatures(riskEvidence);
     const affectedApis = extractSearchTerms(
       (item as any).affectedApis,
       row?.code_discovery,
@@ -245,24 +300,25 @@ export function buildAnalysisBundleFromChangeLog(
       item.compatibilityAnalysis,
       item.codeExample
     );
-    const localSearchTerms = extractSearchTerms(
+    const localSearchTerms = mergeTerms(extractSearchTerms(
       affectedApis,
       item.reason,
       item.compatibilityAnalysis,
       item.codeExample,
       row?.test_suggestion
-    );
+    ), externalTerms, externalFailures);
     const evidence = {
       id,
       source_type: "changelog_row",
       upstream_version: toVersion,
       hypothesis: item.reason,
-      sample_failure_signatures: extractSearchTerms(row?.test_suggestion).slice(0, 10),
-      suspect_apis: affectedApis,
+      sample_failure_signatures: mergeTerms(extractSearchTerms(row?.test_suggestion).slice(0, 10), externalFailures).slice(0, 15),
+      suspect_apis: mergeTerms(affectedApis, externalTerms).slice(0, 60),
       likely_impact_surfaces: item.compatibilityAnalysis ? [item.compatibilityAnalysis] : [],
       source_file: null,
       source_url: sourceUrl(repoUrl, fromVersion, toVersion),
       local_search_terms: localSearchTerms,
+      external_evidence_urls: evidenceUrls(riskEvidence),
       before_after_hint: item.codeExample ? {
         before: item.codeExample.before,
         after: item.codeExample.after
@@ -275,19 +331,23 @@ export function buildAnalysisBundleFromChangeLog(
   if (diffEvidenceLines.length === 0 && rows.length > 0) {
     rows.forEach((row, index) => {
       const id = `chg-${(index + 1).toString().padStart(3, '0')}`;
+      const riskEvidence = evidenceForRisk(externalEvidence, id);
+      const externalTerms = evidenceSearchTerms(riskEvidence);
+      const externalFailures = evidenceFailureSignatures(riskEvidence);
       const affectedApis = extractSearchTerms(row.code_discovery, row.changepoint, row.chinese, row.function);
-      const localSearchTerms = extractSearchTerms(affectedApis, row.code_fix, row.test_suggestion);
+      const localSearchTerms = mergeTerms(extractSearchTerms(affectedApis, row.code_fix, row.test_suggestion), externalTerms, externalFailures);
       const evidence = {
         id,
         source_type: "changelog_row",
         upstream_version: toVersion,
         hypothesis: row.chinese,
-        sample_failure_signatures: extractSearchTerms(row.test_suggestion).slice(0, 10),
-        suspect_apis: affectedApis,
+        sample_failure_signatures: mergeTerms(extractSearchTerms(row.test_suggestion).slice(0, 10), externalFailures).slice(0, 15),
+        suspect_apis: mergeTerms(affectedApis, externalTerms).slice(0, 60),
         likely_impact_surfaces: [],
         source_file: null,
         source_url: sourceUrl(repoUrl, fromVersion, toVersion),
         local_search_terms: localSearchTerms,
+        external_evidence_urls: evidenceUrls(riskEvidence),
         before_after_hint: null
       };
       diffEvidenceLines.push(JSON.stringify(evidence));
@@ -317,6 +377,10 @@ export function buildAnalysisBundleFromChangeLog(
 ## 核心摘要
 ${analysis.summary}
 
+## 外部证据增强
+- **外部证据条数**: ${externalEvidence.length}
+- **高可信来源**: ${evidenceSourceSummary(externalEvidence).official_or_maintainer}
+
 ## 项目背景
 ${projectBackground}
 
@@ -328,6 +392,7 @@ ${projectBackground}
     manifest,
     fileRisk,
     diffEvidence,
+    externalEvidence: externalEvidenceLines(externalEvidence),
     unresolvedQuestions,
     platformSummary
   };
@@ -343,7 +408,8 @@ export function buildAnalysisBundleFromFullDiff(
   repoUrl: string,
   fromVersion: string,
   toVersion: string,
-  projectBackground: string
+  projectBackground: string,
+  externalEvidence: ExternalEvidence[] = []
 ): SkillBundle {
   const repoParts = repoUrl.split('/');
   const repoName = repoParts[repoParts.length - 1] || 'unknown-repo';
@@ -394,6 +460,8 @@ export function buildAnalysisBundleFromFullDiff(
     medium_risk_count: mediumRiskCount,
     low_risk_count: lowRiskCount,
     overall_risk: analysis.overallRisk,
+    external_evidence_count: externalEvidence.length,
+    external_evidence_sources: evidenceSourceSummary(externalEvidence),
     confidence: "upstream-diff-verified / repo-unverified",
     limitations,
     project_background: projectBackground || ""
@@ -403,6 +471,9 @@ export function buildAnalysisBundleFromFullDiff(
   const fileRisk = items.map((item, index) => {
     const id = `diff-${(index + 1).toString().padStart(3, '0')}`;
     const row = rowForItem(item, index);
+    const riskEvidence = evidenceForRisk(externalEvidence, id);
+    const externalTerms = evidenceSearchTerms(riskEvidence);
+    const externalFailures = evidenceFailureSignatures(riskEvidence);
     const affectedApis = extractSearchTerms(
       item.affectedApis,
       row?.code_discovery,
@@ -411,7 +482,7 @@ export function buildAnalysisBundleFromFullDiff(
       item.compatibilityAnalysis,
       item.codeExample
     );
-    const localSearchTerms = extractSearchTerms(
+    const localSearchTerms = mergeTerms(extractSearchTerms(
       affectedApis,
       item.sourceSnippet,
       item.description,
@@ -419,7 +490,7 @@ export function buildAnalysisBundleFromFullDiff(
       item.codeExample,
       row?.test_suggestion,
       row?.code_fix
-    );
+    ), externalTerms, externalFailures);
     const sourceFile = inferSourceFile(item.sourceSnippet);
     const riskText = [item.title, item.description, item.compatibilityAnalysis, item.sourceSnippet].join('\n');
     return {
@@ -430,16 +501,17 @@ export function buildAnalysisBundleFromFullDiff(
       severity: item.riskLevel === 'High' ? 'high' : (item.riskLevel === 'Medium' ? 'medium' : 'low'),
       risk_type: inferRiskType(riskText),
       trigger_condition: item.compatibilityAnalysis || row?.function || item.description,
-      failure_signatures: extractSearchTerms(row?.test_suggestion, item.compatibilityAnalysis).slice(0, 10),
+      failure_signatures: mergeTerms(extractSearchTerms(row?.test_suggestion, item.compatibilityAnalysis).slice(0, 10), externalFailures).slice(0, 15),
       affectedApis,
-      affected_symbols: affectedSymbols(affectedApis.length ? affectedApis : localSearchTerms),
+      affected_symbols: affectedSymbols(mergeTerms(affectedApis.length ? affectedApis : localSearchTerms, externalTerms)),
       source_file: sourceFile,
       source_url: sourceUrl(repoUrl, fromVersion, toVersion),
       local_search_terms: localSearchTerms,
+      external_evidence_urls: evidenceUrls(riskEvidence),
       functional_purpose: row?.function || item.compatibilityAnalysis || item.description,
       triage_advice: row?.suggestion ? [row.suggestion] : [],
       test_advice: row?.test_suggestion ? [row.test_suggestion] : [],
-      code_investigation_guide: uniqueClean([...(row?.code_discovery ? [row.code_discovery] : []), ...affectedApis], 20),
+      code_investigation_guide: uniqueClean([...(row?.code_discovery ? [row.code_discovery] : []), ...affectedApis, ...externalTerms], 20),
       code_remediation_guide: row?.code_fix ? [row.code_fix] : (item.codeExample?.after ? [item.codeExample.after] : []),
       confidence: isDegraded ? "medium" : "high"
     };
@@ -449,6 +521,9 @@ export function buildAnalysisBundleFromFullDiff(
   const diffEvidence = items.map((item, index) => {
     const id = `diff-${(index + 1).toString().padStart(3, '0')}`;
     const row = rowForItem(item, index);
+    const riskEvidence = evidenceForRisk(externalEvidence, id);
+    const externalTerms = evidenceSearchTerms(riskEvidence);
+    const externalFailures = evidenceFailureSignatures(riskEvidence);
     const affectedApis = extractSearchTerms(
       item.affectedApis,
       row?.code_discovery,
@@ -457,27 +532,28 @@ export function buildAnalysisBundleFromFullDiff(
       item.compatibilityAnalysis,
       item.codeExample
     );
-    const localSearchTerms = extractSearchTerms(
+    const localSearchTerms = mergeTerms(extractSearchTerms(
       affectedApis,
       item.sourceSnippet,
       item.description,
       item.compatibilityAnalysis,
       item.codeExample,
       row?.test_suggestion
-    );
+    ), externalTerms, externalFailures);
     const sourceFile = inferSourceFile(item.sourceSnippet);
     return JSON.stringify({
       id,
       source_type: "full_diff_item",
       upstream_version: toVersion,
       hypothesis: item.description,
-      sample_failure_signatures: extractSearchTerms(row?.test_suggestion, item.compatibilityAnalysis).slice(0, 10),
-      suspect_apis: affectedApis,
+      sample_failure_signatures: mergeTerms(extractSearchTerms(row?.test_suggestion, item.compatibilityAnalysis).slice(0, 10), externalFailures).slice(0, 15),
+      suspect_apis: mergeTerms(affectedApis, externalTerms).slice(0, 60),
       likely_impact_surfaces: item.compatibilityAnalysis ? [item.compatibilityAnalysis] : [],
       source_snippet: item.sourceSnippet || null,
       source_file: sourceFile,
       source_url: sourceUrl(repoUrl, fromVersion, toVersion),
       local_search_terms: localSearchTerms,
+      external_evidence_urls: evidenceUrls(riskEvidence),
       related_commits: (item.commitLinks || []).map(c => c.url),
       before_after_hint: item.codeExample ? {
         before: item.codeExample.before,
@@ -519,6 +595,10 @@ ${analysis.summary}
 ## 核心建议
 ${(analysis.recommendations || []).map(r => `- ${r}`).join('\n')}
 
+## 外部证据增强
+- **外部证据条数**: ${externalEvidence.length}
+- **高可信来源**: ${evidenceSourceSummary(externalEvidence).official_or_maintainer}
+
 ## 项目背景
 ${projectBackground}
 
@@ -530,6 +610,7 @@ ${projectBackground}
     manifest,
     fileRisk,
     diffEvidence,
+    externalEvidence: externalEvidenceLines(externalEvidence),
     unresolvedQuestions,
     platformSummary
   };

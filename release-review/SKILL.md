@@ -12,11 +12,12 @@ description: 读取随本 skill 附带的 analysis-bundle（上游三方件升�
 1. `analysis-bundle/manifest.json` — 升级范围、风险计数、project_background、analysis_mode
 2. `analysis-bundle/file-risk.json` — 风险项清单（含 affectedApis、排查建议、整改建议）
 3. `analysis-bundle/diff-evidence.jsonl` — 每条风险的上游证据（source_snippet、related_commits、suspect_apis）
-4. `analysis-bundle/unresolved-questions.json` — 待人工确认问题
-5. `analysis-bundle/platform-summary.md` — 平台侧分析摘要
+4. `analysis-bundle/external-evidence.jsonl` — 联网采集的公开踩坑/Issue/安全库证据，以及 `reference_only=true` 的普通网页参考链接；网页参考只供人工点开判断
+5. `analysis-bundle/unresolved-questions.json` — 待人工确认问题
+6. `analysis-bundle/platform-summary.md` — 平台侧分析摘要
 
 若不确定安装路径，可用 glob 搜索 `**/release-review/analysis-bundle/manifest.json` 定位。
-`manifest.json` 的 `schema_version` / `bundle_schema_version` 为 2 时，优先使用 v2 字段：`ecosystem`、`package_coordinates`、`affected_symbols`、`risk_type`、`trigger_condition`、`failure_signatures`、`source_file`、`source_url`、`local_search_terms`。
+`manifest.json` 的 `schema_version` / `bundle_schema_version` 为 2 时，优先使用 v2 字段：`ecosystem`、`package_coordinates`、`affected_symbols`、`risk_type`、`trigger_condition`、`failure_signatures`、`source_file`、`source_url`、`local_search_terms`、`external_evidence_count`、`external_evidence_sources`。
 `manifest.json` 的 `analysis_mode` 标识风险来源：`changelog`=上游变更日志，`full_diff` 系列=上游两版本间源码 Diff。`project_background` 是使用方项目背景。
 
 ## 核心目标
@@ -38,7 +39,7 @@ bundle 里每条风险项都是「上游视角的待验证假设 + 已有证据�
 脚本会先检测项目类型，再扫描 manifest/lockfile、源码使用点、Vue SFC 模式和可选诊断日志，输出 `final-report.json`，每条风险状态为 `confirmed | likely | downgraded | rejected | needs-human`。
 
 ### 2. 读取并理解 bundle 与机器 JSON
-读完上述 bundle 文件和 `final-report.json`，建立风险项清单；对每条记下其受影响 API 符号（affectedApis / suspect_apis / affected_symbols / local_search_terms）与上游证据（source_snippet）。
+读完上述 bundle 文件和 `final-report.json`，建立风险项清单；对每条记下其受影响 API 符号（affectedApis / suspect_apis / affected_symbols / local_search_terms）与上游证据（source_snippet）。如存在 `external-evidence.jsonl`，只把它作为公开经验佐证和搜索词来源，不能替代本仓库代码证据。
 
 ### 3. 逐项做多层调用链路追踪（本 skill 的核心价值）
 对每条高/中风险项，**不要只搜一层直接调用**，要追踪完整链路：
@@ -56,6 +57,8 @@ e. **结论**：以 `final-report.json` 的机器状态为起点，基于证据�
 - 优先读 manifest 的 `project_background`，但代码证据与背景描述冲突时以代码为准。
 - `full_diff` 系列时，`diff-evidence.jsonl` 的 `source_snippet` 与 `related_commits` 是源码级证据，可直接据此定位本仓库调用点。
 - v2 bundle 中 `local_search_terms` 与 `affected_symbols.search_variants` 是本地检索首选锚点，优先于宽泛标题词。
+- `external-evidence.jsonl` 中 `trust_level=official|maintainer|security` 且 `confidence >= 0.7` 的记录可作为强佐证；社区记录只用于提示可能的故障模式或补充搜索词。
+- `external-evidence.jsonl` 中 `reference_only=true` 的网页搜索结果只作为人工参考链接，不得参与最终风险确认或打分。
 - 仓库未使用某个被引用 API → 明确说明并降级/排除，不要硬凑。
 - 无法仅凭当前仓库证明的内容 → 放入「待人工确认问题」，不要臆测。
 - 对 bundle 中**所有**风险项统一处理，不要只分析第一条。

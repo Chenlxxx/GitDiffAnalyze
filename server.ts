@@ -65,6 +65,434 @@ function rateLimitResetHint(headers: any): string {
   return `配额将在约 ${minutes} 分钟后重置。`;
 }
 
+// 外部证据缓存：GitHub / StackOverflow / OSV 都有速率限制，证据可短期复用。
+const externalEvidenceCache = new Map<string, { data: any; ts: number }>();
+const EXTERNAL_EVIDENCE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const EXTERNAL_EVIDENCE_TIMEOUT_MS = 8000;
+
+function externalEvidenceCacheGet(key: string) {
+  const hit = externalEvidenceCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > EXTERNAL_EVIDENCE_CACHE_TTL_MS) {
+    externalEvidenceCache.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function externalEvidenceCacheSet(key: string, data: any) {
+  if (externalEvidenceCache.size >= 300) {
+    const oldest = externalEvidenceCache.keys().next().value;
+    if (oldest !== undefined) externalEvidenceCache.delete(oldest);
+  }
+  externalEvidenceCache.set(key, { data, ts: Date.now() });
+}
+
+function evidenceTextOf(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+const EVIDENCE_TERM_NOISE = new Set([
+  'string', 'builder', 'default', 'this', 'that', 'with', 'without', 'return', 'returns',
+  'object', 'objects', 'class', 'interface', 'public', 'private', 'static', 'final',
+  'fixed', 'changed', 'removed', 'added', 'version', 'release', 'github', 'issue'
+]);
+
+function cleanEvidenceTerms(values: unknown[], limit = 20): string[] {
+  const out: string[] = [];
+  for (const raw of values) {
+    const value = evidenceTextOf(raw).trim().replace(/^['"`\s([{]+|['"`\s)\]}.,;:]+$/g, '');
+    if (value.length < 3 || value.length > 120) continue;
+    const normalized = value.toLowerCase();
+    const compact = normalized.replace(/[^a-z0-9_$#.@/-]+/g, '');
+    if (!compact || EVIDENCE_TERM_NOISE.has(compact) || EVIDENCE_TERM_NOISE.has(normalized)) continue;
+    if (/^\d+$/.test(compact)) continue;
+    if (!out.some(existing => existing.toLowerCase() === normalized)) out.push(value);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function extractEvidenceTerms(...inputs: unknown[]): string[] {
+  const raw: string[] = [];
+  const text = inputs.map(evidenceTextOf).filter(Boolean).join('\n');
+  for (const input of inputs) {
+    if (Array.isArray(input)) raw.push(...input.map(evidenceTextOf));
+  }
+  const patterns = [
+    /`([^`\n]{3,120})`/g,
+    /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?:#[A-Za-z_$][\w$]*)?(?:\([^)\n]{0,80}\))?/g,
+    /\b[A-Z][A-Za-z0-9_$]+(?:Exception|Error|Failure|Config|Options|Builder|Client|Router|Factory|Manager|Handler|Interceptor|Provider|Request|Response|Timeout|Socket|Connection|Cache|Auth|Scheme)\b/g,
+    /\bERR_[A-Z0-9_]+\b/g,
+    /\b[a-z][a-z0-9]*(?:[._-][a-z0-9]+){1,}\b/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) raw.push(match[1] || match[0]);
+  }
+  return cleanEvidenceTerms(raw, 40);
+}
+
+function extractFailureSignatures(...inputs: unknown[]): string[] {
+  const text = inputs.map(evidenceTextOf).filter(Boolean).join('\n');
+  const raw: string[] = [];
+  const patterns = [
+    /\b[A-Za-z_$][\w$]*(?:Exception|Error|Failure)\b(?::\s*[^\n\r]{0,100})?/g,
+    /\b(?:NoSuchMethodError|NoClassDefFoundError|ClassNotFoundException|ClassCastException|IllegalArgumentException|IllegalStateException|NullPointerException)\b/g,
+    /\bERR_[A-Z0-9_]+\b/g,
+    /\b(?:cannot|can't|failed to|unable to|invalid|unsupported|deprecated|missing|not found)\s+[^\n\r]{3,100}/gi
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) raw.push(match[0]);
+  }
+  return cleanEvidenceTerms(raw, 12);
+}
+
+function evidenceSymbolKind(term: string): string {
+  if (term.includes('#') || /\w+\([^)]*\)/.test(term)) return 'method';
+  if (/[._-](config|option|property|timeout|ttl|limit|mode|flag)s?$/i.test(term)) return 'config';
+  if (/Exception$|Error$|Failure$/.test(term)) return 'exception';
+  if (term.includes('.') && /[A-Z]/.test(term.split('.').pop() || '')) return 'class';
+  if (/^[A-Z][A-Za-z0-9_$]+$/.test(term)) return 'class';
+  return 'keyword';
+}
+
+function evidenceSearchVariants(term: string): string[] {
+  const simple = term.replace(/\([^)]*\)/g, '').split(/[.#/@_-]/).filter(Boolean).pop();
+  return cleanEvidenceTerms([term, simple, term.replace(/[\s.#/@_-]+/g, '')], 6);
+}
+
+function searchTermsForRisk(risk: any): string[] {
+  const symbolNames = Array.isArray(risk.affected_symbols)
+    ? risk.affected_symbols.map((s: any) => s?.name).filter(Boolean)
+    : [];
+  return cleanEvidenceTerms([
+    ...(risk.affectedApis || []),
+    ...symbolNames,
+    ...(risk.local_search_terms || []),
+    ...(risk.failure_signatures || []),
+    risk.title,
+    risk.trigger_condition
+  ], 8);
+}
+
+function matchTerms(text: string, terms: string[]): string[] {
+  const lower = text.toLowerCase();
+  return terms.filter(term => {
+    const t = term.toLowerCase();
+    if (t.length < 3) return false;
+    return lower.includes(t) || lower.includes(t.replace(/[.#/@_-]+/g, ''));
+  }).slice(0, 10);
+}
+
+function decodeHtml(value: string): string {
+  return String(value || '')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function unwrapDuckDuckGoUrl(url: string): string {
+  try {
+    const parsed = new URL(url, 'https://duckduckgo.com');
+    const uddg = parsed.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+function confidenceFor(sourceType: string, trustLevel: string, matchedTerms: string[], rawScore = 0): number {
+  const sourceBase: Record<string, number> = {
+    osv: 0.92,
+    official: 0.88,
+    github_pr: 0.76,
+    github_issue: 0.58,
+    stackoverflow: 0.56,
+    package_registry: 0.62,
+    web_search: 0.2,
+    web: 0.35
+  };
+  const trustBoost: Record<string, number> = {
+    official: 0.08,
+    maintainer: 0.08,
+    security: 0.07,
+    registry: 0.04,
+    'community-confirmed': 0.05,
+    weak: -0.1
+  };
+  const matchBoost = Math.min(0.16, matchedTerms.length * 0.025);
+  const popularityBoost = Math.min(0.08, Math.log10(Math.max(1, rawScore)) * 0.025);
+  const value = (sourceBase[sourceType] ?? 0.4) + (trustBoost[trustLevel] ?? 0) + matchBoost + popularityBoost;
+  return Math.max(0.05, Math.min(0.98, Number(value.toFixed(2))));
+}
+
+function githubTrustLevel(item: any, isPr: boolean): string {
+  if (isPr) return 'maintainer';
+  const assoc = String(item.author_association || '').toUpperCase();
+  if (['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc)) return 'maintainer';
+  if ((item.comments || 0) >= 3 || (item.reactions?.total_count || 0) >= 3) return 'community-confirmed';
+  return 'weak';
+}
+
+async function searchGitHubEvidence(repoUrl: string, risk: any, terms: string[], authHeader?: string): Promise<any[]> {
+  const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+  if (!match || terms.length === 0) return [];
+  const owner = match[1];
+  const repo = match[2].replace(/\.git$/, '');
+  const queryTerms = terms.slice(0, 4).map(t => `"${t.replace(/"/g, '')}"`).join(' ');
+  const q = `${queryTerms} repo:${owner}/${repo} in:title,body`;
+  const cacheKey = `github|${q}`;
+  const cached = externalEvidenceCacheGet(cacheKey);
+  if (cached) return cached;
+  try {
+    const headers: any = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'CompatAnalyzer/1.0'
+    };
+    if (authHeader) headers.Authorization = authHeader;
+    else if (process.env.GITHUB_TOKEN) headers.Authorization = `token ${process.env.GITHUB_TOKEN}`;
+    const { data } = await axios.get('https://api.github.com/search/issues', {
+      params: { q, per_page: 5 },
+      headers,
+      timeout: EXTERNAL_EVIDENCE_TIMEOUT_MS
+    });
+    const evidence = (data.items || []).map((item: any) => {
+      const text = [item.title, item.body].join('\n');
+      const isPr = !!item.pull_request;
+      const sourceType = isPr ? 'github_pr' : 'github_issue';
+      const matched = matchTerms(text, terms);
+      const extracted = extractEvidenceTerms(item.title, item.body);
+      const failures = extractFailureSignatures(item.title, item.body);
+      const trust = githubTrustLevel(item, isPr);
+      return {
+        risk_id: risk.id,
+        source_type: sourceType,
+        source_url: item.html_url,
+        title: item.title,
+        matched_terms: matched,
+        evidence_summary: String(item.body || '').replace(/\s+/g, ' ').slice(0, 500),
+        signal: isPr ? 'upstream_fix_or_discussion' : 'upstream_issue_or_regression',
+        trust_level: trust,
+        confidence: confidenceFor(sourceType, trust, matched, item.comments || 0),
+        score: item.score || 0,
+        extracted_terms: extracted,
+        failure_signatures: failures,
+        affected_symbols: extracted.slice(0, 8).map(name => ({
+          name,
+          kind: evidenceSymbolKind(name),
+          search_variants: evidenceSearchVariants(name)
+        })),
+        published_at: item.created_at || null
+      };
+    }).filter((ev: any) => ev.matched_terms.length > 0 || ev.failure_signatures.length > 0);
+    externalEvidenceCacheSet(cacheKey, evidence);
+    return evidence;
+  } catch (err: any) {
+    console.warn('GitHub external evidence search failed:', err.response?.status || err.message);
+    return [];
+  }
+}
+
+async function searchStackOverflowEvidence(packageName: string, risk: any, terms: string[]): Promise<any[]> {
+  if (!packageName || terms.length === 0) return [];
+  const q = cleanEvidenceTerms([packageName, ...terms.slice(0, 4)], 5).join(' ');
+  if (!q) return [];
+  const cacheKey = `stackoverflow|${q}`;
+  const cached = externalEvidenceCacheGet(cacheKey);
+  if (cached) return cached;
+  try {
+    const { data } = await axios.get('https://api.stackexchange.com/2.3/search/advanced', {
+      params: {
+        order: 'desc',
+        sort: 'relevance',
+        site: 'stackoverflow',
+        pagesize: 5,
+        q
+      },
+      timeout: EXTERNAL_EVIDENCE_TIMEOUT_MS
+    });
+    const evidence = (data.items || []).map((item: any) => {
+      const title = String(item.title || '').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+      const matched = matchTerms(title, terms);
+      const extracted = extractEvidenceTerms(title);
+      const trust = item.is_answered || item.score >= 3 ? 'community-confirmed' : 'weak';
+      return {
+        risk_id: risk.id,
+        source_type: 'stackoverflow',
+        source_url: item.link,
+        title,
+        matched_terms: matched,
+        evidence_summary: `Stack Overflow question, score=${item.score || 0}, answers=${item.answer_count || 0}, answered=${!!item.is_answered}`,
+        signal: 'community_runtime_or_migration_question',
+        trust_level: trust,
+        confidence: confidenceFor('stackoverflow', trust, matched, item.score || 0),
+        score: item.score || 0,
+        extracted_terms: extracted,
+        failure_signatures: extractFailureSignatures(title),
+        affected_symbols: extracted.slice(0, 6).map(name => ({
+          name,
+          kind: evidenceSymbolKind(name),
+          search_variants: evidenceSearchVariants(name)
+        })),
+        published_at: item.creation_date ? new Date(item.creation_date * 1000).toISOString() : null
+      };
+    }).filter((ev: any) => ev.matched_terms.length > 0 || ev.failure_signatures.length > 0);
+    externalEvidenceCacheSet(cacheKey, evidence);
+    return evidence;
+  } catch (err: any) {
+    console.warn('StackOverflow external evidence search failed:', err.response?.status || err.message);
+    return [];
+  }
+}
+
+async function searchWebReferenceEvidence(packageName: string, risk: any, terms: string[]): Promise<any[]> {
+  const query = cleanEvidenceTerms([
+    packageName,
+    ...terms.slice(0, 4),
+    'upgrade',
+    'migration',
+    'error'
+  ], 8).join(' ');
+  if (!query) return [];
+  const cacheKey = `webref|${query}`;
+  const cached = externalEvidenceCacheGet(cacheKey);
+  if (cached) return cached;
+  try {
+    const { data } = await axios.get('https://duckduckgo.com/html/', {
+      params: { q: query },
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; CompatAnalyzer/1.0)' },
+      timeout: EXTERNAL_EVIDENCE_TIMEOUT_MS,
+      responseType: 'text'
+    });
+    const html = String(data || '');
+    const blocks = html.split(/<div[^>]+class="[^"]*result[^"]*"[^>]*>/i).slice(1, 8);
+    const evidence = blocks.map(block => {
+      const linkMatch = block.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+        || block.match(/<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+      if (!linkMatch) return null;
+      const sourceUrl = unwrapDuckDuckGoUrl(decodeHtml(linkMatch[1]));
+      if (!/^https?:\/\//i.test(sourceUrl)) return null;
+      const title = decodeHtml(linkMatch[2]);
+      const snippetMatch = block.match(/<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/i)
+        || block.match(/<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+      const summary = decodeHtml(snippetMatch?.[1] || '');
+      const matched = matchTerms(`${title}\n${summary}`, terms);
+      return {
+        risk_id: risk.id,
+        source_type: 'web_search',
+        source_url: sourceUrl,
+        title,
+        matched_terms: matched,
+        evidence_summary: summary || 'General web search reference. Review manually before using as evidence.',
+        signal: 'reference_only_web_result',
+        trust_level: 'weak',
+        confidence: confidenceFor('web_search', 'weak', matched, 0),
+        score: 0,
+        reference_only: true,
+        extracted_terms: [],
+        failure_signatures: [],
+        affected_symbols: [],
+        published_at: null
+      };
+    }).filter(Boolean).slice(0, 4);
+    externalEvidenceCacheSet(cacheKey, evidence);
+    return evidence;
+  } catch (err: any) {
+    console.warn('Web reference search failed:', err.response?.status || err.message);
+    return [];
+  }
+}
+
+function osvEcosystem(ecosystem: string): string | null {
+  const map: Record<string, string> = {
+    maven: 'Maven',
+    npm: 'npm',
+    python: 'PyPI',
+    go: 'Go',
+    rust: 'crates.io',
+    dotnet: 'NuGet',
+    php: 'Packagist'
+  };
+  return map[String(ecosystem || '').toLowerCase()] || null;
+}
+
+async function searchOsvEvidence(manifest: any, risk: any, terms: string[], toVersion: string): Promise<any[]> {
+  const ecosystem = osvEcosystem(manifest?.ecosystem);
+  const packageName = manifest?.package_coordinates?.package || manifest?.component;
+  const version = String(toVersion || manifest?.to_ref || '').replace(/^v/i, '');
+  if (!ecosystem || !packageName || !version) return [];
+  const cacheKey = `osv|${ecosystem}|${packageName}|${version}`;
+  let vulns = externalEvidenceCacheGet(cacheKey);
+  if (!vulns) {
+    try {
+      const { data } = await axios.post('https://api.osv.dev/v1/query', {
+        version,
+        package: { name: packageName, ecosystem }
+      }, { timeout: EXTERNAL_EVIDENCE_TIMEOUT_MS });
+      vulns = data.vulns || [];
+      externalEvidenceCacheSet(cacheKey, vulns);
+    } catch (err: any) {
+      console.warn('OSV external evidence search failed:', err.response?.status || err.message);
+      return [];
+    }
+  }
+  return (vulns || []).map((vuln: any) => {
+    const text = [vuln.id, vuln.summary, vuln.details, ...(vuln.aliases || [])].join('\n');
+    const matched = matchTerms(text, terms);
+    if (matched.length === 0 && !/security|vulnerab|cve|cwe/i.test(text)) return null;
+    const url = vuln.references?.find((r: any) => r.url)?.url || `https://osv.dev/vulnerability/${vuln.id}`;
+    return {
+      risk_id: risk.id,
+      source_type: 'osv',
+      source_url: url,
+      title: vuln.summary || vuln.id,
+      matched_terms: matched,
+      evidence_summary: String(vuln.details || vuln.summary || '').replace(/\s+/g, ' ').slice(0, 500),
+      signal: 'security_advisory',
+      trust_level: 'security',
+      confidence: confidenceFor('osv', 'security', matched, 10),
+      score: 10,
+      extracted_terms: extractEvidenceTerms(vuln.id, vuln.summary, vuln.details, vuln.aliases),
+      failure_signatures: extractFailureSignatures(vuln.summary, vuln.details),
+      affected_symbols: extractEvidenceTerms(vuln.summary, vuln.details).slice(0, 6).map(name => ({
+        name,
+        kind: evidenceSymbolKind(name),
+        search_variants: evidenceSearchVariants(name)
+      })),
+      published_at: vuln.published || null
+    };
+  }).filter(Boolean);
+}
+
+function dedupeEvidence(evidence: any[], limitPerRisk = 8): any[] {
+  const grouped = new Map<string, any[]>();
+  for (const item of evidence) {
+    if (!item?.risk_id || !item?.source_url) continue;
+    const arr = grouped.get(item.risk_id) || [];
+    if (!arr.some(existing => existing.source_url === item.source_url)) arr.push(item);
+    grouped.set(item.risk_id, arr);
+  }
+  const out: any[] = [];
+  for (const arr of grouped.values()) {
+    const scored = arr.filter(item => !item.reference_only).sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+    const references = arr.filter(item => item.reference_only).slice(0, 4);
+    out.push(...scored.slice(0, limitPerRisk), ...references);
+  }
+  return out;
+}
+
 // AI 代理的服务端默认 key 注入：客户端未带鉴权时按目标域名兜底。
 // 部署平台（如 Render）可通过 DEFAULT_AI_API_KEY 提供统一默认 Key。
 function injectAIKey(url: string, headers: any) {
@@ -257,6 +685,49 @@ async function startServer() {
       }
 
       res.status(status || 500).json({ message: error.message });
+    }
+  });
+
+  app.post("/api/external-evidence", async (req, res) => {
+    try {
+      const { repoUrl, fromVersion, toVersion, manifest, risks } = req.body || {};
+      if (!repoUrl || !Array.isArray(risks)) {
+        return res.status(400).json({ message: 'Missing repoUrl or risks' });
+      }
+
+      const packageName = manifest?.package_coordinates?.package || manifest?.component || '';
+      const authHeader = req.headers['authorization'] as string | undefined;
+      const allEvidence: any[] = [];
+
+      // 小批量、逐项 best-effort：外部证据不能拖垮主分析。
+      for (const risk of risks.slice(0, 30)) {
+        const terms = searchTermsForRisk(risk);
+        if (terms.length === 0) continue;
+        const [githubEvidence, stackOverflowEvidence, osvEvidence, webReferenceEvidence] = await Promise.all([
+          searchGitHubEvidence(repoUrl, risk, terms, authHeader),
+          searchStackOverflowEvidence(packageName, risk, terms),
+          searchOsvEvidence(manifest || {}, risk, terms, toVersion || fromVersion),
+          searchWebReferenceEvidence(packageName, risk, terms)
+        ]);
+        allEvidence.push(...githubEvidence, ...stackOverflowEvidence, ...osvEvidence, ...webReferenceEvidence);
+      }
+
+      const evidence = dedupeEvidence(allEvidence, 8);
+      res.json({
+        evidence,
+        source_summary: {
+          github: evidence.filter((e: any) => e.source_type === 'github_issue' || e.source_type === 'github_pr').length,
+          stackoverflow: evidence.filter((e: any) => e.source_type === 'stackoverflow').length,
+          osv: evidence.filter((e: any) => e.source_type === 'osv').length,
+          web_reference: evidence.filter((e: any) => e.reference_only).length
+        }
+      });
+    } catch (error: any) {
+      console.error('External evidence search failed:', error?.message || error);
+      res.status(500).json({
+        message: '外部证据采集失败',
+        details: error?.message || String(error)
+      });
     }
   });
 
