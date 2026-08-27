@@ -65,6 +65,7 @@ export interface ChangeLogAnalysis {
     prNumber?: number;
     reason: string;
     impactLevel: 'High' | 'Medium' | 'Low';
+    affectedApis?: string[];
     compatibilityAnalysis?: string;
     codeExample?: {
       before: string;

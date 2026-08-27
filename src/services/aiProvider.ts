@@ -755,11 +755,12 @@ ${changeLog}
     "prNumber": 12345,
     "reason": "变更说明与背景（中文）",
     "impactLevel": "High | Medium | Low",
+    "affectedApis": ["受影响的公开 API / 类 / 方法 / 配置项全名"],
     "compatibilityAnalysis": "对使用方的影响与排查建议",
     "codeExample": { "before": "旧用法", "after": "新用法" }
   }]
 }
-要求：逐条覆盖日志中的具体条目，不要宽泛概括；High/Medium 条目必须给出 codeExample；prNumber 没有就省略；仅基于日志内容，严禁编造。`;
+要求：逐条覆盖日志中的具体条目，不要宽泛概括；High/Medium 条目必须给出 affectedApis 和 codeExample；prNumber 没有就省略；仅基于日志内容，严禁编造。`;
     const result = await this.callAI(prompt);
     return { ...parseJSON(result), sourceUrl };
   }

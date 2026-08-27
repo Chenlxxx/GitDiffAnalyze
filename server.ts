@@ -477,8 +477,8 @@ async function startServer() {
             要求：
             1. 必须输出纯 JSON 格式。
             2. 识别并罗列变更日志中的每一个具体条目。不要进行宽泛的概括，要细化到具体的 PR 或 BugFix。
-            3. 每一个条目必须包含：标题、PR编号（如有）、变更原因、影响程度评价（High/Medium/Low）、兼容性影响分析。
-            4. 如果影响等级为“High”或“Medium”，必须提供具体的代码示例或配置调整展示。
+            3. 每一个条目必须包含：标题、PR编号（如有）、变更原因、影响程度评价（High/Medium/Low）、受影响 API / 类 / 方法 / 配置项、兼容性影响分析。
+            4. 如果影响等级为“High”或“Medium”，必须提供 affectedApis 和具体的代码示例或配置调整展示。
             5. 特别针对 Netty 等项目，请关注 Protocol, SSL, Buffer, EventLoop, Transport 等核心模块。
 
             输出格式 (JSON):
@@ -490,6 +490,7 @@ async function startServer() {
                   "prNumber": 12345,
                   "reason": "变更的详细背景说明",
                   "impactLevel": "High | Medium | Low",
+                  "affectedApis": ["受影响的公开 API / 类 / 方法 / 配置项全名"],
                   "compatibilityAnalysis": "对现有代码的影响及排查建议",
                   "codeExample": {
                     "before": "旧版本用法",

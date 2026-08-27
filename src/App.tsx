@@ -49,6 +49,7 @@ import {
   OPENAI_YAML, 
   EXAMPLE_REPORT_MD, 
   USAGE_MD, 
+  COMPAT_LOCAL_REVIEW_PY,
   EXPORT_DOCX_PY 
 } from './constants/skillStaticFiles';
 
@@ -1078,6 +1079,7 @@ export default function App() {
       zip.file('agents/openai.yaml', OPENAI_YAML);
       zip.file('references/example-report.md', EXAMPLE_REPORT_MD);
       zip.file('references/usage.md', USAGE_MD);
+      zip.file('scripts/compat_local_review.py', COMPAT_LOCAL_REVIEW_PY);
       zip.file('scripts/export_docx.py', EXPORT_DOCX_PY);
 
       // Dynamic bundle files

@@ -8,11 +8,15 @@
 ## 运行
 在 Claude Code / OpenCode 中打开当前仓库后，可直接输入：
 
-`请使用 release-review skill，读取 .opencode/skills/release-review/analysis-bundle，对当前仓库进行复核，并在仓库根目录生成中文 final-report.md。`
+`请使用 release-review skill，先运行 scripts/compat_local_review.py 读取 .opencode/skills/release-review/analysis-bundle，对当前仓库产出 final-report.json，再基于 JSON 命中结果追踪调用链并完善中文 final-report.md。`
 
 更强一些的指令是：
 
-`请立即使用 release-review skill。读取 .opencode/skills/release-review/analysis-bundle 中的全部风险项，结合当前仓库逐项验证，并输出中文 final-report.md。除非缺少必要文件，否则不要先问我是否继续。`
+`请立即使用 release-review skill。先执行机器复核脚本，检测项目类型、扫描 manifest/lockfile、源码使用点和可选构建日志，输出 confirmed / likely / downgraded / rejected / needs-human 的 final-report.json；然后结合当前仓库逐项验证调用链，完善中文 final-report.md。除非缺少必要文件，否则不要先问我是否继续。`
+
+也可以手工先运行：
+
+`python .opencode/skills/release-review/scripts/compat_local_review.py --bundle .opencode/skills/release-review/analysis-bundle --repo-root . --out final-report.md`
 
 ## 可选 Word 导出
 生成 `final-report.md` 后，可继续要求：

@@ -16,6 +16,7 @@ description: 读取随本 skill 附带的 analysis-bundle（上游三方件升�
 5. `analysis-bundle/platform-summary.md` — 平台侧分析摘要
 
 若不确定安装路径，可用 glob 搜索 `**/release-review/analysis-bundle/manifest.json` 定位。
+`manifest.json` 的 `schema_version` / `bundle_schema_version` 为 2 时，优先使用 v2 字段：`ecosystem`、`package_coordinates`、`affected_symbols`、`risk_type`、`trigger_condition`、`failure_signatures`、`source_file`、`source_url`、`local_search_terms`。
 `manifest.json` 的 `analysis_mode` 标识风险来源：`changelog`=上游变更日志，`full_diff` 系列=上游两版本间源码 Diff。`project_background` 是使用方项目背景。
 
 ## 核心目标
@@ -24,24 +25,37 @@ bundle 里每条风险项都是「上游视角的待验证假设 + 已有证据�
 
 ## 工作流
 
-### 1. 读取并理解 bundle
-读完上述文件，建立风险项清单；对每条记下其受影响 API 符号（affectedApis / suspect_apis）与上游证据（source_snippet）。
+### 1. 先运行机器复核，再读取结果
+优先运行本 skill 附带脚本（路径相对本 SKILL.md）：
 
-### 2. 逐项做多层调用链路追踪（本 skill 的核心价值）
+`python scripts/compat_local_review.py --bundle analysis-bundle --repo-root . --out final-report.md`
+
+如果用户提供了已有构建/类型检查日志，把它们作为诊断证据传入：
+
+`python scripts/compat_local_review.py --bundle analysis-bundle --repo-root . --diagnostics build.log --out final-report.md`
+
+只有在用户明确授权运行本地构建/测试命令时，才追加 `--check-command "npm run build"`、`--check-command "mvn test"` 等参数。
+脚本会先检测项目类型，再扫描 manifest/lockfile、源码使用点、Vue SFC 模式和可选诊断日志，输出 `final-report.json`，每条风险状态为 `confirmed | likely | downgraded | rejected | needs-human`。
+
+### 2. 读取并理解 bundle 与机器 JSON
+读完上述 bundle 文件和 `final-report.json`，建立风险项清单；对每条记下其受影响 API 符号（affectedApis / suspect_apis / affected_symbols / local_search_terms）与上游证据（source_snippet）。
+
+### 3. 逐项做多层调用链路追踪（本 skill 的核心价值）
 对每条高/中风险项，**不要只搜一层直接调用**，要追踪完整链路：
 
 a. **定位直接使用点**：搜索对受影响 API（类/接口/方法/字段/配置项名）的直接引用——import、new、方法调用、继承、实现、注解、配置文件中的类名。
 b. **向上追踪调用链**：找到直接使用点后，继续追踪**谁调用了它们**——包装类(wrapper)、适配器(adapter)、门面(facade)、工具类、基类，一层层向上，直到业务入口（Controller / Service 公开方法 / 定时任务 / 消息消费者 / 对外接口）。画出「上游变更 API → 本仓库封装层 → 业务入口」的完整链路。
 c. **覆盖间接/隐式使用**：注意纯文本搜索易漏的命中方式——反射、SPI/ServiceLoader、依赖注入(Spring Bean / @Autowired)、AOP 切面、动态代理、配置驱动实例化、字节码增强、序列化框架。
 d. **识别运行时故障面**：判断变更在编译期暴露还是仅运行时暴露（默认行为变化、序列化/协议格式变化等），以及触发的具体场景。
-e. **结论**：基于证据把该风险项**确认 / 降级 / 推翻**，给出受影响的具体文件、完整调用链、故障模式。
+e. **结论**：以 `final-report.json` 的机器状态为起点，基于证据把该风险项**确认 / likely / 降级 / 推翻 / 待人工确认**，给出受影响的具体文件、完整调用链、故障模式。
 
-### 3. 输出报告
-在仓库根目录生成 `final-report.md`（结构见下）。全部中文，基于真实代码证据，引用文件路径、类名、方法名、行号。
+### 4. 输出报告
+脚本会先生成机器版 `final-report.md`。你需要基于 `final-report.json` 和真实代码继续完善同一个 `final-report.md`：补充调用链、业务入口、误报/漏报判断和整改建议。ClaudeCode 负责解释调用链和整改，不要从零搜索。
 
 ## 执行规则
 - 优先读 manifest 的 `project_background`，但代码证据与背景描述冲突时以代码为准。
 - `full_diff` 系列时，`diff-evidence.jsonl` 的 `source_snippet` 与 `related_commits` 是源码级证据，可直接据此定位本仓库调用点。
+- v2 bundle 中 `local_search_terms` 与 `affected_symbols.search_variants` 是本地检索首选锚点，优先于宽泛标题词。
 - 仓库未使用某个被引用 API → 明确说明并降级/排除，不要硬凑。
 - 无法仅凭当前仓库证明的内容 → 放入「待人工确认问题」，不要臆测。
 - 对 bundle 中**所有**风险项统一处理，不要只分析第一条。
