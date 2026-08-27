@@ -75,6 +75,15 @@
   "confidence": "high | medium"
 }]
 ```
+二阶段本地脚本会在 `final-report.json` 中为每条 review 追加：
+```json
+{
+  "status": "confirmed | likely | downgraded | rejected | needs-human",
+  "auto_fix_eligible": true,
+  "reason": "机器复核原因"
+}
+```
+`auto_fix_eligible=true` 表示该项满足自动整改门槛：本地 confirmed，且原始或最终风险为 high。skill 只能对这些项执行代码修改。
 
 ## 3. diff-evidence.jsonl
 每行一个 JSON 对象，id 与 file-risk.json 对应：

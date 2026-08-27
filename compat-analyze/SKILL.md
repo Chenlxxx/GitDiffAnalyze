@@ -44,7 +44,7 @@ description: 分析 GitHub 三方库两个版本之间的破坏性变更与兼�
 
 在当前目录生成 `compat-report.md`（结构见 `references/report-template.md`），全文中文，风险项按等级降序。
 
-如果用户要求生成 skill 包 / analysis-bundle（供使用方仓库用 release-review 复核），按 `references/bundle-format.md` 在 `analysis-bundle/` 目录生成 6 个文件；其中每个风险项标记 `confidence: upstream-high / repo-unverified`，`manifest.json` 写入 `project_background`。
+如果用户要求生成 skill 包 / analysis-bundle（供使用方仓库用 release-review 复核与自动整改），按 `references/bundle-format.md` 在 `analysis-bundle/` 目录生成 6 个文件；其中每个风险项标记 `confidence: upstream-high / repo-unverified`，`manifest.json` 写入 `project_background`。第二阶段只允许对本地 confirmed high 项自动修改代码，其余风险只写报告。
 
 ## 第四步（可选）：本仓库落地复核
 

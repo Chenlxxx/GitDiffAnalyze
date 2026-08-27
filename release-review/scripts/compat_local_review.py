@@ -355,6 +355,11 @@ def score_for(risk: Dict[str, Any], status: str) -> Tuple[int, str]:
     return score, severity
 
 
+def auto_fix_eligible(risk: Dict[str, Any], status: str, final_severity: str) -> bool:
+    original_severity = str(risk.get("severity", "")).lower()
+    return status == "confirmed" and (final_severity == "high" or original_severity == "high")
+
+
 def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], vue_hits: List[Dict[str, Any]], diagnostics: List[Dict[str, Any]], reviews: List[Dict[str, Any]]) -> None:
     review_json = out.with_suffix(".json")
     payload = {"manifest": manifest, "project": project, "vue_hits": vue_hits, "diagnostics": [{"source": d.get("source"), "returncode": d.get("returncode"), "error": d.get("error")} for d in diagnostics], "reviews": reviews}
@@ -369,6 +374,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
         f"- Bundle schema：{manifest.get('schema_version') or manifest.get('bundle_schema_version') or 'v1'}",
         f"- 检测到生态：{', '.join(project.get('ecosystems', [])) or '未识别'}",
         f"- confirmed：{counts['confirmed']} / likely：{counts['likely']} / downgraded：{counts['downgraded']} / rejected：{counts['rejected']} / needs-human：{counts['needs-human']}",
+        f"- 自动整改候选：{sum(1 for r in reviews if r.get('auto_fix_eligible'))}（仅 confirmed + high）",
         "",
         "## 二、项目结构信号",
         "~~~json",
@@ -379,7 +385,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
     ]
     for item in reviews:
         risk = item["risk"]
-        lines.extend(["", f"### {risk.get('id')} {risk.get('title')}", f"- 状态：{item['status']}", f"- 分数：{risk.get('final_score')} ({risk.get('final_severity')})", f"- 原因：{item['reason']}"])
+        lines.extend(["", f"### {risk.get('id')} {risk.get('title')}", f"- 状态：{item['status']}", f"- 分数：{risk.get('final_score')} ({risk.get('final_severity')})", f"- 自动整改候选：{'是' if item.get('auto_fix_eligible') else '否'}", f"- 原因：{item['reason']}"])
         lines.append("- 搜索词：" + (", ".join(item.get("terms", [])[:20]) or "无"))
         if item.get("usage"):
             lines.append("- 源码命中：")
@@ -397,7 +403,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
             lines.append("- 高可信外部证据：")
             for ext in item["external_evidence"][:5]:
                 lines.append(f"  - [{ext.get('trust_level')} {ext.get('confidence')}] {ext.get('title')} {ext.get('source_url')}")
-    lines.extend(["", "## 四、ClaudeCode 复核要求", "基于 final-report.json 继续追踪 confirmed/likely 项的 wrapper、adapter、service、controller/job/consumer 调用链，并把误报项降级或推翻。"])
+    lines.extend(["", "## 四、ClaudeCode 复核与整改要求", "基于 final-report.json 继续追踪 confirmed/likely 项的 wrapper、adapter、service、controller/job/consumer 调用链，并把误报项降级或推翻。只允许对 auto_fix_eligible=true 的 confirmed high 项做代码修改；其他项只写报告，不改代码。"])
     out.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -429,6 +435,7 @@ def main() -> int:
         final_score, final_severity = score_for(risk, status)
         risk["final_score"] = final_score
         risk["final_severity"] = final_severity
+        eligible = auto_fix_eligible(risk, status, final_severity)
         if status == "confirmed":
             reason = "源码使用点或构建/类型检查诊断命中。"
         elif status == "likely":
@@ -439,7 +446,7 @@ def main() -> int:
             reason = "bundle 缺少稳定搜索词，需要人工从上游证据反推。"
         else:
             reason = "组件存在但未发现直接使用点，暂降级。"
-        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "external_evidence": trusted_external_evidence(external, str(risk.get("id", ""))), "status": status, "reason": reason})
+        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "external_evidence": trusted_external_evidence(external, str(risk.get("id", ""))), "status": status, "auto_fix_eligible": eligible, "reason": reason})
 
     out = Path(args.out).resolve()
     write_outputs(out, manifest, project, vue_hits, diagnostics, reviews)

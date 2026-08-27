@@ -5,7 +5,7 @@
 
 export const SKILL_MD = `---
 name: release-review
-description: 读取随本 skill 附带的 analysis-bundle（上游三方件升级风险清单），结合当前代码仓库逐项验证，并追踪受影响 API 在本仓库中的多层调用链路，输出基于真实代码证据的中文升级复核报告。适用于已将本 skill 安装到使用方代码仓库、希望对依赖升级风险做落地复核的场景。
+description: 读取随本 skill 附带的 analysis-bundle（上游三方件升级风险清单），结合当前代码仓库逐项验证，追踪受影响 API 在本仓库中的多层调用链路，并只对本地 confirmed high 风险项做代码整改，输出修改说明与中文升级复核报告。适用于已将本 skill 安装到使用方代码仓库、希望对依赖升级风险做落地复核和安全整改的场景。
 ---
 
 当用户要求运行或使用 release-review skill 时，直接执行以下工作流，不要先请求确认（除非必需文件缺失）。
@@ -28,6 +28,7 @@ description: 读取随本 skill 附带的 analysis-bundle（上游三方件升�
 ## 核心目标
 bundle 里每条风险项都是「上游视角的待验证假设 + 已有证据」，**不是**本仓库的最终结论。
 你的任务是把每条假设拿到当前代码仓库验证：它在本仓库**是否真实命中**、命中后**会沿哪条调用链路影响到哪些业务入口**。不要停留在复述 bundle。
+在完成验证后，进一步对 \`final-report.json\` 中 \`auto_fix_eligible=true\` 的风险项实施代码整改。\`auto_fix_eligible=true\` 只代表机器初筛，动手修改前仍要人工式阅读相关代码和调用链；只有确认修改范围清晰、修复方式明确时才修改。
 
 ## 工作流
 
@@ -41,7 +42,7 @@ bundle 里每条风险项都是「上游视角的待验证假设 + 已有证据�
 \`python scripts/compat_local_review.py --bundle analysis-bundle --repo-root . --diagnostics build.log --out final-report.md\`
 
 只有在用户明确授权运行本地构建/测试命令时，才追加 \`--check-command "npm run build"\`、\`--check-command "mvn test"\` 等参数。
-脚本会先检测项目类型，再扫描 manifest/lockfile、源码使用点、Vue SFC 模式和可选诊断日志，输出 \`final-report.json\`，每条风险状态为 \`confirmed | likely | downgraded | rejected | needs-human\`。
+脚本会先检测项目类型，再扫描 manifest/lockfile、源码使用点、Vue SFC 模式和可选诊断日志，输出 \`final-report.json\`，每条风险状态为 \`confirmed | likely | downgraded | rejected | needs-human\`，并标记 \`auto_fix_eligible\`。
 
 ### 2. 读取并理解 bundle 与机器 JSON
 读完上述 bundle 文件和 \`final-report.json\`，建立风险项清单；对每条记下其受影响 API 符号（affectedApis / suspect_apis / affected_symbols / local_search_terms）与上游证据（source_snippet）。如存在 \`external-evidence.jsonl\`，只把它作为公开经验佐证和搜索词来源，不能替代本仓库代码证据。
@@ -55,8 +56,23 @@ c. **覆盖间接/隐式使用**：注意纯文本搜索易漏的命中方式—
 d. **识别运行时故障面**：判断变更在编译期暴露还是仅运行时暴露（默认行为变化、序列化/协议格式变化等），以及触发的具体场景。
 e. **结论**：以 \`final-report.json\` 的机器状态为起点，基于证据把该风险项**确认 / likely / 降级 / 推翻 / 待人工确认**，给出受影响的具体文件、完整调用链、故障模式。
 
-### 4. 输出报告
-脚本会先生成机器版 \`final-report.md\`。你需要基于 \`final-report.json\` 和真实代码继续完善同一个 \`final-report.md\`：补充调用链、业务入口、误报/漏报判断和整改建议。ClaudeCode 负责解释调用链和整改，不要从零搜索。
+### 4. 仅对 confirmed high 项执行代码整改
+从 \`final-report.json\` 里筛选 \`auto_fix_eligible=true\` 的项。通常它们满足：本地源码/诊断已 confirmed，且最终风险或原始风险为 high。
+
+对每个候选项：
+
+a. 先阅读 \`usage\` 命中的文件、相关封装层、业务入口和 bundle 中的 \`code_remediation_guide\` / \`codeExample.after\` / \`trigger_condition\`。
+b. 只改与该 confirmed high 风险直接相关的最小代码范围。
+c. 优先修复明确 API 迁移、配置名变更、异常处理、默认行为变化防护、显式参数设置、兼容分支等可验证问题。
+d. 不要修改 \`likely\`、\`downgraded\`、\`rejected\`、\`needs-human\` 项；这些项只能写入报告和待确认清单。
+e. 如果某个 confirmed high 项虽然命中，但修复方式依赖业务选择、凭证、外部运行环境或无法确定正确语义，不要硬改；在报告中标为“已确认但未自动修改”，说明阻塞原因和建议人工决策。
+f. 修改前注意当前仓库可能有用户未提交改动。不要回滚、覆盖或格式化无关文件。
+
+### 5. 验证修改
+代码修改后，优先运行仓库中已有、成本合理且不需要额外授权的静态检查或测试命令，例如 \`npm test\`、\`npm run build\`、\`mvn test\`、\`gradle test\`、\`pytest\`。如果命令耗时过长、缺依赖、需要网络或需要用户授权，跳过并在报告中说明。
+
+### 6. 输出报告与修改说明
+脚本会先生成机器版 \`final-report.md\`。你需要基于 \`final-report.json\` 和真实代码继续完善同一个 \`final-report.md\`：补充调用链、业务入口、误报/漏报判断、实际代码整改和验证结果。ClaudeCode 负责解释调用链、执行 confirmed high 修复并说明结果，不要从零搜索。
 
 ## 执行规则
 - 优先读 manifest 的 \`project_background\`，但代码证据与背景描述冲突时以代码为准。
@@ -64,6 +80,9 @@ e. **结论**：以 \`final-report.json\` 的机器状态为起点，基于证�
 - v2 bundle 中 \`local_search_terms\` 与 \`affected_symbols.search_variants\` 是本地检索首选锚点，优先于宽泛标题词。
 - \`external-evidence.jsonl\` 中 \`trust_level=official|maintainer|security\` 且 \`confidence >= 0.7\` 的记录可作为强佐证；社区记录只用于提示可能的故障模式或补充搜索词。
 - \`external-evidence.jsonl\` 中 \`reference_only=true\` 的网页搜索结果只作为人工参考链接，不得参与最终风险确认或打分。
+- 只允许自动修改 \`auto_fix_eligible=true\` 的 confirmed high 项；其余风险项一律不得修改代码。
+- 自动修改必须最小化、可解释、可回滚；不要做大规模重构、风格化格式化或顺手优化。
+- 如果没有 \`auto_fix_eligible=true\` 的风险项，明确说明“没有满足自动整改门槛的风险”，只输出复核报告。
 - 仓库未使用某个被引用 API → 明确说明并降级/排除，不要硬凑。
 - 无法仅凭当前仓库证明的内容 → 放入「待人工确认问题」，不要臆测。
 - 对 bundle 中**所有**风险项统一处理，不要只分析第一条。
@@ -91,7 +110,10 @@ e. **结论**：以 \`final-report.json\` 的机器状态为起点，基于证�
 ## 六、建议整改与测试计划
 按优先级排列，优先覆盖高风险项。
 
-## 七、证据附录
+## 七、实际代码整改记录
+列出本次实际修改的文件、对应风险项、修改内容、未修改的 confirmed high 项及原因、验证命令与结果。
+
+## 八、证据附录
 列出使用的 bundle 文件，以及检查过的关键仓库文件路径。
 
 ## 可选 Word 导出
@@ -138,7 +160,12 @@ export const EXAMPLE_REPORT_MD = `# 三方件升级复核报告
 2. 增加针对 Digest、缓存共享与 302 重定向的回归测试。
 3. 对关键集成链路补充端到端验证。
 
-## 七、证据附录
+## 七、实际代码整改记录
+- 已修改：\`src/auth/OAuthClient.java\`，对应风险项 \`diff-001\`，将默认自动重定向改为显式 3xx 处理，并限制敏感头跨域转发。
+- 未自动修改：无。
+- 验证：已运行 \`mvn test\`，结果按实际填写。
+
+## 八、证据附录
 - 使用的 bundle：\`manifest.json\`、\`file-risk.json\`、\`diff-evidence.jsonl\`、\`external-evidence.jsonl\`、\`platform-summary.md\`
 - 检查过的仓库文件：按实际扫描结果填写
 `;
@@ -156,7 +183,7 @@ export const USAGE_MD = `# 安装与使用
 ## 运行
 在使用方代码仓库中打开 agent 后输入：
 
-\`请使用 release-review skill，先运行 scripts/compat_local_review.py 读取随它附带的 analysis-bundle，对当前仓库产出 final-report.json，再基于 JSON 命中结果和 external-evidence.jsonl 的公开佐证追踪调用链并完善中文 final-report.md。除非缺少必要文件，否则不要先问我是否继续。\`
+\`请使用 release-review skill，先运行 scripts/compat_local_review.py 读取随它附带的 analysis-bundle，对当前仓库产出 final-report.json，再基于 JSON 命中结果和 external-evidence.jsonl 的公开佐证追踪调用链；只对 auto_fix_eligible=true 的 confirmed high 项做最小代码整改，最后完善中文 final-report.md 并说明修改了什么。除非缺少必要文件，否则不要先问我是否继续。\`
 
 也可以手工先运行：
 
@@ -525,6 +552,11 @@ def score_for(risk: Dict[str, Any], status: str) -> Tuple[int, str]:
     return score, severity
 
 
+def auto_fix_eligible(risk: Dict[str, Any], status: str, final_severity: str) -> bool:
+    original_severity = str(risk.get("severity", "")).lower()
+    return status == "confirmed" and (final_severity == "high" or original_severity == "high")
+
+
 def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], vue_hits: List[Dict[str, Any]], diagnostics: List[Dict[str, Any]], reviews: List[Dict[str, Any]]) -> None:
     review_json = out.with_suffix(".json")
     payload = {"manifest": manifest, "project": project, "vue_hits": vue_hits, "diagnostics": [{"source": d.get("source"), "returncode": d.get("returncode"), "error": d.get("error")} for d in diagnostics], "reviews": reviews}
@@ -539,6 +571,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
         f"- Bundle schema：{manifest.get('schema_version') or manifest.get('bundle_schema_version') or 'v1'}",
         f"- 检测到生态：{', '.join(project.get('ecosystems', [])) or '未识别'}",
         f"- confirmed：{counts['confirmed']} / likely：{counts['likely']} / downgraded：{counts['downgraded']} / rejected：{counts['rejected']} / needs-human：{counts['needs-human']}",
+        f"- 自动整改候选：{sum(1 for r in reviews if r.get('auto_fix_eligible'))}（仅 confirmed + high）",
         "",
         "## 二、项目结构信号",
         "~~~json",
@@ -549,7 +582,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
     ]
     for item in reviews:
         risk = item["risk"]
-        lines.extend(["", f"### {risk.get('id')} {risk.get('title')}", f"- 状态：{item['status']}", f"- 分数：{risk.get('final_score')} ({risk.get('final_severity')})", f"- 原因：{item['reason']}"])
+        lines.extend(["", f"### {risk.get('id')} {risk.get('title')}", f"- 状态：{item['status']}", f"- 分数：{risk.get('final_score')} ({risk.get('final_severity')})", f"- 自动整改候选：{'是' if item.get('auto_fix_eligible') else '否'}", f"- 原因：{item['reason']}"])
         lines.append("- 搜索词：" + (", ".join(item.get("terms", [])[:20]) or "无"))
         if item.get("usage"):
             lines.append("- 源码命中：")
@@ -567,7 +600,7 @@ def write_outputs(out: Path, manifest: Dict[str, Any], project: Dict[str, Any], 
             lines.append("- 高可信外部证据：")
             for ext in item["external_evidence"][:5]:
                 lines.append(f"  - [{ext.get('trust_level')} {ext.get('confidence')}] {ext.get('title')} {ext.get('source_url')}")
-    lines.extend(["", "## 四、ClaudeCode 复核要求", "基于 final-report.json 继续追踪 confirmed/likely 项的 wrapper、adapter、service、controller/job/consumer 调用链，并把误报项降级或推翻。"])
+    lines.extend(["", "## 四、ClaudeCode 复核与整改要求", "基于 final-report.json 继续追踪 confirmed/likely 项的 wrapper、adapter、service、controller/job/consumer 调用链，并把误报项降级或推翻。只允许对 auto_fix_eligible=true 的 confirmed high 项做代码修改；其他项只写报告，不改代码。"])
     out.write_text("\\n".join(lines), encoding="utf-8")
 
 
@@ -599,6 +632,7 @@ def main() -> int:
         final_score, final_severity = score_for(risk, status)
         risk["final_score"] = final_score
         risk["final_severity"] = final_severity
+        eligible = auto_fix_eligible(risk, status, final_severity)
         if status == "confirmed":
             reason = "源码使用点或构建/类型检查诊断命中。"
         elif status == "likely":
@@ -609,7 +643,7 @@ def main() -> int:
             reason = "bundle 缺少稳定搜索词，需要人工从上游证据反推。"
         else:
             reason = "组件存在但未发现直接使用点，暂降级。"
-        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "external_evidence": trusted_external_evidence(external, str(risk.get("id", ""))), "status": status, "reason": reason})
+        reviews.append({"risk": risk, "terms": terms, "usage": usage, "dependency_hits": dep_hits, "diagnostic_hits": diag_hits, "external_evidence": trusted_external_evidence(external, str(risk.get("id", ""))), "status": status, "auto_fix_eligible": eligible, "reason": reason})
 
     out = Path(args.out).resolve()
     write_outputs(out, manifest, project, vue_hits, diagnostics, reviews)
